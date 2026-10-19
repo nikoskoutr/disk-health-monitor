@@ -47,33 +47,19 @@ final class SettingsViewModel: ObservableObject {
                 try? FileManager.default.removeItem(atPath: plistPath)
             } else {
                 try? FileManager.default.createDirectory(atPath: agentsDir, withIntermediateDirectories: true)
-                let plistContent = """
-                <?xml version="1.0" encoding="UTF-8"?>
-                <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-                <plist version="1.0">
-                <dict>
-                    <key>Label</key>
-                    <string>\(bundleId)</string>
-                    <key>ProgramArguments</key>
-                    <array>
-                        <string>\(binaryPath)</string>
-                    </array>
-                    <key>WorkingDirectory</key>
-                    <string>\(logsDir)</string>
-                    <key>RunAtLoad</key>
-                    <true/>
-                    <key>KeepAlive</key>
-                    <true/>
-                    <key>StandardOutPath</key>
-                    <string>\(logsDir)/launchd.out.log</string>
-                    <key>StandardErrorPath</key>
-                    <string>\(logsDir)/launchd.err.log</string>
-                    <key>ProcessType</key>
-                    <string>Interactive</string>
-                </dict>
-                </plist>
-                """
-                try? plistContent.write(toFile: plistPath, atomically: true, encoding: .utf8)
+                let plistDict: [String: Any] = [
+                    "Label": bundleId,
+                    "ProgramArguments": [binaryPath, "--menubar"],
+                    "WorkingDirectory": logsDir,
+                    "RunAtLoad": true,
+                    "KeepAlive": true,
+                    "StandardOutPath": "\(logsDir)/launchd.out.log",
+                    "StandardErrorPath": "\(logsDir)/launchd.err.log",
+                    "ProcessType": "Interactive"
+                ]
+                if let plistData = try? PropertyListSerialization.data(fromPropertyList: plistDict, format: .xml, options: 0) {
+                    try? plistData.write(to: URL(fileURLWithPath: plistPath), options: .atomic)
+                }
                 let bootstrap = Process()
                 bootstrap.executableURL = URL(fileURLWithPath: "/bin/launchctl")
                 bootstrap.arguments = ["bootstrap", "gui/\(getuid())", plistPath]
@@ -87,37 +73,41 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func refreshDiskList() {
-        var items: [(id: String, name: String)] = []
-        var devices = [DiskHardwareMetrics](repeating: DiskHardwareMetrics(), count: 16)
-        let count = DiskListAllDevices(&devices, 16)
-        for i in 0..<Int(count) {
-            let d = devices[i]
-            let prod = cStringToSwift(d.productName)
-            let vendor = cStringToSwift(d.vendorName)
-            let bsd = cStringToSwift(d.bsdName)
-            let bus = cStringToSwift(d.interconnectType)
-            let label = "\(vendor.isEmpty ? "" : vendor + " ")\(prod) (\(bsd), \(bus))"
-            items.append((id: bsd, name: label))
-        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            var items: [(id: String, name: String)] = []
+            var devices = [DiskHardwareMetrics](repeating: DiskHardwareMetrics(), count: 16)
+            let count = DiskListAllDevices(&devices, 16)
+            for i in 0..<Int(count) {
+                let d = devices[i]
+                let prod = cStringToSwift(d.productName)
+                let vendor = cStringToSwift(d.vendorName)
+                let bsd = cStringToSwift(d.bsdName)
+                let bus = cStringToSwift(d.interconnectType)
+                let label = "\(vendor.isEmpty ? "" : vendor + " ")\(prod) (\(bsd), \(bus))"
+                items.append((id: bsd, name: label))
+            }
 
-        let numMounts = getfsstat(nil, 0, MNT_NOWAIT)
-        if numMounts > 0 {
-            let allocCount = Int(numMounts) + 4
-            var fsList = Array<Darwin.statfs>(repeating: Darwin.statfs(), count: allocCount)
-            let mCount = getfsstat(&fsList, Int32(MemoryLayout<Darwin.statfs>.size * allocCount), MNT_NOWAIT)
-            if mCount > 0 {
-                for i in 0..<min(Int(mCount), allocCount) {
-                    let volPath = cStringToSwift(fsList[i].f_mntonname)
-                    let flags = UInt32(fsList[i].f_flags)
-                    let isLocal = (flags & UInt32(MNT_LOCAL)) != 0
-                    if isLocal && (volPath.hasPrefix("/Volumes/") || volPath == "/") {
-                        let displayName = volPath == "/" ? "Macintosh HD (/)" : (volPath as NSString).lastPathComponent
-                        items.append((id: volPath, name: "📂 \(displayName) (\(volPath))"))
+            let numMounts = getfsstat(nil, 0, MNT_NOWAIT)
+            if numMounts > 0 {
+                let allocCount = Int(numMounts) + 4
+                var fsList = Array<Darwin.statfs>(repeating: Darwin.statfs(), count: allocCount)
+                let mCount = getfsstat(&fsList, Int32(MemoryLayout<Darwin.statfs>.size * allocCount), MNT_NOWAIT)
+                if mCount > 0 {
+                    for i in 0..<min(Int(mCount), allocCount) {
+                        let volPath = cStringToSwift(fsList[i].f_mntonname)
+                        let flags = UInt32(fsList[i].f_flags)
+                        let isLocal = (flags & UInt32(MNT_LOCAL)) != 0
+                        if isLocal && (volPath.hasPrefix("/Volumes/") || volPath == "/") {
+                            let displayName = volPath == "/" ? "Macintosh HD (/)" : (volPath as NSString).lastPathComponent
+                            items.append((id: volPath, name: "📂 \(displayName) (\(volPath))"))
+                        }
                     }
                 }
             }
+            DispatchQueue.main.async {
+                self.availableDisks = items
+            }
         }
-        self.availableDisks = items
     }
 
     func runTelegramTest() {

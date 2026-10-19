@@ -13,6 +13,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var dailyDigestItem: NSMenuItem!
     private var selectDiskMenu: NSMenu!
     private var selectDiskMenuItem: NSMenuItem!
+    private var cachedDevices: [DiskHardwareMetrics] = []
+    private var cachedMounts: [(path: String, name: String)] = []
+    private let cacheLock = NSLock()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -35,10 +38,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         setupMenu()
 
-        // Observe macOS volume mount / unmount
+        // Observe macOS volume mount / unmount and system sleep / wake
         let wsCenter = NSWorkspace.shared.notificationCenter
         wsCenter.addObserver(self, selector: #selector(volumeMountChanged(_:)), name: NSWorkspace.didMountNotification, object: nil)
         wsCenter.addObserver(self, selector: #selector(volumeMountChanged(_:)), name: NSWorkspace.didUnmountNotification, object: nil)
+        wsCenter.addObserver(self, selector: #selector(systemWillSleep(_:)), name: NSWorkspace.willSleepNotification, object: nil)
+        wsCenter.addObserver(self, selector: #selector(systemDidWake(_:)), name: NSWorkspace.didWakeNotification, object: nil)
 
         // Initial check
         refreshHealth(forceCanary: true)
@@ -175,8 +180,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func populateSelectDiskMenu() {
         selectDiskMenu.removeAllItems()
 
-        var devices = [DiskHardwareMetrics](repeating: DiskHardwareMetrics(), count: 16)
-        let count = DiskListAllDevices(&devices, 16)
+        cacheLock.lock()
+        let devices = cachedDevices
+        let mounts = cachedMounts
+        cacheLock.unlock()
 
         let currentActive = DiskHealthMonitor.shared.currentSnapshot?.bsdName ?? ""
         let currentMount = DiskHealthMonitor.shared.currentSnapshot?.mountPoint ?? ""
@@ -192,8 +199,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         selectDiskMenu.addItem(NSMenuItem.separator())
 
         // Physical Disks
-        for i in 0..<Int(count) {
-            let d = devices[i]
+        for d in devices {
             let prod = cStringToSwift(d.productName)
             let vendor = cStringToSwift(d.vendorName)
             let bsd = cStringToSwift(d.bsdName)
@@ -211,32 +217,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         // Mounted Volumes in /Volumes
-        selectDiskMenu.addItem(NSMenuItem.separator())
-        let sectionItem = NSMenuItem(title: "Mounted Volumes:", action: nil, keyEquivalent: "")
-        sectionItem.isEnabled = false
-        selectDiskMenu.addItem(sectionItem)
+        if !mounts.isEmpty {
+            selectDiskMenu.addItem(NSMenuItem.separator())
+            let sectionItem = NSMenuItem(title: "Mounted Volumes:", action: nil, keyEquivalent: "")
+            sectionItem.isEnabled = false
+            selectDiskMenu.addItem(sectionItem)
 
-        let numMounts = getfsstat(nil, 0, MNT_NOWAIT)
-        if numMounts > 0 {
-            let allocCount = Int(numMounts) + 4
-            var fsList = Array<Darwin.statfs>(repeating: Darwin.statfs(), count: allocCount)
-            let mCount = getfsstat(&fsList, Int32(MemoryLayout<Darwin.statfs>.size * allocCount), MNT_NOWAIT)
-            if mCount > 0 {
-                for i in 0..<min(Int(mCount), allocCount) {
-                    let volPath = cStringToSwift(fsList[i].f_mntonname)
-                    let flags = UInt32(fsList[i].f_flags)
-                    let isLocal = (flags & UInt32(MNT_LOCAL)) != 0
-                    if isLocal && (volPath.hasPrefix("/Volumes/") || volPath == "/") {
-                        let displayName = volPath == "/" ? "Macintosh HD (/)" : (volPath as NSString).lastPathComponent
-                        let item = NSMenuItem(title: "  📂 \(displayName)", action: #selector(selectDiskTarget(_:)), keyEquivalent: "")
-                        item.target = self
-                        item.representedObject = volPath
-                        if ConfigManager.shared.config.targetVolumePath == volPath || currentMount == volPath {
-                            item.state = .on
-                        }
-                        selectDiskMenu.addItem(item)
-                    }
+            for m in mounts {
+                let item = NSMenuItem(title: "  📂 \(m.name)", action: #selector(selectDiskTarget(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = m.path
+                if ConfigManager.shared.config.targetVolumePath == m.path || currentMount == m.path {
+                    item.state = .on
                 }
+                selectDiskMenu.addItem(item)
             }
         }
     }
@@ -271,8 +265,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    @objc private func systemWillSleep(_ note: Notification) {
+        pollTimer?.invalidate()
+        DiskHealthMonitor.shared.noteSystemWillSleep()
+    }
+
+    @objc private func systemDidWake(_ note: Notification) {
+        DiskHealthMonitor.shared.noteSystemDidWake()
+        // Wait 8 seconds for external USB/Thunderbolt buses to re-enumerate before polling
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) { [weak self] in
+            guard let self = self else { return }
+            self.refreshHealth(forceCanary: false)
+            self.schedulePollingTimer(interval: ConfigManager.shared.config.pollIntervalSeconds)
+        }
+    }
+
+    private func updateDiskCache() {
+        var devices = [DiskHardwareMetrics](repeating: DiskHardwareMetrics(), count: 16)
+        let count = DiskListAllDevices(&devices, 16)
+        var mounts: [(path: String, name: String)] = []
+
+        let numMounts = getfsstat(nil, 0, MNT_NOWAIT)
+        if numMounts > 0 {
+            let allocCount = Int(numMounts) + 4
+            var fsList = Array<Darwin.statfs>(repeating: Darwin.statfs(), count: allocCount)
+            let mCount = getfsstat(&fsList, Int32(MemoryLayout<Darwin.statfs>.size * allocCount), MNT_NOWAIT)
+            if mCount > 0 {
+                for i in 0..<min(Int(mCount), allocCount) {
+                    let volPath = cStringToSwift(fsList[i].f_mntonname)
+                    let flags = UInt32(fsList[i].f_flags)
+                    let isLocal = (flags & UInt32(MNT_LOCAL)) != 0
+                    if isLocal && (volPath.hasPrefix("/Volumes/") || volPath == "/") {
+                        let displayName = volPath == "/" ? "Macintosh HD (/)" : (volPath as NSString).lastPathComponent
+                        mounts.append((path: volPath, name: displayName))
+                    }
+                }
+            }
+        }
+
+        cacheLock.lock()
+        cachedDevices = Array(devices.prefix(Int(count)))
+        cachedMounts = mounts
+        cacheLock.unlock()
+    }
+
     private func refreshHealth(forceCanary: Bool) {
         DispatchQueue.global(qos: .utility).async {
+            self.updateDiskCache()
             let snap = DiskHealthMonitor.shared.evaluateHealth(forceCanary: forceCanary, allowNotifications: true)
             DispatchQueue.main.async {
                 self.updateStatusBarButton(with: snap)

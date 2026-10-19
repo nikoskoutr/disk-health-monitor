@@ -132,7 +132,8 @@ final class DiagnosticExporter {
 
         if let data = jsonStr.data(using: .utf8) {
             do {
-                try data.write(to: URL(fileURLWithPath: targetPath))
+                try data.write(to: URL(fileURLWithPath: targetPath), options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: targetPath)
                 return targetPath
             } catch {
                 ConfigManager.shared.log("Failed to write diagnostic report: \(error.localizedDescription)")

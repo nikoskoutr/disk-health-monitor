@@ -9,6 +9,7 @@ final class DiskHealthMonitor: ObservableObject {
 
     @Published private(set) var currentSnapshot: DiskHealthSnapshot?
     @Published private(set) var isVerifyingVolume: Bool = false
+    private var isVerifyingInternal: Bool = false
 
     private let engineLock = NSRecursiveLock()
     private var state: DiskPersistentState
@@ -20,6 +21,7 @@ final class DiskHealthMonitor: ObservableObject {
     private var cachedCanaryOk: Bool = true
     private var cachedCanaryLatencyMs: Double = 0.0
     private var cachedCanaryError: String = ""
+    private var lastWakeTime: TimeInterval = 0
 
     private init() {
         self.state = DiskHealthMonitor.loadState()
@@ -39,8 +41,25 @@ final class DiskHealthMonitor: ObservableObject {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         if let data = try? encoder.encode(state) {
-            try? data.write(to: URL(fileURLWithPath: path))
+            try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
         }
+    }
+
+    func noteSystemWillSleep() {
+        engineLock.lock()
+        previousSampleTime = 0
+        engineLock.unlock()
+        ConfigManager.shared.log("System entering sleep; pausing telemetry deltas.")
+    }
+
+    func noteSystemDidWake(at timestamp: TimeInterval = Date().timeIntervalSince1970) {
+        engineLock.lock()
+        lastWakeTime = timestamp
+        previousSampleTime = 0
+        lastCanaryRunTime = 0
+        engineLock.unlock()
+        ConfigManager.shared.log("System woke from sleep; applying 8s hardware settle grace period.")
     }
 
     var dailySummaryEnabled: Bool {
@@ -62,6 +81,7 @@ final class DiskHealthMonitor: ObservableObject {
         ConfigManager.shared.updateTarget(volumePath: volumePath, deviceQuery: deviceQuery)
         state.monitoredTarget = volumePath ?? deviceQuery ?? "auto"
         state.lastAlertTimestampByCode.removeAll()
+        state.lastOverallSeverity = HealthSeverity.healthy.rawValue
         previousDriveKey = ""
         previousBytesRead = 0
         previousBytesWritten = 0
@@ -101,14 +121,15 @@ final class DiskHealthMonitor: ObservableObject {
     }
 
     private func performSingleCanaryPass(targetMount: String) -> (Bool, Double, String) {
-        let canaryPath = "\(targetMount)/.disk_health_canary"
+        let canaryPath = (targetMount as NSString).appendingPathComponent(".disk_health_canary")
         let token = "DISK_HEALTH_CANARY_\(UUID().uuidString)\n"
         guard let data = token.data(using: .utf8) else {
             return (false, 0, "Encoding error")
         }
 
         let start = DispatchTime.now()
-        let fd = open(canaryPath, O_CREAT | O_WRONLY | O_TRUNC, 0o644)
+        // Use O_NOFOLLOW to prevent symlink truncation attacks and O_CLOEXEC to prevent fd inheritance
+        let fd = open(canaryPath, O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0o600)
         if fd < 0 {
             let errCode = errno
             if errCode == EPERM || errCode == EACCES || errCode == EROFS {
@@ -220,19 +241,21 @@ final class DiskHealthMonitor: ObservableObject {
                 let resolvedInspect = (mountToInspect as NSString).standardizingPath
                 fsType = cStringToSwift(sfs.f_fstypename)
 
-                // If inspecting "/", resolvedMountPoint must be "/".
-                // If inspecting "/Volumes/Foo", resolvedMountPoint must equal "/Volumes/Foo"
-                // (not "/" when "/Volumes/Foo" is an unmounted stub directory).
+                // If inspecting a path under /Volumes/..., its resolved mount point must also be under /Volumes/
+                // (not "/" or "/System/Volumes/Data", which happens when /Volumes/Foo is an unmounted stub directory).
                 let isValidMatch: Bool
-                if resolvedInspect == "/" {
-                    isValidMatch = (resolvedMountPoint == "/")
+                if resolvedInspect.hasPrefix("/Volumes/") {
+                    isValidMatch = (resolvedMountPoint == resolvedInspect) ||
+                                   (resolvedMountPoint.hasPrefix("/Volumes/") && resolvedInspect.hasPrefix(resolvedMountPoint + "/"))
                 } else {
                     isValidMatch = (resolvedMountPoint == resolvedInspect) ||
-                                   (resolvedMountPoint != "/" && resolvedInspect.hasPrefix(resolvedMountPoint + "/"))
+                                   (resolvedMountPoint == "/" || resolvedMountPoint == "/System/Volumes/Data") ||
+                                   resolvedInspect.hasPrefix(resolvedMountPoint + "/")
                 }
 
                 if isValidMatch {
-                    mountPoint = resolvedMountPoint
+                    // For /System/Volumes/Data firmlinks (e.g. /Users, /Applications), normalize mountPoint to "/"
+                    mountPoint = (resolvedMountPoint == "/System/Volumes/Data" && !resolvedInspect.hasPrefix("/System/Volumes/Data")) ? "/" : resolvedMountPoint
                     isMounted = true
                     isReadOnly = (sfs.f_flags & UInt32(MNT_RDONLY)) != 0
                     let bsize = UInt64(sfs.f_bsize)
@@ -247,7 +270,12 @@ final class DiskHealthMonitor: ObservableObject {
         // 4. Required Subpaths Check (if user configured any)
         var subpathsStatus: [String: Bool] = [:]
         for subpath in cfg.requiredSubpaths {
-            let fullSubpath = "\(mountPoint)/\(subpath)"
+            let cleanSub = subpath.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+            guard !cleanSub.isEmpty, !cleanSub.components(separatedBy: "/").contains("..") else {
+                subpathsStatus[subpath] = false
+                continue
+            }
+            let fullSubpath = (mountPoint as NSString).appendingPathComponent(cleanSub)
             var isDir: ObjCBool = false
             let exists = isMounted && FileManager.default.fileExists(atPath: fullSubpath, isDirectory: &isDir)
             subpathsStatus[subpath] = exists
@@ -255,6 +283,10 @@ final class DiskHealthMonitor: ObservableObject {
 
         let driveKey = !serialNumber.isEmpty ? serialNumber : (!bsdName.isEmpty ? bsdName : (targetMount.isEmpty ? "default" : targetMount))
         if driveKey != previousDriveKey {
+            if !previousDriveKey.isEmpty {
+                state.lastOverallSeverity = HealthSeverity.healthy.rawValue
+                state.lastAlertTimestampByCode.removeAll()
+            }
             previousDriveKey = driveKey
             previousBytesRead = 0
             previousBytesWritten = 0
@@ -323,27 +355,36 @@ final class DiskHealthMonitor: ObservableObject {
         // 8. Health Evaluation Rules Engine
         var issues: [HealthIssue] = []
         var score = 100
+        let inWakeGrace = (lastWakeTime > 0 && (nowTs - lastWakeTime < 8.0))
 
         // Rule 1: Hardware Presence
         if !hw.found {
-            issues.append(HealthIssue(
-                code: "HW_DISCONNECTED",
-                severity: .critical,
-                title: "Storage Hardware Disconnected",
-                detail: "Target device was not detected on macOS IOKit storage buses."
-            ))
-            score -= 60
+            if inWakeGrace {
+                ConfigManager.shared.log("Hardware presence not confirmed during wake grace period (8s); suppressing false alert.")
+            } else {
+                issues.append(HealthIssue(
+                    code: "HW_DISCONNECTED",
+                    severity: .critical,
+                    title: "Storage Hardware Disconnected",
+                    detail: "Target device was not detected on macOS IOKit storage buses."
+                ))
+                score -= 60
+            }
         }
 
         // Rule 2: Volume Mount Status
         if !mountToInspect.isEmpty && !isMounted {
-            issues.append(HealthIssue(
-                code: "VOLUME_UNMOUNTED",
-                severity: .critical,
-                title: "Volume Unmounted",
-                detail: "Volume \(mountToInspect) is not mounted."
-            ))
-            score -= 50
+            if inWakeGrace {
+                ConfigManager.shared.log("Volume unmounted status during wake grace period (8s); suppressing false alert.")
+            } else {
+                issues.append(HealthIssue(
+                    code: "VOLUME_UNMOUNTED",
+                    severity: .critical,
+                    title: "Volume Unmounted",
+                    detail: "Volume \(mountToInspect) is not mounted."
+                ))
+                score -= 50
+            }
         } else if isMounted {
             // Rule 3: Read-Only Mount (excluding sealed macOS root filesystem)
             if isReadOnly && mountPoint != "/" {
@@ -371,7 +412,9 @@ final class DiskHealthMonitor: ObservableObject {
 
             // Rule 5: Active Canary Probe
             if cfg.enableActiveCanary {
-                if !canaryOk {
+                if inWakeGrace {
+                    ConfigManager.shared.log("Canary probe issue suppressed during wake grace period (8s).")
+                } else if !canaryOk {
                     issues.append(HealthIssue(
                         code: "CANARY_IO_FAILED",
                         severity: .critical,
@@ -640,7 +683,9 @@ final class DiskHealthMonitor: ObservableObject {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         if let jsonData = try? encoder.encode(snapshot) {
-            try? jsonData.write(to: URL(fileURLWithPath: ConfigManager.shared.latestJsonPath))
+            let latestPath = ConfigManager.shared.latestJsonPath
+            try? jsonData.write(to: URL(fileURLWithPath: latestPath), options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: latestPath)
         }
 
         if allowNotifications {
@@ -746,18 +791,21 @@ final class DiskHealthMonitor: ObservableObject {
 
     func runVolumeVerification(sendTelegram: Bool = true, completion: ((Bool, String) -> Void)? = nil) {
         engineLock.lock()
-        if isVerifyingVolume {
+        if isVerifyingInternal {
             engineLock.unlock()
             completion?(false, "Verification already in progress")
             return
         }
+        isVerifyingInternal = true
+        let snapMount = self.currentSnapshot?.mountPoint ?? ""
+        let target = !snapMount.isEmpty ? snapMount : (ConfigManager.shared.config.targetVolumePath ?? "/")
         engineLock.unlock()
 
-        DispatchQueue.main.async { self.isVerifyingVolume = true }
-
-        let target = self.currentSnapshot?.mountPoint.isEmpty == false
-            ? (self.currentSnapshot?.mountPoint ?? "/")
-            : (ConfigManager.shared.config.targetVolumePath ?? "/")
+        if Thread.isMainThread {
+            self.isVerifyingVolume = true
+        } else {
+            DispatchQueue.main.async { self.isVerifyingVolume = true }
+        }
 
         ConfigManager.shared.log("Starting diskutil verifyVolume on '\(target)'...")
 
@@ -773,16 +821,36 @@ final class DiskHealthMonitor: ObservableObject {
             var summary = ""
             do {
                 try proc.run()
+
+                // 180-second watchdog timer in case diskutil hangs on a wedged USB bridge
+                var timedOut = false
+                let watchdog = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+                watchdog.schedule(deadline: .now() + 180.0)
+                watchdog.setEventHandler {
+                    if proc.isRunning {
+                        timedOut = true
+                        proc.terminate()
+                    }
+                }
+                watchdog.resume()
+
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 proc.waitUntilExit()
+                watchdog.cancel()
+
                 let output = String(decoding: data, as: UTF8.self)
-                ok = (proc.terminationStatus == 0) && (output.contains("appears to be OK") || output.contains("Finished file system verification") || output.contains("File system check exit code is 0"))
                 let timeStr = shortMonthDateFormatter.string(from: Date())
-                if ok {
-                    summary = "Verified OK (\(timeStr))"
+                if timedOut {
+                    ok = false
+                    summary = "Timed out after 180s (\(timeStr))"
                 } else {
-                    let lastLines = output.components(separatedBy: .newlines).filter { !$0.isEmpty }.suffix(2).joined(separator: " | ")
-                    summary = "Failed (\(timeStr)): \(lastLines)"
+                    ok = (proc.terminationStatus == 0) && (output.contains("appears to be OK") || output.contains("Finished file system verification") || output.contains("File system check exit code is 0"))
+                    if ok {
+                        summary = "Verified OK (\(timeStr))"
+                    } else {
+                        let lastLines = output.components(separatedBy: .newlines).filter { !$0.isEmpty }.suffix(2).joined(separator: " | ")
+                        summary = "Failed (\(timeStr)): \(lastLines)"
+                    }
                 }
             } catch {
                 summary = "Error running diskutil: \(error.localizedDescription)"
@@ -798,6 +866,7 @@ final class DiskHealthMonitor: ObservableObject {
                 $0.lastVerifyResult = summary
             }
             self.saveStateLocked()
+            self.isVerifyingInternal = false
             self.engineLock.unlock()
 
             ConfigManager.shared.log("Volume verification finished: ok=\(ok), result=\(summary)")

@@ -248,16 +248,14 @@ struct CoreLogicTestRunner {
         print("  [OK] HTML escaping verified")
 
         print("=== Swift Unit Test 7: Unmounted Stub Directory Detection ===")
-        let stubDir = "\(NSTemporaryDirectory())unmounted_stub_test_\(UUID().uuidString)"
-        try? FileManager.default.createDirectory(atPath: stubDir, withIntermediateDirectories: true)
+        let stubDir = "/Volumes/__unmounted_stub_test_\(UUID().uuidString)__"
         cfgMgr.updateConfig { cfg in
             cfg.targetVolumePath = stubDir
             cfg.targetDeviceQuery = nil
         }
         let stubSnap = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
-        assertTrue(!stubSnap.isMounted, "Unmounted stub directory on root filesystem must evaluate to isMounted == false")
+        assertTrue(!stubSnap.isMounted, "Unmounted stub directory under /Volumes must evaluate to isMounted == false")
         assertTrue(stubSnap.issues.contains(where: { $0.code == "VOLUME_UNMOUNTED" }), "Unmounted stub directory must trigger VOLUME_UNMOUNTED issue")
-        try? FileManager.default.removeItem(atPath: stubDir)
         print("  [OK] Unmounted stub directory detection verified")
 
         print("=== Swift Unit Test 8: Configuration Import Logic & Secret Preservation ===")
@@ -350,6 +348,181 @@ struct CoreLogicTestRunner {
         assertTrue(updatedDriveState.baselineIoReadRetries == 25, "Advanced baselineIoReadRetries must be 25")
         assertTrue(updatedDriveState.baselineIoWriteRetries == 14, "Advanced baselineIoWriteRetries must be 14")
         print("  [OK] I/O retry baseline advancement verified")
+
+        print("=== Swift Unit Test 12: ConfigManager Concurrency & SynchronizedDateFormatter Thread Safety (IMPROVE-V2-02) ===")
+        let group = DispatchGroup()
+        for i in 0..<20 {
+            group.enter()
+            DispatchQueue.global().async {
+                cfgMgr.updateConfig { cfg in
+                    cfg.tempWarningCelsius = 40 + (i % 10)
+                }
+                _ = isoTimestampFormatter.string(from: Date())
+                _ = shortTimeFormatter.string(from: Date())
+                _ = shortMonthDateFormatter.string(from: Date())
+                group.leave()
+            }
+        }
+        group.wait()
+        assertTrue(cfgMgr.config.tempWarningCelsius >= 40 && cfgMgr.config.tempWarningCelsius <= 50, "Concurrent updateConfig completed safely")
+        print("  [OK] Concurrency & SynchronizedDateFormatter verified")
+
+        print("=== Swift Unit Test 13: System Sleep / Wake Telemetry Grace Period (IMPROVE-V2-03) ===")
+        monitor.noteSystemWillSleep()
+        monitor.noteSystemDidWake()
+        // During the 8s grace period, a missing device or unmounted stub should not trigger HW_DISCONNECTED or VOLUME_UNMOUNTED issues
+        cfgMgr.updateConfig { cfg in
+            cfg.targetVolumePath = "/Volumes/__Wake_Grace_Test__"
+            cfg.targetDeviceQuery = "disk99998"
+        }
+        let wakeSnap = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        assertTrue(!wakeSnap.issues.contains(where: { $0.code == "HW_DISCONNECTED" }), "HW_DISCONNECTED suppressed during wake grace period")
+        assertTrue(!wakeSnap.issues.contains(where: { $0.code == "VOLUME_UNMOUNTED" }), "VOLUME_UNMOUNTED suppressed during wake grace period")
+        assertTrue(!wakeSnap.issues.contains(where: { $0.code == "CANARY_IO_FAILED" }), "CANARY_IO_FAILED suppressed during wake grace period")
+        assertTrue(!wakeSnap.issues.contains(where: { $0.code == "CANARY_HIGH_LATENCY" }), "CANARY_HIGH_LATENCY suppressed during wake grace period")
+        print("  [OK] Sleep / wake grace period suppression verified")
+
+        print("=== Swift Unit Test 14: Per-Drive Severity Scoping on Target Switch (IMPROVE-V2-04) ===")
+        cfgMgr.updateConfig { cfg in
+            cfg.diskUsedWarningPercent = 99.0
+            cfg.diskUsedCriticalPercent = 99.9
+            cfg.minFreeSpaceWarningGB = 0.001
+            cfg.minFreeSpaceCriticalGB = 0.0001
+            cfg.requiredSubpaths = []
+        }
+        // Expire wake grace window explicitly for this test
+        monitor.noteSystemDidWake(at: Date().timeIntervalSince1970 - 15.0)
+        monitor.setMonitoredTarget(volumePath: "/Volumes/__Missing_For_Severity_Test__", deviceQuery: nil)
+        let failSnap = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        assertTrue(failSnap.overallSeverity == .critical, "Missing target must evaluate to CRITICAL")
+
+        // Switch to root '/', which is HEALTHY
+        monitor.setMonitoredTarget(volumePath: "/", deviceQuery: nil)
+        let switchedSnap = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        assertTrue(switchedSnap.overallSeverity == .healthy, "Target switch to '/' must evaluate to HEALTHY without false recovery alert")
+        print("  [OK] Per-drive severity scoping on target switch verified")
+
+        print("=== Swift Unit Test 15: Canary File Security & Subpath Traversal Sanitization (IMPROVE-V2-06) ===")
+        // Subpath traversal check: subpaths containing ".." must be rejected (false)
+        cfgMgr.updateConfig { cfg in
+            cfg.targetVolumePath = "/"
+            cfg.requiredSubpaths = ["../etc", "Users/../Applications", "..", "Users"]
+        }
+        let traversalSnap = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        assertTrue(traversalSnap.subpathsStatus["../etc"] == false, "Subpath with .. prefix must be rejected")
+        assertTrue(traversalSnap.subpathsStatus["Users/../Applications"] == false, "Subpath with .. component must be rejected")
+        assertTrue(traversalSnap.subpathsStatus[".."] == false, "Subpath '..' must be rejected")
+        assertTrue(traversalSnap.subpathsStatus["Users"] == true, "Normal subpath 'Users' must succeed")
+
+        // Canary symlink attack prevention check (O_NOFOLLOW / O_CLOEXEC)
+        let canarySymlinkTestDir = "\(NSTemporaryDirectory())canary_symlink_test_\(UUID().uuidString)"
+        try? FileManager.default.createDirectory(atPath: canarySymlinkTestDir, withIntermediateDirectories: true)
+        let sensitiveTargetFile = "\(canarySymlinkTestDir)/important_data.txt"
+        let secretContent = "CRITICAL_SYSTEM_DATA_DO_NOT_TRUNCATE"
+        try? secretContent.write(toFile: sensitiveTargetFile, atomically: true, encoding: .utf8)
+        let symlinkCanaryPath = "\(canarySymlinkTestDir)/.disk_health_canary"
+        try? FileManager.default.createSymbolicLink(atPath: symlinkCanaryPath, withDestinationPath: sensitiveTargetFile)
+
+        // Attempt canary write via open with O_NOFOLLOW
+        let canaryFd = open(symlinkCanaryPath, O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        assertTrue(canaryFd < 0, "open() on canary symlink with O_NOFOLLOW must fail")
+        assertTrue(errno == ELOOP, "open() on canary symlink must fail with ELOOP, got errno \(errno)")
+        let readBackData = try? String(contentsOfFile: sensitiveTargetFile, encoding: .utf8)
+        assertTrue(readBackData == secretContent, "Sensitive target file must NOT be truncated by canary probe")
+        try? FileManager.default.removeItem(atPath: canarySymlinkTestDir)
+
+        // Clean up requiredSubpaths
+        cfgMgr.updateConfig { $0.requiredSubpaths = [] }
+        print("  [OK] Subpath traversal sanitization & canary symlink protection verified")
+
+        print("=== Swift Unit Test 16: Accurate Mount Path & Unmounted Stub Detection (IMPROVE-V2-07) ===")
+        // Mounted root volume '/' should report isMounted == true
+        cfgMgr.updateConfig { cfg in
+            cfg.targetVolumePath = "/"
+            cfg.targetDeviceQuery = nil
+        }
+        let rootSnapCheck = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        assertTrue(rootSnapCheck.isMounted, "Root volume '/' must be detected as mounted")
+
+        // Root subdirectories like '/Users' must ALSO report isMounted == true (not VOLUME_UNMOUNTED)
+        cfgMgr.updateConfig { cfg in
+            cfg.targetVolumePath = "/Users"
+            cfg.targetDeviceQuery = nil
+        }
+        let usersSnapCheck = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        assertTrue(usersSnapCheck.isMounted, "Subdirectory '/Users' on root filesystem must be detected as mounted")
+        assertTrue(!usersSnapCheck.issues.contains(where: { $0.code == "VOLUME_UNMOUNTED" }), "/Users must not trigger VOLUME_UNMOUNTED")
+
+        // Unmounted stub in /Volumes must report isMounted == false
+        let fakeVolumeStub = "/Volumes/__Unmounted_Stub_Test_\(UUID().uuidString)__"
+        cfgMgr.updateConfig { cfg in
+            cfg.targetVolumePath = fakeVolumeStub
+            cfg.targetDeviceQuery = nil
+        }
+        let unmountedSnap = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        assertTrue(!unmountedSnap.isMounted, "Unmounted stub under /Volumes/ must report isMounted == false")
+        assertTrue(unmountedSnap.issues.contains(where: { $0.code == "VOLUME_UNMOUNTED" }), "Must trigger VOLUME_UNMOUNTED")
+        print("  [OK] Mount path & unmounted stub detection verified")
+
+        print("=== Swift Unit Test 17: runVolumeVerification Re-Entrancy Guard (IMPROVE-V2-08) ===")
+        let verifyGroup = DispatchGroup()
+        var verifyResults: [String] = []
+        let resultsLock = NSLock()
+
+        verifyGroup.enter()
+        monitor.runVolumeVerification(sendTelegram: false) { ok, msg in
+            resultsLock.lock()
+            verifyResults.append(msg)
+            resultsLock.unlock()
+            verifyGroup.leave()
+        }
+
+        // Immediate second call while first is in progress
+        verifyGroup.enter()
+        monitor.runVolumeVerification(sendTelegram: false) { ok, msg in
+            resultsLock.lock()
+            verifyResults.append(msg)
+            resultsLock.unlock()
+            verifyGroup.leave()
+        }
+
+        verifyGroup.wait()
+        assertTrue(verifyResults.contains("Verification already in progress"), "Second concurrent verification must be rejected by re-entrancy lock")
+        print("  [OK] runVolumeVerification re-entrancy guard verified")
+
+        print("=== Swift Unit Test 18: Restrictive 0600 File Permissions (IMPROVE-V2-10) ===")
+        // Trigger health evaluation and logging to create state.json, latest_status.json, health.log
+        cfgMgr.updateConfig { $0.targetVolumePath = "/" }
+        _ = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        cfgMgr.log("Permission check log message")
+
+        let pathsToCheck = [
+            cfgMgr.stateFilePath,
+            cfgMgr.latestJsonPath,
+            cfgMgr.logFilePath
+        ]
+
+        for p in pathsToCheck {
+            assertTrue(FileManager.default.fileExists(atPath: p), "File must exist: \(p)")
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: p),
+               let perms = attrs[.posixPermissions] as? NSNumber {
+                assertTrue(perms.intValue == 0o600, "File \(p) must have 0600 permissions, got \(String(perms.intValue, radix: 8))")
+            } else {
+                assertTrue(false, "Could not read POSIX permissions for \(p)")
+            }
+        }
+
+        // Also verify diagnostic report 0600 permissions
+        if let diagPath = DiagnosticExporter.shared.saveDiagnosticReportToFile() {
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: diagPath),
+               let perms = attrs[.posixPermissions] as? NSNumber {
+                assertTrue(perms.intValue == 0o600, "Diagnostic report must have 0600 permissions, got \(String(perms.intValue, radix: 8))")
+            } else {
+                assertTrue(false, "Could not read POSIX permissions for diagnostic report")
+            }
+            try? FileManager.default.removeItem(atPath: diagPath)
+        }
+        print("  [OK] 0600 file permissions verified")
 
         print("✅ All Swift Core Logic Unit Tests Passed!")
     }

@@ -51,5 +51,7 @@ jobs:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.1.0' }}
           name: Universal Disk Health Monitor ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.1.0' }} (macOS Universal)
           prerelease: false
+          make_latest: true
+          fail_on_unmatched_files: true
           generate_release_notes: true
           files: dist/*

@@ -49,6 +49,20 @@ static uint64_t nvmeLe128ToU64(const void *ptr) {
     return CFSwapInt64LittleToHost(low);
 }
 
+// Convert raw 16-bit NVMe composite temperature to Celsius with boundary validation
+int32_t DiskConvertNVMeTemperature(uint16_t tempRaw) {
+    if (tempRaw >= 233 && tempRaw <= 423) {
+        // Valid Kelvin range: 233K (-40°C) to 423K (+150°C)
+        return (int32_t)tempRaw - 273;
+    } else if (tempRaw > 0 && tempRaw <= 150) {
+        // Non-standard controller reporting directly in Celsius
+        return (int32_t)tempRaw;
+    } else {
+        // 0 (unreported) or corrupt/sentinel value (e.g. 0xFFFF): default to safe nominal 0
+        return 0;
+    }
+}
+
 // Inspect parent chain for USB / Thunderbolt / Interconnect properties
 static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwareMetrics *outMetrics) {
     io_registry_entry_t current = entry;
@@ -293,11 +307,7 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
 
                 uint16_t tempRaw = CFSwapInt16LittleToHost(data.TEMPERATURE);
                 outMetrics->temperatureKelvin = (int32_t)tempRaw;
-                if (tempRaw >= 250) {
-                    outMetrics->temperatureCelsius = (int32_t)tempRaw - 273;
-                } else {
-                    outMetrics->temperatureCelsius = (int32_t)tempRaw;
-                }
+                outMetrics->temperatureCelsius = DiskConvertNVMeTemperature(tempRaw);
 
                 outMetrics->availableSpare = data.AVAILABLE_SPARE;
                 outMetrics->availableSpareThreshold = data.AVAILABLE_SPARE_THRESHOLD;
@@ -325,6 +335,33 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
     }
 }
 
+// Recursively traverse all parents in kIOServicePlane (handles APFS containers with multiple parent links)
+static io_service_t findParentBlockStorageDeviceRecursive(io_registry_entry_t entry, int depth) {
+    if (!entry || depth > 24) return 0;
+
+    if (IOObjectConformsTo(entry, "IOBlockStorageDevice")) {
+        IOObjectRetain(entry);
+        return entry;
+    }
+
+    io_iterator_t parentIter = 0;
+    if (IORegistryEntryGetParentIterator(entry, kIOServicePlane, &parentIter) != KERN_SUCCESS || !parentIter) {
+        return 0;
+    }
+
+    io_service_t foundDevice = 0;
+    io_registry_entry_t parent;
+    while ((parent = IOIteratorNext(parentIter)) != 0) {
+        foundDevice = findParentBlockStorageDeviceRecursive(parent, depth + 1);
+        IOObjectRelease(parent);
+        if (foundDevice != 0) {
+            break;
+        }
+    }
+    IOObjectRelease(parentIter);
+    return foundDevice;
+}
+
 // Locate physical IOBlockStorageDevice for an APFS volume, snapshot, partition slice, or whole-disk BSD name
 static io_service_t findBlockStorageDeviceByBSDName(const char *rawBsdName) {
     if (!rawBsdName || rawBsdName[0] == '\0') return 0;
@@ -334,33 +371,22 @@ static io_service_t findBlockStorageDeviceByBSDName(const char *rawBsdName) {
         bsdName += 5;
     }
 
+    // Handle APFS snapshot mount names like "com.apple.os.update-...@/dev/disk3s1s1" or "disk3s1s1"
+    const char *atSign = strchr(bsdName, '@');
+    if (atSign != NULL) {
+        bsdName = atSign + 1;
+        if (strncmp(bsdName, "/dev/", 5) == 0) {
+            bsdName += 5;
+        }
+    }
+
     CFMutableDictionaryRef matching = IOBSDNameMatching(kIOMainPortDefault, 0, bsdName);
     if (!matching) return 0;
 
     io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, matching);
     if (!service) return 0;
 
-    // Traverse up kIOServicePlane parent chain until reaching IOBlockStorageDevice
-    io_registry_entry_t current = service;
-    IOObjectRetain(current);
-    io_service_t blockDevice = 0;
-
-    for (int depth = 0; depth < 20; depth++) {
-        if (IOObjectConformsTo(current, "IOBlockStorageDevice")) {
-            blockDevice = current;
-            IOObjectRetain(blockDevice);
-            break;
-        }
-
-        io_registry_entry_t parent = 0;
-        if (IORegistryEntryGetParentEntry(current, kIOServicePlane, &parent) != KERN_SUCCESS || parent == 0) {
-            break;
-        }
-        IOObjectRelease(current);
-        current = parent;
-    }
-
-    IOObjectRelease(current);
+    io_service_t blockDevice = findParentBlockStorageDeviceRecursive(service, 0);
     IOObjectRelease(service);
     return blockDevice;
 }

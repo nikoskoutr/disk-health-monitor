@@ -237,16 +237,29 @@ if [[ "${1:-}" == "--package" ]]; then
     cp -R "${APP_BUNDLE}" "${DMG_STAGE}/"
     ln -s /Applications "${DMG_STAGE}/Applications"
     cp "${SCRIPT_DIR}/README.md" "${SCRIPT_DIR}/LICENSE" "${DMG_STAGE}/"
-    hdiutil create -volname "Disk Health Monitor" \
-        -srcfolder "${DMG_STAGE}" \
-        -ov -format UDZO \
-        "${DIST_DIR}/${APP_NAME}.dmg" > /dev/null 2>&1 || true
+    if ! hdiutil create -volname "Disk Health Monitor" \
+            -srcfolder "${DMG_STAGE}" \
+            -ov -format UDZO \
+            "${DIST_DIR}/${APP_NAME}.dmg" > /dev/null 2>&1; then
+        # Fall back to userspace hybrid imaging if kernel loopback device access is restricted
+        TMP_RAW="${BUILD_CACHE_DIR}/raw.dmg"
+        rm -f "${TMP_RAW}"
+        hdiutil makehybrid -hfs -hfs-volume-name "Disk Health Monitor" -o "${TMP_RAW}" "${DMG_STAGE}" > /dev/null 2>&1
+        hdiutil convert "${TMP_RAW}" -format UDZO -o "${DIST_DIR}/${APP_NAME}.dmg" -ov > /dev/null 2>&1
+        rm -f "${TMP_RAW}"
+    fi
     rm -rf "${DMG_STAGE}"
+
+    # Fast-fail release hygiene: verify that DMG was created and is non-empty
+    if [[ ! -s "${DIST_DIR}/${APP_NAME}.dmg" ]]; then
+        echo "❌ Error: Failed to produce valid DMG at ${DIST_DIR}/${APP_NAME}.dmg" >&2
+        exit 1
+    fi
 
     # Generate SHA-256 Checksums
     (
         cd "${DIST_DIR}"
-        shasum -a 256 ./* > SHA256SUMS.txt
+        shasum -a 256 "${APP_NAME}-macOS.zip" "${APP_NAME}.dmg" > SHA256SUMS.txt
     )
     echo "✅ Release assets packaged in ${DIST_DIR}:"
     ls -lh "${DIST_DIR}"

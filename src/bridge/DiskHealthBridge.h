@@ -66,6 +66,9 @@ int DiskListAllDevices(DiskHardwareMetrics *outArray, int maxCount);
 // Find the mounted filesystem path for a block storage device (resolving APFS containers and partitions)
 bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint, size_t maxLen);
 
+// Convert raw 16-bit NVMe composite temperature to Celsius with boundary validation
+int32_t DiskConvertNVMeTemperature(uint16_t tempRaw);
+
 #ifdef __cplusplus
 }
 #endif

@@ -107,6 +107,39 @@ int main(void) {
     assert(tinyBuf[1] == '\0');
     printf("Boundary & buffer truncation safety checks passed\n");
 
+    printf("\n=== Test 8: APFS Physical Store Recursive Resolution (IMPROVE-V2-01) ===\n");
+    DiskHardwareMetrics rootPhysical;
+    DiskReadHardwareMetrics("/", &rootPhysical);
+    assert(rootPhysical.found == true);
+    assert(rootPhysical.bsdName[0] != '\0');
+    assert(rootPhysical.isInternal == true);
+    printf("Resolved physical block device for '/': %s (%s)\n", rootPhysical.productName, rootPhysical.bsdName);
+
+    printf("\n=== Test 9: NVMe Temperature Boundary Clamping & Validation (IMPROVE-V2-11) ===\n");
+    // Synthetic boundary checks
+    assert(DiskConvertNVMeTemperature(0x0000) == 0);        // Unreported/uninitialized
+    assert(DiskConvertNVMeTemperature(0xFFFF) == 0);        // Hardware failure sentinel
+    assert(DiskConvertNVMeTemperature(232) == 0);           // Below Kelvin lower bound (-41C -> invalid)
+    assert(DiskConvertNVMeTemperature(233) == -40);         // Exactly -40C (Kelvin lower bound)
+    assert(DiskConvertNVMeTemperature(273) == 0);           // Exactly 0C
+    assert(DiskConvertNVMeTemperature(308) == 35);          // Normal room temp 35C
+    assert(DiskConvertNVMeTemperature(423) == 150);         // Exactly 150C (Kelvin upper bound)
+    assert(DiskConvertNVMeTemperature(424) == 0);           // Above Kelvin upper bound (151C -> invalid)
+    assert(DiskConvertNVMeTemperature(45) == 45);           // Direct Celsius controller
+    assert(DiskConvertNVMeTemperature(150) == 150);         // Direct Celsius upper bound
+    assert(DiskConvertNVMeTemperature(151) == 0);           // Non-Kelvin out-of-range
+    printf("  Synthetic boundary checks passed (0x0000, 0xFFFF, bounds -40C to 150C)\n");
+
+    for (int i = 0; i < count; i++) {
+        if (devices[i].smartValid) {
+            // Temperature must be clamped within valid range -40C to +150C
+            assert(devices[i].temperatureCelsius >= -40 && devices[i].temperatureCelsius <= 150);
+            printf("  Device %s SMART temp validated: %d C (%d K)\n",
+                   devices[i].bsdName, devices[i].temperatureCelsius, devices[i].temperatureKelvin);
+        }
+    }
+    printf("NVMe temperature boundary clamping validated\n");
+
     printf("\n=== All Bridge Tests Passed Successfully! ===\n");
     return 0;
 }

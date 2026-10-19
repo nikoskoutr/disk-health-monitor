@@ -184,23 +184,39 @@ func cStringToSwift<T>(_ tuple: T) -> String {
     }
 }
 
-// POSIX locale formatters ensuring consistent formatting across any macOS system language/time setting
-let isoTimestampFormatter: DateFormatter = {
-    let df = DateFormatter()
+// POSIX locale formatters ensuring consistent, thread-safe formatting across any macOS system language/time setting
+final class SynchronizedDateFormatter: DateFormatter, @unchecked Sendable {
+    private let lock = NSLock()
+
+    override func string(from date: Date) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return super.string(from: date)
+    }
+
+    override func date(from string: String) -> Date? {
+        lock.lock()
+        defer { lock.unlock() }
+        return super.date(from: string)
+    }
+}
+
+let isoTimestampFormatter: SynchronizedDateFormatter = {
+    let df = SynchronizedDateFormatter()
     df.locale = Locale(identifier: "en_US_POSIX")
     df.dateFormat = "yyyy-MM-dd HH:mm:ss"
     return df
 }()
 
-let shortTimeFormatter: DateFormatter = {
-    let df = DateFormatter()
+let shortTimeFormatter: SynchronizedDateFormatter = {
+    let df = SynchronizedDateFormatter()
     df.locale = Locale(identifier: "en_US_POSIX")
     df.dateFormat = "HH:mm:ss"
     return df
 }()
 
-let shortMonthDateFormatter: DateFormatter = {
-    let df = DateFormatter()
+let shortMonthDateFormatter: SynchronizedDateFormatter = {
+    let df = SynchronizedDateFormatter()
     df.locale = Locale(identifier: "en_US_POSIX")
     df.dateFormat = "MMM d, HH:mm"
     return df
