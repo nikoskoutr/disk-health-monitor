@@ -1,5 +1,12 @@
 # Universal Disk Health Monitor
 
+[![Build, Test & Release](https://github.com/nikoskoutr/disk-health-monitor/actions/workflows/ci-release.yml/badge.svg)](https://github.com/nikoskoutr/disk-health-monitor/actions/workflows/ci-release.yml)
+[![Release](https://img.shields.io/github/v/release/nikoskoutr/disk-health-monitor?color=blue&label=release)](https://github.com/nikoskoutr/disk-health-monitor/releases)
+[![Platform](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey?logo=apple)](https://apple.com/macos)
+[![Architecture](https://img.shields.io/badge/arch-Apple%20Silicon%20%7C%20Intel-orange)](https://github.com/nikoskoutr/disk-health-monitor/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Swift](https://img.shields.io/badge/Swift-5.9%2B-F05138.svg?logo=swift&logoColor=white)](https://swift.org)
+
 A native, zero-dependency macOS hardware telemetry daemon, menu bar application, and CLI tool for monitoring internal Apple Silicon/Intel SSDs and external USB/Thunderbolt/NVMe storage drives.
 
 Built directly on top of **IOKit**, **DiskArbitration**, **CoreFoundation**, and **SwiftUI/AppKit**, Universal Disk Health Monitor inspects hardware SMART registers, bus negotiation speeds, I/O error counters, thermal states, and filesystem writability in real time—without requiring `smartmontools` or third-party kernel extensions.
