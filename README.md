@@ -7,48 +7,42 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Swift](https://img.shields.io/badge/Swift-5.9%2B-F05138.svg?logo=swift&logoColor=white)](https://swift.org)
 
-A native, zero-dependency macOS hardware telemetry daemon, menu bar application, and CLI tool for monitoring internal Apple Silicon/Intel SSDs and external USB/Thunderbolt/NVMe storage drives.
+A zero-dependency macOS hardware telemetry daemon, CLI utility, and status bar monitor for internal Apple Silicon/Intel SSDs and external USB, Thunderbolt, and NVMe storage devices.
 
-Built directly on top of **IOKit**, **DiskArbitration**, **CoreFoundation**, and **SwiftUI/AppKit**, Universal Disk Health Monitor inspects hardware SMART registers, bus negotiation speeds, I/O error counters, thermal states, and filesystem writability in real time—without requiring `smartmontools` or third-party kernel extensions.
+Built directly on **IOKit**, **DiskArbitration**, **CoreFoundation**, and **Security.framework**, the engine inspects hardware SMART registers, physical bus link speed negotiation, kernel I/O error counters, host thermal pressure, and filesystem writability in real time without requiring `smartmontools` or third-party kernel extensions.
 
 <p align="center">
-  <img src="assets/MainWindow.png" alt="Universal Disk Health Monitor Menu Bar Dashboard" width="380">
+  <img src="assets/MainWindow.png" alt="Universal Disk Health Monitor Telemetry View" width="380">
 </p>
 
 ---
 
-## Key Capabilities
+## Core Technical Capabilities
 
-- **Universal Drive Discovery & APFS Container Resolution**: Automatically enumerates all mounted internal and external volumes or targets a specific mount point/BSD unit (`diskX`). Traverses the `IOService` parent plane to resolve synthesized APFS containers (`diskXsY`) back to their underlying physical NVMe or USB storage controller.
-- **128-Bit Native NVMe SMART Telemetry**: Reads full 16-byte little-endian NVMe SMART health log counters (`Data Units Read`, `Data Units Written`, `Power Cycles`, `Power On Hours`, `Unsafe Shutdowns`, `Media Errors`, `Available Spare`, `Percentage Used`, and `Composite Temperature`) without 64-bit truncation.
-- **12-Point Automated Health Evaluation Engine**: Evaluates SMART status, NVMe spare capacity, wear level (`Percentage Used`), drive temperature, host macOS thermal pressure, kernel I/O errors, read/write latency spikes, bus speed negotiation anomalies, unsafe shutdown deltas, free disk space, canary file writability, and optional `diskutil verifyVolume` checks.
-- **Native Menu Bar App & Preferences Window (`Cmd+,`)**:
-  - Live menu bar status icon with instant drive switcher.
-  - Rich graphical dashboard displaying health badges, thermal and SSD wear gauges, lifetime TBW/TBR counters, and cumulative session I/O throughput.
-  - Multi-tab **Settings Window (`Cmd+,`)** across **General**, **Thresholds**, **Notifications**, and **Diagnostics**.
-- **Dual-Channel Alerting with Cooldowns**: Dispatches stateful alerts via native macOS Notification Center (`UNUserNotificationCenter`) and optional Telegram Bot HTML messages with configurable per-drive alert cooldowns.
-- **macOS Keychain Credential Protection**: Stores sensitive tokens (`telegramBotToken`) in the native macOS Keychain (`Security.framework`) with automatic `0600` file fallback for headless SSH/LaunchAgent environments.
+- **IOKit Registry Traversal & APFS Physical Store Resolution**: Enumerates mounted volumes via `getfsstat(2)` and `DADiskCreateFromBSDName`, then walks the `kIOServicePlane` parent hierarchy to resolve synthesized APFS containers (`diskXsY` -> `AppleAPFSVolume` -> `AppleAPFSContainer` -> physical `IOMedia`) back to the underlying `IOBlockStorageDriver`, `IONVMeController`, or `IOUSBHostDevice`.
+- **128-Bit Native NVMe SMART Telemetry**: Queries `IONVMeSMARTInterface` (Log Page `02h`) and decodes full 16-byte little-endian counters (`Data Units Read`, `Data Units Written`, `Power Cycles`, `Power On Hours`, `Unsafe Shutdowns`, `Media and Data Integrity Errors`, `Available Spare`, `Percentage Used`, and `Composite Temperature`) without 64-bit integer truncation.
+- **USB / Thunderbolt Transport & Bridge Diagnostics**: Inspects `IOBlockStorageDriver` statistics (`Statistics` dictionary for read/write ops, bytes transferred, cumulative latency, and I/O errors) and USB device speed negotiation (`Device Speed` / link rate in bps) for external enclosures that lack SAT/NVMe SMART pass-through.
+- **Active Canary Filesystem Probe**: Performs periodic non-destructive write, `fsync(2)`, read-back verification, and `unlink(2)` checks on mounted writable volumes to detect silent read-only remounts, hung I/O queues, or controller lockups before metadata corruption occurs.
+- **Stateful Alerting & Keychain Credential Storage**: Dispatches transition-aware alerts (`HEALTHY` <-> `WARNING` <-> `CRITICAL`) with configurable per-drive cooldowns via `UNUserNotificationCenter` and the Telegram Bot API. Credentials are stored in the macOS Keychain (`Security.framework`) with an automatic `0600` file fallback for headless SSH/LaunchAgent execution.
 
 ---
 
-## Repository Architecture
-
-Every directory in this repository includes its own `README.md` documenting its internal design, data flow, and files:
+## System Architecture
 
 ```text
 disk-health-monitor/
-├── build_and_install.sh          # Universal build, test, and LaunchAgent installer script
+├── build_and_install.sh          # Build, test, packaging, and LaunchAgent installer script
 ├── .env.example                  # Template environment variable configuration
 ├── assets/                       # Generated macOS AppIcon.png (1024x1024) and AppIcon.icns
 ├── scripts/                      # Build-time utilities (CoreGraphics vector AppIcon generator)
 ├── logs/                         # Runtime logs, latest JSON telemetry snapshot, and state persistence
-├── tests/                        # C/IOKit unit and hardware integration test suite
-└── src/                          # Modular C11 + Swift 5 source code
+├── tests/                        # C11/IOKit unit and Swift engine integration test suite
+└── src/                          # Modular C11 + Swift 5 source tree
     ├── main.swift                # Entrypoint, CLI argument router, and NSApplication bootstrap
     ├── bridge/                   # Low-level C11 IOKit / DiskArbitration / NVMe SMART bridge
     │   ├── DiskHealthBridge.h    # Public C ABI structs and function declarations
     │   └── DiskHealthBridge.c    # IOKit registry traversal, NVMe SMART client, and statfs calls
-    ├── models/                   # Core domain models, telemetry snapshots, and POSIX formatters
+    ├── models/                   # Domain models, telemetry snapshots, and POSIX formatters
     │   └── HealthModels.swift
     ├── security/                 # macOS Keychain (Security.framework) & 0600 fallback secret store
     │   └── SecretStore.swift
@@ -61,207 +55,213 @@ disk-health-monitor/
     │   └── DiagnosticExporter.swift
     ├── engine/                   # 12-rule health evaluation engine, canary probe, and state tracker
     │   └── DiskHealthMonitor.swift
-    └── ui/                       # AppKit status bar controller and SwiftUI dashboard/settings views
+    └── ui/                       # AppKit status bar controller and SwiftUI telemetry/configuration views
         ├── AppDelegate.swift
         ├── DashboardMenuView.swift
         └── SettingsView.swift
 ```
 
-### Subfolder Documentation Index
+### Module Documentation Index
 
-| Directory | Documentation Link | Purpose |
+| Directory | Documentation | Scope |
 | :--- | :--- | :--- |
-| [`src/`](src/README.md) | [src/README.md](src/README.md) | Architectural overview of the C + Swift compilation pipeline and module interactions |
-| [`src/bridge/`](src/bridge/README.md) | [src/bridge/README.md](src/bridge/README.md) | IOKit registry traversal, APFS physical store resolution, NVMe SMART plugin querying |
+| [`src/`](src/README.md) | [src/README.md](src/README.md) | C11 + Swift compilation pipeline and inter-module data flow |
+| [`src/bridge/`](src/bridge/README.md) | [src/bridge/README.md](src/bridge/README.md) | `kIOServicePlane` traversal, APFS physical store resolution, `IOCFPlugInInterface` NVMe SMART queries |
 | [`src/models/`](src/models/README.md) | [src/models/README.md](src/models/README.md) | Telemetry data structures (`DiskHealthSnapshot`), severity levels, and thread-safe formatters |
 | [`src/security/`](src/security/README.md) | [src/security/README.md](src/security/README.md) | `Security.framework` Keychain storage and restricted `0600` headless fallback |
-| [`src/config/`](src/config/README.md) | [src/config/README.md](src/config/README.md) | Multi-source config resolution, `.env` parsing, secret redaction, and logging |
-| [`src/notifications/`](src/notifications/README.md) | [src/notifications/README.md](src/notifications/README.md) | Native macOS notifications (`UNUserNotificationCenter`) and Telegram Bot API client |
-| [`src/diagnostics/`](src/diagnostics/README.md) | [src/diagnostics/README.md](src/diagnostics/README.md) | Self-contained diagnostic report exporter (`DiagnosticReport`) |
-| [`src/engine/`](src/engine/README.md) | [src/engine/README.md](src/engine/README.md) | Core health check orchestration, 12 evaluation rules, canary write probe, and alert cooldowns |
-| [`src/ui/`](src/ui/README.md) | [src/ui/README.md](src/ui/README.md) | Menu bar controller, popover telemetry card, and 4-tab `Cmd+,` Settings window |
-| [`tests/`](tests/README.md) | [tests/README.md](tests/README.md) | C/IOKit unit, Swift core engine unit, and CLI integration test suite |
-| [`scripts/`](scripts/README.md) | [scripts/README.md](scripts/README.md) | CoreGraphics vector icon generator script |
-| [`assets/`](assets/README.md) | [assets/README.md](assets/README.md) | Generated application icons (`AppIcon.png`, `AppIcon.icns`) and UI screenshots |
+| [`src/config/`](src/config/README.md) | [src/config/README.md](src/config/README.md) | Multi-source config resolution, `.env` parser, secret redaction, and structured logging |
+| [`src/notifications/`](src/notifications/README.md) | [src/notifications/README.md](src/notifications/README.md) | `UNUserNotificationCenter` dispatcher and Telegram Bot HTTP client |
+| [`src/diagnostics/`](src/diagnostics/README.md) | [src/diagnostics/README.md](src/diagnostics/README.md) | Self-contained diagnostic report serializer (`DiagnosticReport`) |
+| [`src/engine/`](src/engine/README.md) | [src/engine/README.md](src/engine/README.md) | Health evaluation heuristics, canary I/O probe, delta tracking, and alert cooldown state machine |
+| [`src/ui/`](src/ui/README.md) | [src/ui/README.md](src/ui/README.md) | `NSStatusItem` controller and SwiftUI telemetry views |
+| [`tests/`](tests/README.md) | [tests/README.md](tests/README.md) | C11/IOKit unit tests, Swift engine unit tests, and CLI integration suite |
+| [`scripts/`](scripts/README.md) | [scripts/README.md](scripts/README.md) | CoreGraphics vector icon generator |
 | [`logs/`](logs/README.md) | [logs/README.md](logs/README.md) | Runtime log files, latest telemetry JSON, and delta state persistence |
-| [`.github/workflows/`](.github/workflows/ci-release.yml) | [ci-release.yml](.github/workflows/ci-release.yml) | GitHub Actions CI test pipeline and automated Universal macOS Release packager |
+| [`.github/workflows/`](.github/workflows/ci-release.yml) | [ci-release.yml](.github/workflows/ci-release.yml) | GitHub Actions CI test pipeline and multi-architecture release packager |
 
 ---
 
-## Requirements & Building
+## 12-Point Health Evaluation Engine
 
-- **Operating System**: macOS 13.0 (Ventura) or later (Apple Silicon or Intel).
-- **Toolchain**: Xcode Command Line Tools (`xcode-select --install`) providing `clang`, `swiftc`, and `iconutil`.
+Each check cycle collects a `DiskHealthSnapshot` via `DiskHealthBridge.c` and evaluates 12 deterministic rules in `DiskHealthMonitor.swift`:
 
-### Build the Application Bundle
+| # | Rule | Telemetry Source | Trigger Condition | Severity |
+| :--- | :--- | :--- | :--- | :--- |
+| **1** | **Mount Availability & Subpaths** | `statfs(2)`, `FileManager` | Target volume unmounted or any configured `requiredSubpaths` missing | `CRITICAL` |
+| **2** | **Hardware SMART Status** | `IOBlockStorageDevice` / NVMe Critical Warning (`Byte 0`) | Hardware reports SMART failure or NVMe Critical Warning bitmask `!= 0` | `CRITICAL` |
+| **3** | **NVMe Available Spare** | NVMe SMART Log `02h` (`Bytes 3–4`) | `availableSpare < availableSpareThreshold` (`CRITICAL`) or `< 20%` (`WARNING`) | `WARNING` / `CRITICAL` |
+| **4** | **NVMe Wear (`Percentage Used`)** | NVMe SMART Log `02h` (`Byte 5`) | `percentageUsed >= 90%` (`WARNING`) or `>= 100%` (`CRITICAL`) | `WARNING` / `CRITICAL` |
+| **5** | **Drive Composite Temperature** | NVMe SMART Log `02h` (`Bytes 1–2`) | `temperatureCelsius >= tempWarningCelsius` or `>= tempCriticalCelsius` | `WARNING` / `CRITICAL` |
+| **6** | **Host Thermal Pressure** | `NSProcessInfo.thermalState` | Host macOS thermal state in `.serious` (`WARNING`) or `.critical` (`CRITICAL`) | `WARNING` / `CRITICAL` |
+| **7** | **Media & Kernel I/O Errors** | NVMe Log `02h` (`Bytes 160–175`) & `IOBlockStorageDriver` | Non-zero delta in `mediaErrors`, `Read Errors`, or `Write Errors` since prior snapshot | `WARNING` / `CRITICAL` |
+| **8** | **I/O Latency Spikes** | `IOBlockStorageDriver` (`Total Read/Write Time`) | Average read/write operation latency exceeds threshold (`> 50 ms` warn, `> 200 ms` crit) | `WARNING` / `CRITICAL` |
+| **9** | **Bus Speed Negotiation** | `IOUSBHostDevice` (`Device Speed`) | USB link negotiates below `minExpectedUsbSpeedBps` (e.g., SuperSpeed drive on USB 2.0 `480 Mbps`) | `WARNING` |
+| **10** | **Unsafe Shutdown Delta** | NVMe SMART Log `02h` (`Bytes 144–159`) | `unsafeShutdowns` counter incremented relative to persisted state (`logs/state.json`) | `WARNING` |
+| **11** | **Capacity & Free Space** | `statfs(2)` (`f_bavail * f_bsize`) | Usage `%` above warning/critical ceiling OR free GB below warning/critical floor | `WARNING` / `CRITICAL` |
+| **12** | **Filesystem Writability & Integrity** | Active Canary Probe & `diskutil verifyVolume` | Read-only mount flags (`MNT_RDONLY`), canary write/fsync/read failure, or `--deep` verification error | `CRITICAL` |
+
+### NVMe Wear & Lifespan Calculation
+
+For NVMe devices, remaining lifespan is computed from **NVMe SMART/Health Information Log Page `02h`, Byte 5 (`Percentage Used`)**:
+
+$$\text{Remaining Lifespan (\%)} = \max(0, 100 - \text{Percentage Used})$$
+
+- Per the NVM Express Base Specification, `Percentage Used` is an integer reported in **1% increments** (values `0` to `255`).
+- Controllers frequently round fractional wear (`> 0.0%` of rated TBW) up to `1%`, resulting in `99%` reported remaining lifespan on healthy drives with minor write volume.
+- External USB enclosures that block SCSI/ATA Translation (SAT) or NVMe pass-through report `smartSupported = false` (`percentageUsed = -1`) and are evaluated via rules 1, 6, 7, 8, 9, 11, and 12.
+
+---
+
+## Requirements & Build Pipeline
+
+- **OS**: macOS 13.0 (Ventura) or newer (`arm64` Apple Silicon or `x86_64` Intel).
+- **Toolchain**: Xcode Command Line Tools (`xcode-select --install`) providing `clang`, `swiftc`, `lipo`, and `iconutil`.
+
+### Build From Source
 
 ```bash
 ./build_and_install.sh
 ```
 
-What `./build_and_install.sh` does:
-1. Generates `assets/AppIcon.png` and `assets/AppIcon.icns` via `scripts/generate_app_icon.swift` if not already cached.
-2. Compiles `src/bridge/DiskHealthBridge.c` into a C11 object file (`build/DiskHealthBridge.o`).
-3. Compiles all Swift modules under `src/` and links them with `DiskHealthBridge.o` and macOS system frameworks (`Cocoa`, `SwiftUI`, `IOKit`, `DiskArbitration`, `Security`, `UserNotifications`) into `DiskHealthMonitor.app`.
-4. Ad-hoc codesigns `DiskHealthMonitor.app`.
-5. Creates a local convenience symlink `./disk-health -> DiskHealthMonitor.app/Contents/MacOS/DiskHealthMonitor` (git-ignored) so you can run CLI commands directly from the project root.
+Build stages executed by `build_and_install.sh`:
+1. Generates `assets/AppIcon.png` and `assets/AppIcon.icns` via `scripts/generate_app_icon.swift` if not cached.
+2. Compiles `src/bridge/DiskHealthBridge.c` (`-std=c11 -Wall -Wextra -O2`) into `build/DiskHealthBridge.o`.
+3. Compiles all Swift modules under `src/` and links against `DiskHealthBridge.o` and system frameworks (`Cocoa`, `SwiftUI`, `IOKit`, `DiskArbitration`, `Security`, `UserNotifications`) to produce `DiskHealthMonitor.app`.
+4. Applies an ad-hoc code signature (`codesign --force --deep --sign -`).
+5. Creates a local symlink `./disk-health -> DiskHealthMonitor.app/Contents/MacOS/DiskHealthMonitor`.
 
-### Optional Build, Test & Packaging Flags
+### Build, Test & Packaging Targets
 
 ```bash
-# Run the C/IOKit, Swift core engine, and CLI integration test suite
+# Execute C11/IOKit unit tests, Swift engine tests, and CLI integration tests
 ./build_and_install.sh --test
 
-# Build and package architecture-specific (arm64, x86_64) and Universal assets into dist/
+# Cross-compile and package arm64, x86_64, and Universal release artifacts in dist/
 ./build_and_install.sh --package
-# Produces in dist/:
-#   - DiskHealthMonitor-macOS-arm64.dmg & .zip      (Apple Silicon M1/M2/M3/M4)
-#   - DiskHealthMonitor-macOS-x86_64.dmg & .zip    (Intel 64-bit / x64)
+# Artifacts produced in dist/:
+#   - DiskHealthMonitor-macOS-arm64.dmg & .zip      (Apple Silicon)
+#   - DiskHealthMonitor-macOS-x86_64.dmg & .zip    (Intel x86_64)
 #   - DiskHealthMonitor-macOS-universal.dmg & .zip (Universal Binary)
 #   - disk-health-arm64, disk-health-x86_64, disk-health-universal (Standalone CLI)
-#   - SHA256SUMS.txt (Cryptographic verification checksums)
+#   - SHA256SUMS.txt
 
-# Symlink the CLI binary to /usr/local/bin/disk-health
+# Symlink CLI binary into /usr/local/bin/disk-health
 ./build_and_install.sh --install-cli
 
-# Install and start background LaunchAgents
+# Install and load background LaunchAgents (periodic check + mount watcher)
 ./build_and_install.sh --install-service
 
-# Stop and remove background LaunchAgents
+# Unload and remove background LaunchAgents
 ./build_and_install.sh --uninstall-service
 ```
 
 ---
 
-## Usage Guide
-
-### 1. Menu Bar Application (Default)
-
-Launch the app bundle or run the binary without arguments:
+## Command-Line Interface (CLI) Reference
 
 ```bash
-open DiskHealthMonitor.app
-# or
-./disk-health --menubar
+./disk-health [FLAG] [OPTIONS]
 ```
-
-- Click the menu bar icon to inspect real-time health, temperature, SSD wear, bus speed, and session I/O counters.
-- Switch between mounted drives using the **Switch Monitored Drive** submenu.
-- Press **`Cmd+,`** (or click **Settings (`Cmd+,`)...**) to configure target drives, alert thresholds, native/Telegram notifications, and diagnostic exports.
-
-### 2. Command-Line Interface (CLI)
 
 | Flag | Description |
 | :--- | :--- |
-| `--status` | Run an immediate health check and print a formatted report to `stdout` |
-| `--json` | Run a health check and output the raw `DiskHealthSnapshot` as pretty-printed JSON |
-| `--list-disks` | List all currently mounted internal and external disks detected via IOKit |
-| `--check` | Run a single background check cycle (evaluates thresholds, updates `logs/`, sends alerts) |
-| `--watch-mounts` | Run a check triggered by a DiskArbitration/LaunchAgent mount event |
-| `--deep` | Include `diskutil verifyVolume` filesystem structure verification during the check |
-| `--volume <path>` | Override the target mount path (e.g. `--volume "/Volumes/ExternalSSD"` or `--volume /`) |
-| `--device <query>` | Override the target BSD device or model name (e.g. `--device disk4`) |
-| `--export-config <path>` | Export the active configuration to `<path>` with secrets automatically redacted |
-| `--export-diagnostics <path>` | Export a comprehensive JSON diagnostic bundle (OS info, disk list, snapshot, redacted config, recent logs) |
-| `--version`, `-v` | Display application version and target binary architecture (`arm64` or `x86_64`) |
-| `--help`, `-h` | Show CLI usage instructions |
+| `--status` | Run an immediate health evaluation and print a structured report to `stdout` |
+| `--json` | Run a health evaluation and serialize the full `DiskHealthSnapshot` as JSON to `stdout` |
+| `--list-disks` | Enumerate all mounted internal and external block devices discovered via IOKit |
+| `--check` | Execute a single daemon check cycle (evaluates thresholds, persists state/logs, dispatches alerts) |
+| `--watch-mounts` | Execute a mount-triggered evaluation cycle (invoked by `LaunchAgent` `WatchPaths` on `/Volumes`) |
+| `--deep` | Append `diskutil verifyVolume` filesystem metadata verification to the check cycle |
+| `--volume <path>` | Target a specific mount point (e.g., `--volume /` or `--volume "/Volumes/ExternalSSD"`) |
+| `--device <query>` | Target a specific BSD unit, device model, or serial (e.g., `--device disk4`) |
+| `--menubar` | Start the persistent `NSStatusItem` background telemetry daemon (default when launched without arguments) |
+| `--export-config <path>` | Export the resolved configuration JSON to `<path>` with secrets redacted |
+| `--export-diagnostics <path>` | Export a diagnostic JSON bundle (OS build, IOKit disk list, latest snapshot, redacted config, recent logs) |
+| `--version`, `-v` | Print version and compiled binary architecture (`arm64` or `x86_64`) |
+| `--help`, `-h` | Display CLI usage synopsis |
+
+### Exit Codes
+
+When invoked in CLI check modes (`--status`, `--json`, `--check`, `--watch-mounts`), the process exits with a deterministic status code suitable for cron jobs, monitoring agents, or CI scripts:
+
+- `0`: `HEALTHY` — All evaluated rules passed.
+- `1`: `WARNING` — One or more warning thresholds exceeded; no critical failures.
+- `2`: `CRITICAL` — Hardware SMART failure, unmounted target, I/O error, or critical threshold breached.
 
 ---
 
-## How SSD Lifespan & Wear Are Calculated
+## Configuration Schema & Precedence
 
-For NVMe drives, SSD lifespan is derived directly from the hardware controller's **NVMe SMART/Health Information Log (Log Page `02h`, Byte 5: `Percentage Used`)**:
+Configuration parameters are resolved in the following priority order (highest to lowest):
 
-$$\text{Remaining Lifespan (\%)} = \max(0, 100 - \text{Percentage Used})$$
-
-- Per the NVMe specification, `Percentage Used` is an integer reported by the controller firmware in **1% increments**.
-- As soon as a new drive accumulates any measurable wear above `0.0%` (for example, `0.2%` or `0.5%` of its rated Terabytes Written), many NVMe controllers (including Apple Silicon internal SSDs) round up and report `Percentage Used = 1%`, which displays as **99% Lifespan (`1% used`)**.
-- USB-bridged external drives that block SAT/NVMe SMART pass-through over USB Mass Storage (`smartSupported == false`) report `percentageUsed = -1` (`N/A`) and rely on active canary I/O probes, kernel I/O error counters, latency tracking, and bus negotiation checks instead.
-
----
-
-## Settings Window (`Cmd+,`) & Configuration Guide
-
-Press **`Cmd+,`** while the menu bar app is open (or select **Settings (`Cmd+,`)...** from the status bar menu) to open the 4-tab native macOS Preferences window:
-
-### 1. General Tab (`Target Drive & Service`)
-- **Monitored Disk / Volume**: Choose **Auto-Detect First External Drive** (default) or select any specific hardware block device (`diskX`) or mounted volume (`/Volumes/...`, `/`) from the live dropdown.
-- **Target Volume Mount Path (`targetVolumePath`)**: Optional explicit mount point override (e.g., `/Volumes/MediaSSD`).
-- **Target Device Query (`targetDeviceQuery`)**: Optional BSD device name (`disk4`), drive product model (`External SSD`), or hardware serial number.
-- **Required Subpaths (`requiredSubpaths`)**: Optional comma-separated list of relative paths inside the volume that must exist and remain accessible whenever the volume is mounted.
-- **Enable Active Canary Write/Read Probe (`enableActiveCanary`)**: Toggles the periodic `.disk_health_canary_probe` write, `fsync()`, read-back, and unlink test on writable volumes (default: `true`).
-- **Background Polling Interval (`pollIntervalSeconds`)**: Controls how frequently the menu bar daemon evaluates drive health (`10s`, `30s`, `60s`, `5m`, or `15m`; default: `30s`).
-- **Launch at Login (`LaunchAgent`)**: One-click toggle that installs or removes `~/Library/LaunchAgents/io.github.disk-health-monitor.plist` via `launchctl`.
-
-### 2. Thresholds Tab (`Thermal, Capacity & Bus Rules`)
-All sliders enforce automatic safety bounds (e.g., `Warning < Critical`) and update live:
-- **Temperature Warning (`tempWarningCelsius`)**: Triggers a `WARNING` alert when drive temperature reaches this threshold (default: `58°C`, range: `35°C–80°C`).
-- **Temperature Critical (`tempCriticalCelsius`)**: Triggers a `CRITICAL` alert when drive temperature reaches this threshold (default: `68°C`, range: `45°C–95°C`).
-- **Disk Used Warning (`diskUsedWarningPercent`)**: Triggers a `WARNING` when volume usage exceeds this percentage (default: `85%`).
-- **Disk Used Critical (`diskUsedCriticalPercent`)**: Triggers a `CRITICAL` alert when volume usage exceeds this percentage (default: `93%`).
-- **Minimum Free Space Warning (`minFreeSpaceWarningGB`)**: Triggers a `WARNING` when free capacity drops below this floor (default: `30 GB`).
-- **Minimum Free Space Critical (`minFreeSpaceCriticalGB`)**: Triggers a `CRITICAL` alert when free capacity drops below this floor (default: `15 GB`).
-- **Minimum Expected USB Bus Speed (`minExpectedUsbSpeedBps`)**: Alerts if an external USB drive negotiates below expected link speed (`480 Mbps` USB 2.0, `5 Gbps` USB 3.0 SuperSpeed, or `10 Gbps` USB 3.2 Gen 2; default: `5 Gbps`).
-- **Reset to Recommended Defaults**: Restores all threshold settings to their factory defaults.
-
-### 3. Notifications Tab (`macOS & Telegram Alerts`)
-- **Enable Native macOS Notifications (`enableNativeNotifications`)**: Toggles native macOS Notification Center alerts (`UNUserNotificationCenter`) with sound and banner support (default: `true`).
-- **Telegram Bot Token & Chat ID**: Configures instant remote mobile/desktop push alerts via the Telegram Bot API.
-- **Alert Cooldown Period (`alertCooldownSeconds`)**: Minimum quiet window before re-sending an alert for the same ongoing issue (`5m`, `15m`, `30m`, `1h`, `6h`, or `24h`; default: `1 hour / 3600s`).
-- **Send Test Message**: Immediately dispatches a live test notification to both macOS Notification Center and your configured Telegram chat, reporting success or any API error inline.
-
-### 4. Diagnostics Tab (`Config & Telemetry Export`)
-- **Configuration & Logs Directories**: Shows the active paths (`~/.config/disk-health-monitor` and `logs/`) with one-click **Reveal in Finder** buttons.
-- **Export / Import Configuration JSON**: Saves a sanitized copy of your configuration (with secrets masked as `•••••••• (Protected)`) or imports a previously saved `.json` profile.
-- **Export Full Diagnostic Bundle**: Writes a comprehensive JSON report containing macOS version info, all discovered IOKit storage devices, the latest `DiskHealthSnapshot`, sanitized configuration, and recent `health.log` lines.
-
----
-
-## How to Configure Telegram Notifications
-
-You can receive rich HTML alerts (for `WARNING`, `CRITICAL`, and `✅ HEALTHY` recovery transitions) by providing your **Telegram Bot Token** and **Chat ID** using any of the three methods below:
-
-### Option A: Via the Menu Bar Settings UI (`Cmd+,`) — *Recommended*
-1. Launch `DiskHealthMonitor.app` and press **`Cmd+,`** to open **Settings**.
-2. Switch to the **Notifications** tab.
-3. Paste your **Bot Token** into the **Bot Token** field (click the eye icon to verify it) and enter your **Chat ID**.
-4. Your Bot Token is automatically saved to the **macOS Keychain** (`Security.framework`, service `io.github.disk-health-monitor`) and written as `"REDACTED_IN_KEYCHAIN"` inside `~/.config/disk-health-monitor/config.json` (`0600` permissions).
-5. Click **Send Test Message** to verify delivery.
-
-### Option B: Via a `.env` File
-Copy `.env.example` to `.env` in the project root (or `~/.config/disk-health-monitor/.env`) and restrict its permissions:
-```bash
-cp .env.example .env
-chmod 600 .env
-```
-Edit `.env`:
-```dotenv
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
-TELEGRAM_CHAT_ID=your_telegram_chat_id_here
-```
-
-### Option C: Via Environment Variables
-Pass the credentials directly when invoking the CLI or service:
-```bash
-TELEGRAM_BOT_TOKEN="your_telegram_bot_token_here" TELEGRAM_CHAT_ID="your_telegram_chat_id_here" ./disk-health --check
-```
-
----
-
-## Configuration Precedence & Security
-
-Configuration settings are merged in the following priority order (highest to lowest):
-1. **CLI Arguments** (`--volume`, `--device`, `--deep`)
-2. **Process Environment Variables** (`DISK_HEALTH_VOLUME`, `DISK_HEALTH_DEVICE`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TEMP_WARNING_CELSIUS`, `TEMP_CRITICAL_CELSIUS`, `DISK_USED_WARNING_PERCENT`, `DISK_USED_CRITICAL_PERCENT`, `MIN_FREE_SPACE_WARNING_GB`, `MIN_FREE_SPACE_CRITICAL_GB`)
+1. **CLI Flags** (`--volume`, `--device`, `--deep`)
+2. **Process Environment Variables**
 3. **Local `.env` File** (`$DISK_HEALTH_ENV_FILE`, `~/.config/disk-health-monitor/.env`, or `./.env`)
-4. **JSON Configuration File** (`~/.config/disk-health-monitor/config.json`, edited via `Cmd+,` Settings)
-5. **Built-In Defaults**
+4. **JSON Configuration File** (`~/.config/disk-health-monitor/config.json`)
+5. **Compiled Defaults**
 
-Sensitive credentials (`telegramBotToken`) are stripped from `config.json` before writing to disk (`0600` permissions) and stored securely in the macOS Keychain under service `io.github.disk-health-monitor` (with a `0600` `~/.config/disk-health-monitor/.secrets.json` fallback for headless SSH environments).
+### Configuration Reference (`config.json` & Environment Variables)
+
+| JSON Key (`config.json`) | Environment Variable | Type | Default | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `targetVolumePath` | `DISK_HEALTH_VOLUME` | `String` | `""` (Auto) | Explicit mount point to monitor (e.g., `/Volumes/WorkSSD` or `/`). Empty auto-selects the first external volume or `/` |
+| `targetDeviceQuery` | `DISK_HEALTH_DEVICE` | `String` | `""` | Match target by BSD disk identifier (`disk4`), model string, or serial number |
+| `requiredSubpaths` | `DISK_HEALTH_REQUIRED_SUBPATHS` | `[String]` | `[]` | Relative paths within `targetVolumePath` that must exist when mounted (comma-separated in ENV) |
+| `enableActiveCanary` | `ENABLE_ACTIVE_CANARY` | `Bool` | `true` | Write, `fsync()`, read-back, and unlink `.disk_health_canary_probe` on writable volumes |
+| `pollIntervalSeconds` | `POLL_INTERVAL_SECONDS` | `Int` | `30` | Background polling interval in seconds (`10`–`3600`) |
+| `tempWarningCelsius` | `TEMP_WARNING_CELSIUS` | `Int` | `58` | Drive composite temperature warning threshold (`°C`) |
+| `tempCriticalCelsius` | `TEMP_CRITICAL_CELSIUS` | `Int` | `68` | Drive composite temperature critical threshold (`°C`) |
+| `diskUsedWarningPercent` | `DISK_USED_WARNING_PERCENT` | `Double` | `85.0` | Volume capacity usage warning threshold (`%`) |
+| `diskUsedCriticalPercent` | `DISK_USED_CRITICAL_PERCENT` | `Double` | `93.0` | Volume capacity usage critical threshold (`%`) |
+| `minFreeSpaceWarningGB` | `MIN_FREE_SPACE_WARNING_GB` | `Double` | `30.0` | Minimum free space warning floor (`GB`) |
+| `minFreeSpaceCriticalGB` | `MIN_FREE_SPACE_CRITICAL_GB` | `Double` | `15.0` | Minimum free space critical floor (`GB`) |
+| `minExpectedUsbSpeedBps` | `MIN_EXPECTED_USB_SPEED_BPS` | `UInt64` | `5000000000` | Minimum expected USB link speed in bits/sec (`5000000000` = 5 Gbps USB 3.0) |
+| `enableNativeNotifications` | `ENABLE_NATIVE_NOTIFICATIONS` | `Bool` | `true` | Dispatch alerts via macOS `UNUserNotificationCenter` |
+| `telegramBotToken` | `TELEGRAM_BOT_TOKEN` | `String` | `""` | Telegram Bot API token (persisted in macOS Keychain, redacted in `config.json`) |
+| `telegramChatId` | `TELEGRAM_CHAT_ID` | `String` | `""` | Target Telegram chat or channel ID for HTML alert payloads |
+| `alertCooldownSeconds` | `ALERT_COOLDOWN_SECONDS` | `Int` | `3600` | Minimum suppression window (seconds) before repeating an identical alert for the same volume |
+
+### Example `~/.config/disk-health-monitor/config.json`
+
+```json
+{
+  "alertCooldownSeconds": 3600,
+  "diskUsedCriticalPercent": 93,
+  "diskUsedWarningPercent": 85,
+  "enableActiveCanary": true,
+  "enableNativeNotifications": true,
+  "minExpectedUsbSpeedBps": 5000000000,
+  "minFreeSpaceCriticalGB": 15,
+  "minFreeSpaceWarningGB": 30,
+  "pollIntervalSeconds": 30,
+  "requiredSubpaths": [],
+  "targetDeviceQuery": "",
+  "targetVolumePath": "/Volumes/ExternalNVMe",
+  "telegramBotToken": "REDACTED_IN_KEYCHAIN",
+  "telegramChatId": "-1001234567890",
+  "tempCriticalCelsius": 68,
+  "tempWarningCelsius": 58
+}
+```
+
+---
+
+## Credential Security & Headless Operation
+
+- **macOS Keychain Integration**: When `telegramBotToken` is configured, `SecretStore.swift` stores the secret in the login Keychain via `SecItemAdd` / `SecItemUpdate` (`kSecClassGenericPassword`, service `io.github.disk-health-monitor`, account `telegramBotToken`). The on-disk `config.json` (`0600` permissions) stores only the sentinel `"REDACTED_IN_KEYCHAIN"`.
+- **Headless / SSH Fallback**: If the macOS Keychain is locked or inaccessible (e.g., an unauthenticated SSH session or root cron context returning `errSecInteractionNotAllowed`), `SecretStore` falls back to `~/.config/disk-health-monitor/.secrets.json` enforced with POSIX `0600` permissions, or reads `TELEGRAM_BOT_TOKEN` directly from the environment / `.env` file:
+
+```bash
+cp .env.example ~/.config/disk-health-monitor/.env
+chmod 600 ~/.config/disk-health-monitor/.env
+```
+
+```dotenv
+TELEGRAM_BOT_TOKEN=123456789:AAExampleBotTokenValue
+TELEGRAM_CHAT_ID=-1001234567890
+```
 
 ---
 
 ## License
 
 Released under the [MIT License](LICENSE).
-
