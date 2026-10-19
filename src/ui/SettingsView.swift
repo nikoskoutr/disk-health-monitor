@@ -47,19 +47,18 @@ final class SettingsViewModel: ObservableObject {
                 try? FileManager.default.removeItem(atPath: plistPath)
             } else {
                 try? FileManager.default.createDirectory(atPath: agentsDir, withIntermediateDirectories: true)
-                let plistDict: [String: Any] = [
-                    "Label": bundleId,
-                    "ProgramArguments": [binaryPath, "--menubar"],
-                    "WorkingDirectory": logsDir,
-                    "RunAtLoad": true,
-                    "KeepAlive": true,
-                    "StandardOutPath": "\(logsDir)/launchd.out.log",
-                    "StandardErrorPath": "\(logsDir)/launchd.err.log",
-                    "ProcessType": "Interactive"
-                ]
+                try? FileManager.default.createDirectory(atPath: logsDir, withIntermediateDirectories: true)
+                let plistDict = SettingsViewModel.makeLaunchAgentPlistDict(bundleId: bundleId, binaryPath: binaryPath, logsDir: logsDir)
                 if let plistData = try? PropertyListSerialization.data(fromPropertyList: plistDict, format: .xml, options: 0) {
                     try? plistData.write(to: URL(fileURLWithPath: plistPath), options: .atomic)
                 }
+                // Ensure any stale registration is unloaded before bootstrapping
+                let bootout = Process()
+                bootout.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+                bootout.arguments = ["bootout", "gui/\(getuid())/\(bundleId)"]
+                try? bootout.run()
+                bootout.waitUntilExit()
+
                 let bootstrap = Process()
                 bootstrap.executableURL = URL(fileURLWithPath: "/bin/launchctl")
                 bootstrap.arguments = ["bootstrap", "gui/\(getuid())", plistPath]
@@ -186,6 +185,19 @@ final class SettingsViewModel: ObservableObject {
             try? json.write(to: url, atomically: true, encoding: .utf8)
             diagnosticsStatusMsg = "Saved diagnostic report to \(url.lastPathComponent)"
         }
+    }
+
+    static func makeLaunchAgentPlistDict(bundleId: String, binaryPath: String, logsDir: String) -> [String: Any] {
+        return [
+            "Label": bundleId,
+            "ProgramArguments": [binaryPath, "--menubar"],
+            "WorkingDirectory": logsDir,
+            "RunAtLoad": true,
+            "KeepAlive": true,
+            "StandardOutPath": "\(logsDir)/launchd.out.log",
+            "StandardErrorPath": "\(logsDir)/launchd.err.log",
+            "ProcessType": "Interactive"
+        ]
     }
 }
 

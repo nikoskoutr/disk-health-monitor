@@ -6,7 +6,21 @@ import Security
 final class SecretStore {
     static let shared = SecretStore()
     private let serviceName = "io.github.disk-health-monitor"
-    var configDir: String? = nil
+    private let lock = NSRecursiveLock()
+    private var _configDir: String? = nil
+
+    var configDir: String? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _configDir
+        }
+        set {
+            lock.lock()
+            defer { lock.unlock() }
+            _configDir = newValue
+        }
+    }
 
     private var isCustomConfigDirOverride: Bool {
         if let env = ProcessInfo.processInfo.environment["DISK_HEALTH_CONFIG_DIR"], !env.isEmpty {
@@ -31,6 +45,8 @@ final class SecretStore {
 
     @discardableResult
     func setSecret(_ value: String, forKey key: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
         if value.isEmpty {
             return deleteSecret(forKey: key)
         }
@@ -86,6 +102,8 @@ final class SecretStore {
     }
 
     func getSecret(forKey key: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
         if isCustomConfigDirOverride {
             let fallback = loadFallbackSecrets()
             if let val = fallback[key], !val.isEmpty {
@@ -120,6 +138,8 @@ final class SecretStore {
 
     @discardableResult
     func deleteSecret(forKey key: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
         let kcDeleted = isCustomConfigDirOverride ? true : deleteSecretFromKeychain(key: key)
         var secrets = loadFallbackSecrets()
         secrets.removeValue(forKey: key)

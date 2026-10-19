@@ -606,7 +606,7 @@ final class DiskHealthMonitor: ObservableObject {
             }
         }
 
-        // Rule 12: Driver I/O Errors & Volume Verification Status
+        // Rule 12: Driver I/O Errors, Driver Latency & Volume Verification Status
         if hw.statsValid {
             if hw.errorsRead > (driveState.baselineIoReadErrors ?? 0) || hw.errorsWritten > (driveState.baselineIoWriteErrors ?? 0) {
                 issues.append(HealthIssue(
@@ -626,6 +626,24 @@ final class DiskHealthMonitor: ObservableObject {
                 ))
                 score -= 10
             }
+            let (latIssue, latPenalty) = DiskHealthMonitor.evaluateDriverLatency(
+                statsValid: hw.statsValid,
+                operationsRead: hw.operationsRead,
+                operationsWritten: hw.operationsWritten,
+                avgReadLatMs: avgReadLatMs,
+                avgWriteLatMs: avgWriteLatMs
+            )
+            if let issue = latIssue {
+                issues.append(issue)
+                score -= latPenalty
+            }
+        }
+
+        // Host macOS Thermal Pressure Check
+        let (thermalIssue, thermalPenalty) = DiskHealthMonitor.evaluateHostThermal(thermalState: ProcessInfo.processInfo.thermalState)
+        if let issue = thermalIssue {
+            issues.append(issue)
+            score -= thermalPenalty
         }
 
         if !driveState.lastVerifyOk {
@@ -830,9 +848,14 @@ final class DiskHealthMonitor: ObservableObject {
             completion?(false, "Verification already in progress")
             return
         }
+        let snap = self.currentSnapshot ?? self.evaluateHealth(forceCanary: false, allowNotifications: false)
+        let snapMount = snap.mountPoint
+        let cfgVol = ConfigManager.shared.currentConfig.targetVolumePath ?? ""
+        let target = !snapMount.isEmpty ? snapMount : (!cfgVol.isEmpty ? cfgVol : (!snap.bsdName.isEmpty ? "/dev/\(snap.bsdName)" : "/"))
+        let capturedDriveKey = !snap.serialNumber.isEmpty
+            ? snap.serialNumber
+            : (!snap.bsdName.isEmpty ? snap.bsdName : (target.isEmpty ? "default" : target))
         isVerifyingInternal = true
-        let snapMount = self.currentSnapshot?.mountPoint ?? ""
-        let target = !snapMount.isEmpty ? snapMount : (ConfigManager.shared.currentConfig.targetVolumePath ?? "/")
         engineLock.unlock()
 
         if Thread.isMainThread {
@@ -841,7 +864,7 @@ final class DiskHealthMonitor: ObservableObject {
             DispatchQueue.main.async { self.isVerifyingVolume = true }
         }
 
-        ConfigManager.shared.log("Starting diskutil verifyVolume on '\(target)'...")
+        ConfigManager.shared.log("Starting diskutil verifyVolume on '\(target)' (driveKey: \(capturedDriveKey))...")
 
         DispatchQueue.global(qos: .utility).async {
             let proc = Process()
@@ -858,12 +881,15 @@ final class DiskHealthMonitor: ObservableObject {
                 try proc.run()
 
                 // 180-second watchdog timer in case diskutil or child fsck hangs on a wedged USB bridge
+                let timeoutLock = NSLock()
                 var timedOut = false
                 let watchdog = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
                 watchdog.schedule(deadline: .now() + 180.0)
                 watchdog.setEventHandler {
                     if proc.isRunning {
+                        timeoutLock.lock()
                         timedOut = true
+                        timeoutLock.unlock()
                         let pid = proc.processIdentifier
                         proc.terminate()
                         // Close read handle and escalate to SIGKILL after 2s if still alive
@@ -882,9 +908,13 @@ final class DiskHealthMonitor: ObservableObject {
                 watchdog.cancel()
                 try? readHandle.close()
 
+                timeoutLock.lock()
+                let didTimeout = timedOut
+                timeoutLock.unlock()
+
                 let output = String(decoding: data, as: UTF8.self)
                 let timeStr = shortMonthDateFormatter.string(from: Date())
-                if timedOut {
+                if didTimeout {
                     ok = false
                     summary = "Timed out after 180s (\(timeStr))"
                 } else {
@@ -901,10 +931,7 @@ final class DiskHealthMonitor: ObservableObject {
             }
 
             self.engineLock.lock()
-            let driveKey = self.currentSnapshot?.serialNumber.isEmpty == false
-                ? self.currentSnapshot!.serialNumber
-                : (self.currentSnapshot?.bsdName.isEmpty == false ? self.currentSnapshot!.bsdName : "default")
-            self.state.updateDriveState(key: driveKey) {
+            self.state.updateDriveState(key: capturedDriveKey) {
                 $0.lastVerifyTimestamp = Date().timeIntervalSince1970
                 $0.lastVerifyOk = ok
                 $0.lastVerifyResult = summary
@@ -915,10 +942,10 @@ final class DiskHealthMonitor: ObservableObject {
 
             ConfigManager.shared.log("Volume verification finished: ok=\(ok), result=\(summary)")
 
-            let snap = self.evaluateHealth(forceCanary: true, allowNotifications: true)
+            let updatedSnap = self.evaluateHealth(forceCanary: true, allowNotifications: true)
             if sendTelegram {
-                let title = ok ? "\(snap.productName) File System Verification Passed" : "\(snap.productName) File System Verification FAILED"
-                let html = TelegramNotifier.shared.formatReportHTML(snapshot: snap, title: title)
+                let title = ok ? "\(updatedSnap.productName) File System Verification Passed" : "\(updatedSnap.productName) File System Verification FAILED"
+                let html = TelegramNotifier.shared.formatReportHTML(snapshot: updatedSnap, title: title)
                 TelegramNotifier.shared.sendMessageAsync(htmlText: html, disableNotification: ok)
             }
 
@@ -927,5 +954,43 @@ final class DiskHealthMonitor: ObservableObject {
             }
             completion?(ok, summary)
         }
+    }
+
+    // MARK: - Rule 8: Storage Driver Latency Evaluation
+    static func evaluateDriverLatency(statsValid: Bool, operationsRead: UInt64, operationsWritten: UInt64, avgReadLatMs: Double, avgWriteLatMs: Double) -> (issue: HealthIssue?, scorePenalty: Int) {
+        guard statsValid else { return (nil, 0) }
+        let maxAvgLatMs = max(
+            operationsRead >= 100 ? avgReadLatMs : 0.0,
+            operationsWritten >= 100 ? avgWriteLatMs : 0.0
+        )
+        if maxAvgLatMs > 200.0 {
+            return (HealthIssue(
+                code: "IO_LATENCY_CRITICAL",
+                severity: .critical,
+                title: "Critical Storage I/O Latency",
+                detail: String(format: "Average driver latency is %.1f ms R / %.1f ms W (> 200 ms).", avgReadLatMs, avgWriteLatMs)
+            ), 25)
+        } else if maxAvgLatMs > 50.0 {
+            return (HealthIssue(
+                code: "IO_LATENCY_WARNING",
+                severity: .warning,
+                title: "Elevated Storage I/O Latency",
+                detail: String(format: "Average driver latency is %.1f ms R / %.1f ms W (> 50 ms).", avgReadLatMs, avgWriteLatMs)
+            ), 10)
+        }
+        return (nil, 0)
+    }
+
+    // MARK: - Rule 6: Host Thermal State Evaluation
+    static func evaluateHostThermal(thermalState: ProcessInfo.ThermalState) -> (issue: HealthIssue?, scorePenalty: Int) {
+        if thermalState == .critical {
+            return (HealthIssue(
+                code: "HOST_THERMAL_CRITICAL",
+                severity: .warning,
+                title: "Host Mac Thermal Throttling",
+                detail: "macOS reported critical system thermal pressure; storage controller may throttle."
+            ), 10)
+        }
+        return (nil, 0)
     }
 }

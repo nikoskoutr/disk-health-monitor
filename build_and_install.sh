@@ -190,6 +190,7 @@ echo "   CLI symlink: ${SCRIPT_DIR}/disk-health"
 if [[ "${1:-}" == "--install-service" ]] || [[ "${1:-}" == "--service" ]]; then
     echo "📦 Installing LaunchAgent into ${LAUNCH_AGENTS_DIR}..."
     mkdir -p "${LAUNCH_AGENTS_DIR}"
+    mkdir -p "${SCRIPT_DIR}/logs"
 
     cat << EOF > "${SERVICE_PLIST}"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -201,6 +202,7 @@ if [[ "${1:-}" == "--install-service" ]] || [[ "${1:-}" == "--service" ]]; then
     <key>ProgramArguments</key>
     <array>
         <string>${BINARY_PATH}</string>
+        <string>--menubar</string>
     </array>
     <key>WorkingDirectory</key>
     <string>${SCRIPT_DIR}</string>

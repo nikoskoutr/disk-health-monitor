@@ -183,6 +183,21 @@ int main(void) {
     assert(DiskFindMountForBlockDevice("disk0", NULL, sizeof(bogusBuf)) == false);
     printf("  IOObjectIsEqualTo fast resolution and boundary safety verified\n");
 
+    printf("\n=== Test 11: DiskNormalizeLinkSpeedToBps (IMPROVE-V4-06) ===\n");
+    assert(DiskNormalizeLinkSpeedToBps(0) == 0);
+    assert(DiskNormalizeLinkSpeedToBps(1) == 12000000ULL);       // USB 1.1 Full Speed (12 Mbps)
+    assert(DiskNormalizeLinkSpeedToBps(2) == 480000000ULL);      // USB 2.0 High Speed (480 Mbps)
+    assert(DiskNormalizeLinkSpeedToBps(3) == 5000000000ULL);     // USB 3.0 SuperSpeed (5 Gbps)
+    assert(DiskNormalizeLinkSpeedToBps(4) == 10000000000ULL);    // USB 3.1/3.2 SuperSpeed+ (10 Gbps)
+    assert(DiskNormalizeLinkSpeedToBps(5) == 20000000000ULL);    // USB 3.2 Gen 2x2 (20 Gbps)
+    assert(DiskNormalizeLinkSpeedToBps(5000000000ULL) == 5000000000ULL); // Raw bits/sec pass-through
+    assert(DiskNormalizeLinkSpeedToBps(10000000000ULL) == 10000000000ULL);
+    assert(DiskNormalizeLinkSpeedToBps(40000000000ULL) == 40000000000ULL);
+    assert(DiskNormalizeLinkSpeedToBps(1500000ULL) == 1500000ULL);
+    assert(DiskNormalizeLinkSpeedToBps(6) == 6);
+    assert(DiskNormalizeLinkSpeedToBps(UINT64_MAX) == UINT64_MAX);
+    printf("  USB speed codes (0-5), boundaries, and raw bps pass-through verified\n");
+
     printf("\n=== All Bridge Tests Passed Successfully! ===\n");
     return 0;
 }

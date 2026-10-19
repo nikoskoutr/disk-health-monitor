@@ -629,6 +629,217 @@ struct CoreLogicTestRunner {
         assertTrue(reportedArch == kAppArchShort, "Diagnostic system architecture must match kAppArchShort")
         print("  [OK] Architecture (\(kAppArchShort)) & version metadata verified")
 
+        print("=== Swift Unit Test 24: ConfigManager .env & Environment Variable Parsing (IMPROVE-V4-05) ===")
+        // 24a. Test applyEnvironmentVariables for all 15 env keys
+        let mockEnv: [String: String] = [
+            "DISK_HEALTH_VOLUME": "/Volumes/TestCustomDrive",
+            "DISK_HEALTH_DEVICE": "disk42",
+            "DISK_HEALTH_REQUIRED_SUBPATHS": "backups, databases, cache",
+            "ENABLE_ACTIVE_CANARY": "false",
+            "ENABLE_NATIVE_NOTIFICATIONS": "false",
+            "POLL_INTERVAL_SECONDS": "45.0",
+            "ALERT_COOLDOWN_SECONDS": "1800.0",
+            "MIN_EXPECTED_USB_SPEED_BPS": "10000000000",
+            "TELEGRAM_CHAT_ID": "mock_chat_987",
+            "TEMP_WARNING_CELSIUS": "62",
+            "TEMP_CRITICAL_CELSIUS": "74",
+            "DISK_USED_WARNING_PERCENT": "88.5",
+            "DISK_USED_CRITICAL_PERCENT": "94.5",
+            "MIN_FREE_SPACE_CRITICAL_GB": "12.0",
+            "MIN_FREE_SPACE_WARNING_GB": "25.0"
+        ]
+        let baseCfg = DiskHealthConfig()
+        let envParsed = ConfigManager.applyEnvironmentVariables(into: baseCfg, env: mockEnv)
+        assertTrue(envParsed.targetVolumePath == "/Volumes/TestCustomDrive", "targetVolumePath parsed")
+        assertTrue(envParsed.targetDeviceQuery == "disk42", "targetDeviceQuery parsed")
+        assertTrue(envParsed.requiredSubpaths == ["backups", "databases", "cache"], "requiredSubpaths parsed")
+        assertTrue(envParsed.enableActiveCanary == false, "enableActiveCanary parsed")
+        assertTrue(envParsed.enableNativeNotifications == false, "enableNativeNotifications parsed")
+        assertTrue(envParsed.pollIntervalSeconds == 45.0, "pollIntervalSeconds parsed")
+        assertTrue(envParsed.alertCooldownSeconds == 1800.0, "alertCooldownSeconds parsed")
+        assertTrue(envParsed.minExpectedUsbSpeedBps == 10_000_000_000, "minExpectedUsbSpeedBps parsed")
+        assertTrue(envParsed.telegramChatId == "mock_chat_987", "telegramChatId parsed")
+        assertTrue(envParsed.tempWarningCelsius == 62, "tempWarningCelsius parsed")
+        assertTrue(envParsed.tempCriticalCelsius == 74, "tempCriticalCelsius parsed")
+        assertTrue(envParsed.diskUsedWarningPercent == 88.5, "diskUsedWarningPercent parsed")
+        assertTrue(envParsed.diskUsedCriticalPercent == 94.5, "diskUsedCriticalPercent parsed")
+        assertTrue(envParsed.minFreeSpaceCriticalGB == 12.0, "minFreeSpaceCriticalGB parsed")
+        assertTrue(envParsed.minFreeSpaceWarningGB == 25.0, "minFreeSpaceWarningGB parsed")
+
+        // 24b. Test applyEnvironmentVariables overriding an ALREADY populated configuration
+        var populatedCfg = DiskHealthConfig()
+        populatedCfg.targetVolumePath = "/Volumes/OldPath"
+        populatedCfg.telegramChatId = "old_chat_111"
+        populatedCfg.pollIntervalSeconds = 300.0
+        populatedCfg.alertCooldownSeconds = 600.0
+        populatedCfg.tempWarningCelsius = 50
+        populatedCfg.enableActiveCanary = true
+        let overrideEnv: [String: String] = [
+            "DISK_HEALTH_VOLUME": "/Volumes/NewPath",
+            "TELEGRAM_CHAT_ID": "new_chat_222",
+            "POLL_INTERVAL_SECONDS": "15.0",
+            "ALERT_COOLDOWN_SECONDS": "120.0",
+            "TEMP_WARNING_CELSIUS": "65",
+            "ENABLE_ACTIVE_CANARY": "false"
+        ]
+        let overridden = ConfigManager.applyEnvironmentVariables(into: populatedCfg, env: overrideEnv)
+        assertTrue(overridden.targetVolumePath == "/Volumes/NewPath", "DISK_HEALTH_VOLUME must override previous value")
+        assertTrue(overridden.telegramChatId == "new_chat_222", "TELEGRAM_CHAT_ID must override previous value")
+        assertTrue(overridden.pollIntervalSeconds == 15.0, "POLL_INTERVAL_SECONDS must override previous value")
+        assertTrue(overridden.alertCooldownSeconds == 120.0, "ALERT_COOLDOWN_SECONDS must override previous value")
+        assertTrue(overridden.tempWarningCelsius == 65, "TEMP_WARNING_CELSIUS must override previous value")
+        assertTrue(overridden.enableActiveCanary == false, "ENABLE_ACTIVE_CANARY must override previous value")
+
+        // 24c. Test loadDotEnv with all 16 keys including TELEGRAM_BOT_TOKEN
+        let tempEnvDir = "\(NSTemporaryDirectory())env_test_\(UUID().uuidString)"
+        try? FileManager.default.createDirectory(atPath: tempEnvDir, withIntermediateDirectories: true)
+        let dotEnvContent = """
+        # Disk Health Configuration Test File
+        DISK_HEALTH_VOLUME="/Volumes/DotEnvSSD"
+        DISK_HEALTH_DEVICE="disk8"
+        DISK_HEALTH_REQUIRED_SUBPATHS="data, logs, media"
+        ENABLE_ACTIVE_CANARY="true"
+        ENABLE_NATIVE_NOTIFICATIONS="yes"
+        POLL_INTERVAL_SECONDS="60"
+        ALERT_COOLDOWN_SECONDS="7200"
+        MIN_EXPECTED_USB_SPEED_BPS="5000000000"
+        TELEGRAM_BOT_TOKEN="123456:ABC-DEF_MockBotToken"
+        TELEGRAM_CHAT_ID="dot_env_chat_123"
+        TEMP_WARNING_CELSIUS="59"
+        TEMP_CRITICAL_CELSIUS="69"
+        DISK_USED_WARNING_PERCENT="80.0"
+        DISK_USED_CRITICAL_PERCENT="90.0"
+        MIN_FREE_SPACE_CRITICAL_GB="10.0"
+        MIN_FREE_SPACE_WARNING_GB="20.0"
+        """
+        try? dotEnvContent.write(toFile: "\(tempEnvDir)/.env", atomically: true, encoding: .utf8)
+        let (dotConfig, dotToken, dotChat) = ConfigManager.loadDotEnv(into: populatedCfg, configDir: tempEnvDir)
+        assertTrue(dotToken == "123456:ABC-DEF_MockBotToken", "TELEGRAM_BOT_TOKEN loaded from .env")
+        assertTrue(dotChat == "dot_env_chat_123", "TELEGRAM_CHAT_ID loaded from .env")
+        assertTrue(dotConfig.targetVolumePath == "/Volumes/DotEnvSSD", "targetVolumePath overridden by .env")
+        assertTrue(dotConfig.targetDeviceQuery == "disk8", "targetDeviceQuery from .env")
+        assertTrue(dotConfig.requiredSubpaths == ["data", "logs", "media"], "requiredSubpaths from .env")
+        assertTrue(dotConfig.enableActiveCanary == true, "enableActiveCanary from .env")
+        assertTrue(dotConfig.enableNativeNotifications == true, "enableNativeNotifications from .env")
+        assertTrue(dotConfig.pollIntervalSeconds == 60.0, "pollIntervalSeconds from .env")
+        assertTrue(dotConfig.alertCooldownSeconds == 7200.0, "alertCooldownSeconds from .env")
+        assertTrue(dotConfig.minExpectedUsbSpeedBps == 5_000_000_000, "minExpectedUsbSpeedBps from .env")
+        assertTrue(dotConfig.telegramChatId == "dot_env_chat_123", "telegramChatId overridden by .env")
+        assertTrue(dotConfig.tempWarningCelsius == 59, "tempWarningCelsius from .env")
+        assertTrue(dotConfig.tempCriticalCelsius == 69, "tempCriticalCelsius from .env")
+        assertTrue(dotConfig.diskUsedWarningPercent == 80.0, "diskUsedWarningPercent from .env")
+        assertTrue(dotConfig.diskUsedCriticalPercent == 90.0, "diskUsedCriticalPercent from .env")
+        assertTrue(dotConfig.minFreeSpaceCriticalGB == 10.0, "minFreeSpaceCriticalGB from .env")
+        assertTrue(dotConfig.minFreeSpaceWarningGB == 20.0, "minFreeSpaceWarningGB from .env")
+        try? FileManager.default.removeItem(atPath: tempEnvDir)
+        print("  [OK] ConfigManager .env and environment variable parsing verified for all 16 keys with full override semantics")
+
+        print("=== Swift Unit Test 25: Storage Driver Latency & Thermal Health Evaluation (IMPROVE-V4-04) ===")
+        // 25a. Test evaluateDriverLatency boundary conditions
+        let (noStatsIssue, noStatsPenalty) = DiskHealthMonitor.evaluateDriverLatency(
+            statsValid: false, operationsRead: 1000, operationsWritten: 1000, avgReadLatMs: 300.0, avgWriteLatMs: 300.0
+        )
+        assertTrue(noStatsIssue == nil && noStatsPenalty == 0, "Invalid stats must not produce latency issues")
+
+        let (lowOpsIssue, lowOpsPenalty) = DiskHealthMonitor.evaluateDriverLatency(
+            statsValid: true, operationsRead: 50, operationsWritten: 50, avgReadLatMs: 300.0, avgWriteLatMs: 300.0
+        )
+        assertTrue(lowOpsIssue == nil && lowOpsPenalty == 0, "< 100 operations must not produce latency issues (insufficient statistical significance)")
+
+        let (nominalLatIssue, nominalLatPenalty) = DiskHealthMonitor.evaluateDriverLatency(
+            statsValid: true, operationsRead: 100, operationsWritten: 100, avgReadLatMs: 50.0, avgWriteLatMs: 45.0
+        )
+        assertTrue(nominalLatIssue == nil && nominalLatPenalty == 0, "<= 50 ms latency must be considered healthy")
+
+        let (warnLatIssue, warnLatPenalty) = DiskHealthMonitor.evaluateDriverLatency(
+            statsValid: true, operationsRead: 100, operationsWritten: 100, avgReadLatMs: 50.1, avgWriteLatMs: 10.0
+        )
+        guard let wIssue = warnLatIssue else { fatalError("Expected warning latency issue") }
+        assertTrue(wIssue.code == "IO_LATENCY_WARNING", "Must produce IO_LATENCY_WARNING")
+        assertTrue(wIssue.severity == .warning, "Latency warning must have warning severity")
+        assertTrue(warnLatPenalty == 10, "Latency warning penalty must be 10")
+
+        let (critLatIssue, critLatPenalty) = DiskHealthMonitor.evaluateDriverLatency(
+            statsValid: true, operationsRead: 50, operationsWritten: 150, avgReadLatMs: 10.0, avgWriteLatMs: 200.5
+        )
+        guard let cIssue = critLatIssue else { fatalError("Expected critical latency issue") }
+        assertTrue(cIssue.code == "IO_LATENCY_CRITICAL", "Must produce IO_LATENCY_CRITICAL")
+        assertTrue(cIssue.severity == .critical, "Latency critical must have critical severity")
+        assertTrue(critLatPenalty == 25, "Latency critical penalty must be 25")
+
+        // 25b. Test evaluateHostThermal
+        let (nominalThermal, nominalThermalPenalty) = DiskHealthMonitor.evaluateHostThermal(thermalState: .nominal)
+        assertTrue(nominalThermal == nil && nominalThermalPenalty == 0, "Nominal thermal state must produce no issue")
+
+        let (fairThermal, fairThermalPenalty) = DiskHealthMonitor.evaluateHostThermal(thermalState: .fair)
+        assertTrue(fairThermal == nil && fairThermalPenalty == 0, "Fair thermal state must produce no issue")
+
+        let (seriousThermal, seriousThermalPenalty) = DiskHealthMonitor.evaluateHostThermal(thermalState: .serious)
+        assertTrue(seriousThermal == nil && seriousThermalPenalty == 0, "Serious thermal state must produce no issue")
+
+        let (critThermal, critThermalPenalty) = DiskHealthMonitor.evaluateHostThermal(thermalState: .critical)
+        guard let tIssue = critThermal else { fatalError("Expected critical thermal issue") }
+        assertTrue(tIssue.code == "HOST_THERMAL_CRITICAL", "Must produce HOST_THERMAL_CRITICAL")
+        assertTrue(tIssue.severity == .warning, "Host thermal issue must have warning severity")
+        assertTrue(critThermalPenalty == 10, "Host thermal penalty must be 10")
+
+        // 25c. Test snapshot latency fields from live monitor evaluation
+        let snap = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        assertTrue(snap.avgReadLatencyMs >= 0.0, "avgReadLatencyMs must be >= 0")
+        assertTrue(snap.avgWriteLatencyMs >= 0.0, "avgWriteLatencyMs must be >= 0")
+        print("  [OK] Storage driver latency & thermal health evaluation boundaries thoroughly verified")
+
+        print("=== Swift Unit Test 26: SecretStore NSRecursiveLock Thread Safety (IMPROVE-V4-07) ===")
+        let secretGroup = DispatchGroup()
+        for i in 0..<30 {
+            secretGroup.enter()
+            DispatchQueue.global().async {
+                let testKey = "concurrent_key_\(i % 5)"
+                let testVal = "token_val_\(UUID().uuidString)"
+                SecretStore.shared.setSecret(testVal, forKey: testKey)
+                _ = SecretStore.shared.getSecret(forKey: testKey)
+                _ = SecretStore.shared.configDir
+                if i % 3 == 0 {
+                    SecretStore.shared.deleteSecret(forKey: testKey)
+                }
+                secretGroup.leave()
+            }
+        }
+        secretGroup.wait()
+        for i in 0..<5 {
+            SecretStore.shared.deleteSecret(forKey: "concurrent_key_\(i)")
+        }
+        print("  [OK] SecretStore NSRecursiveLock thread safety verified")
+
+        print("=== Swift Unit Test 27: LaunchAgent Plist Structure & Verification Target Isolation (IMPROVE-V4-01 & IMPROVE-V4-02) ===")
+        let mockBundleId = "io.github.disk-health-monitor.test"
+        let mockBinary = "/Applications/DiskHealthMonitor.app/Contents/MacOS/DiskHealthMonitor"
+        let mockLogs = "/Users/testuser/.config/disk-health-monitor/logs"
+        let plistDict = SettingsViewModel.makeLaunchAgentPlistDict(bundleId: mockBundleId, binaryPath: mockBinary, logsDir: mockLogs)
+
+        assertTrue(plistDict["Label"] as? String == mockBundleId, "Label must match bundleId")
+        guard let progArgs = plistDict["ProgramArguments"] as? [String] else { fatalError("ProgramArguments missing") }
+        assertTrue(progArgs.count == 2, "ProgramArguments must contain 2 arguments")
+        assertTrue(progArgs[0] == mockBinary, "First argument must be binary path")
+        assertTrue(progArgs[1] == "--menubar", "Second argument must be --menubar")
+        assertTrue(plistDict["WorkingDirectory"] as? String == mockLogs, "WorkingDirectory must match logsDir")
+        assertTrue(plistDict["StandardOutPath"] as? String == "\(mockLogs)/launchd.out.log", "StandardOutPath must be in logsDir")
+        assertTrue(plistDict["StandardErrorPath"] as? String == "\(mockLogs)/launchd.err.log", "StandardErrorPath must be in logsDir")
+        assertTrue(plistDict["ProcessType"] as? String == "Interactive", "ProcessType must be Interactive")
+        assertTrue(plistDict["RunAtLoad"] as? Bool == true, "RunAtLoad must be true")
+        assertTrue(plistDict["KeepAlive"] as? Bool == true, "KeepAlive must be true")
+
+        let plistData = try? PropertyListSerialization.data(fromPropertyList: plistDict, format: .xml, options: 0)
+        assertTrue(plistData != nil && (plistData?.count ?? 0) > 0, "PropertyListSerialization must generate valid XML data")
+        if let data = plistData,
+           let deserialized = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] {
+            assertTrue(deserialized["Label"] as? String == mockBundleId, "Deserialized Label must match")
+            assertTrue(deserialized["WorkingDirectory"] as? String == mockLogs, "Deserialized WorkingDirectory must match")
+        } else {
+            fatalError("Failed to deserialize generated plist XML")
+        }
+        print("  [OK] LaunchAgent plist structure, --menubar argument, and XML serialization verified")
+
         print("✅ All Swift Core Logic Unit Tests Passed!")
     }
 }

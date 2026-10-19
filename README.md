@@ -92,7 +92,7 @@ Each check cycle collects a `DiskHealthSnapshot` via `DiskHealthBridge.c` and ev
 | **3** | **NVMe Available Spare** | NVMe SMART Log `02h` (`Bytes 3–4`) | `availableSpare < availableSpareThreshold` (`CRITICAL`) or `< 20%` (`WARNING`) | `WARNING` / `CRITICAL` |
 | **4** | **NVMe Wear (`Percentage Used`)** | NVMe SMART Log `02h` (`Byte 5`) | `percentageUsed >= 90%` (`WARNING`) or `>= 100%` (`CRITICAL`) | `WARNING` / `CRITICAL` |
 | **5** | **Drive Composite Temperature** | NVMe SMART Log `02h` (`Bytes 1–2`) | `temperatureCelsius >= tempWarningCelsius` or `>= tempCriticalCelsius` | `WARNING` / `CRITICAL` |
-| **6** | **Host Thermal Pressure** | `NSProcessInfo.thermalState` | Host macOS thermal state in `.serious` (`WARNING`) or `.critical` (`CRITICAL`) | `WARNING` / `CRITICAL` |
+| **6** | **Host Thermal State** | `ProcessInfo.processInfo.thermalState` | Host macOS thermal state in `.critical` (`WARNING`) | `WARNING` |
 | **7** | **Media & Kernel I/O Errors** | NVMe Log `02h` (`Bytes 160–175`) & `IOBlockStorageDriver` | Non-zero delta in `mediaErrors`, `Read Errors`, or `Write Errors` since prior snapshot | `WARNING` / `CRITICAL` |
 | **8** | **I/O Latency Spikes** | `IOBlockStorageDriver` (`Total Read/Write Time`) | Average read/write operation latency exceeds threshold (`> 50 ms` warn, `> 200 ms` crit) | `WARNING` / `CRITICAL` |
 | **9** | **Bus Speed Negotiation** | `IOUSBHostDevice` (`Device Speed`) | USB link negotiates below `minExpectedUsbSpeedBps` (e.g., SuperSpeed drive on USB 2.0 `480 Mbps`) | `WARNING` |

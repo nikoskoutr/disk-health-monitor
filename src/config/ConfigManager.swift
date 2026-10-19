@@ -178,16 +178,16 @@ final class ConfigManager: ObservableObject {
         if let envChat = ProcessInfo.processInfo.environment["TELEGRAM_CHAT_ID"], !envChat.isEmpty {
             return envChat
         }
-        if !config.telegramChatId.isEmpty {
-            return config.telegramChatId
-        }
         if let dotChat = dotEnvChatId, !dotChat.isEmpty {
             return dotChat
+        }
+        if !config.telegramChatId.isEmpty {
+            return config.telegramChatId
         }
         return ""
     }
 
-    private static func loadDotEnv(into cfg: DiskHealthConfig, configDir: String) -> (DiskHealthConfig, String?, String?) {
+    static func loadDotEnv(into cfg: DiskHealthConfig, configDir: String) -> (DiskHealthConfig, String?, String?) {
         var result = cfg
         var foundToken: String? = nil
         var foundChatId: String? = nil
@@ -222,11 +222,23 @@ final class ConfigManager: ObservableObject {
                         result.targetVolumePath = val
                     case "DISK_HEALTH_DEVICE":
                         result.targetDeviceQuery = val
+                    case "DISK_HEALTH_REQUIRED_SUBPATHS":
+                        result.requiredSubpaths = val.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+                    case "ENABLE_ACTIVE_CANARY":
+                        result.enableActiveCanary = (val.lowercased() == "true" || val == "1" || val.lowercased() == "yes")
+                    case "ENABLE_NATIVE_NOTIFICATIONS":
+                        result.enableNativeNotifications = (val.lowercased() == "true" || val == "1" || val.lowercased() == "yes")
+                    case "POLL_INTERVAL_SECONDS":
+                        if let v = TimeInterval(val), v >= 5.0 { result.pollIntervalSeconds = v }
+                    case "ALERT_COOLDOWN_SECONDS":
+                        if let v = TimeInterval(val), v >= 0.0 { result.alertCooldownSeconds = v }
+                    case "MIN_EXPECTED_USB_SPEED_BPS":
+                        if let v = UInt64(val) { result.minExpectedUsbSpeedBps = v }
                     case "TELEGRAM_BOT_TOKEN":
                         foundToken = val
                     case "TELEGRAM_CHAT_ID":
                         foundChatId = val
-                        if result.telegramChatId.isEmpty { result.telegramChatId = val }
+                        result.telegramChatId = val
                     case "TEMP_WARNING_CELSIUS":
                         if let v = Int(val) { result.tempWarningCelsius = v }
                     case "TEMP_CRITICAL_CELSIUS":
@@ -249,12 +261,23 @@ final class ConfigManager: ObservableObject {
         return (result, foundToken, foundChatId)
     }
 
-    private static func applyEnvironmentVariables(into cfg: DiskHealthConfig) -> DiskHealthConfig {
+    static func applyEnvironmentVariables(into cfg: DiskHealthConfig, env: [String: String] = ProcessInfo.processInfo.environment) -> DiskHealthConfig {
         var result = cfg
-        let env = ProcessInfo.processInfo.environment
         if let v = env["DISK_HEALTH_VOLUME"], !v.isEmpty { result.targetVolumePath = v }
         if let v = env["DISK_HEALTH_DEVICE"], !v.isEmpty { result.targetDeviceQuery = v }
-        if let v = env["TELEGRAM_CHAT_ID"], !v.isEmpty && result.telegramChatId.isEmpty { result.telegramChatId = v }
+        if let v = env["DISK_HEALTH_REQUIRED_SUBPATHS"], !v.isEmpty {
+            result.requiredSubpaths = v.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        }
+        if let v = env["ENABLE_ACTIVE_CANARY"], !v.isEmpty {
+            result.enableActiveCanary = (v.lowercased() == "true" || v == "1" || v.lowercased() == "yes")
+        }
+        if let v = env["ENABLE_NATIVE_NOTIFICATIONS"], !v.isEmpty {
+            result.enableNativeNotifications = (v.lowercased() == "true" || v == "1" || v.lowercased() == "yes")
+        }
+        if let v = env["POLL_INTERVAL_SECONDS"], let val = TimeInterval(v), val >= 5.0 { result.pollIntervalSeconds = val }
+        if let v = env["ALERT_COOLDOWN_SECONDS"], let val = TimeInterval(v), val >= 0.0 { result.alertCooldownSeconds = val }
+        if let v = env["MIN_EXPECTED_USB_SPEED_BPS"], let val = UInt64(v) { result.minExpectedUsbSpeedBps = val }
+        if let v = env["TELEGRAM_CHAT_ID"], !v.isEmpty { result.telegramChatId = v }
         if let v = env["TEMP_WARNING_CELSIUS"], let val = Int(v) { result.tempWarningCelsius = val }
         if let v = env["TEMP_CRITICAL_CELSIUS"], let val = Int(v) { result.tempCriticalCelsius = val }
         if let v = env["DISK_USED_WARNING_PERCENT"], let val = Double(v) { result.diskUsedWarningPercent = val }

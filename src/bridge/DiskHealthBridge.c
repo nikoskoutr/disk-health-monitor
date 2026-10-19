@@ -63,6 +63,20 @@ int32_t DiskConvertNVMeTemperature(uint16_t tempRaw) {
     }
 }
 
+// Convert IOKit USB "Device Speed" enum or raw bps to bits per second
+uint64_t DiskNormalizeLinkSpeedToBps(uint64_t rawSpeed) {
+    switch (rawSpeed) {
+        case 0: return 0;
+        case 1: return 12000000ULL;       // USB 1.1 Full Speed (12 Mbps)
+        case 2: return 480000000ULL;      // USB 2.0 High Speed (480 Mbps)
+        case 3: return 5000000000ULL;     // USB 3.0 SuperSpeed (5 Gbps)
+        case 4: return 10000000000ULL;    // USB 3.1/3.2 SuperSpeed+ (10 Gbps)
+        case 5: return 20000000000ULL;    // USB 3.2 Gen 2x2 (20 Gbps)
+        default:
+            return rawSpeed;
+    }
+}
+
 // Inspect parent chain for USB / Thunderbolt / Interconnect properties
 static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwareMetrics *outMetrics) {
     io_registry_entry_t current = entry;
@@ -79,13 +93,17 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
         if (!linkSpeedRef) {
             linkSpeedRef = IORegistryEntryCreateCFProperty(parent, CFSTR("LinkSpeed"), kCFAllocatorDefault, 0);
         }
+        if (!linkSpeedRef) {
+            linkSpeedRef = IORegistryEntryCreateCFProperty(parent, CFSTR("Device Speed"), kCFAllocatorDefault, 0);
+        }
         if (linkSpeedRef) {
             if (CFGetTypeID(linkSpeedRef) == CFNumberGetTypeID() && outMetrics->linkSpeedBps == 0) {
                 uint64_t speed = 0;
                 CFNumberGetValue((CFNumberRef)linkSpeedRef, kCFNumberSInt64Type, &speed);
-                if (speed > 0) {
-                    outMetrics->linkSpeedBps = speed;
-                    outMetrics->usbLinkSpeedBps = speed;
+                uint64_t bps = DiskNormalizeLinkSpeedToBps(speed);
+                if (bps > 0) {
+                    outMetrics->linkSpeedBps = bps;
+                    outMetrics->usbLinkSpeedBps = bps;
                 }
             }
             CFRelease(linkSpeedRef);

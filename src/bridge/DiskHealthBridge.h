@@ -69,6 +69,9 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
 // Convert raw 16-bit NVMe composite temperature to Celsius with boundary validation
 int32_t DiskConvertNVMeTemperature(uint16_t tempRaw);
 
+// Normalize IOKit USB link speed or discrete speed code to bits per second
+uint64_t DiskNormalizeLinkSpeedToBps(uint64_t rawSpeed);
+
 #ifdef __cplusplus
 }
 #endif
