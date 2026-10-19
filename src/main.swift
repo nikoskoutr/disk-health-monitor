@@ -6,7 +6,8 @@ import SwiftUI
 
 func printUsage() {
     print("""
-    Universal macOS Disk Health Monitor & Telemetry Agent
+    Universal macOS Disk Health Monitor & Telemetry Agent [\(kAppArchitecture)]
+    Version: \(kAppVersion) (Build \(kAppBuildNumber))
     Usage: disk-health [OPTIONS]
 
     Commands & Modes:
@@ -22,6 +23,7 @@ func printUsage() {
       --verify              Run volume filesystem verification (diskutil verifyVolume)
       --send-report         Dispatch on-demand HTML health report to Telegram
       --menubar             Launch the macOS Menu Bar status item application (default)
+      --version, -v         Display application version and target binary architecture
       --help, -h            Show this help manual
 
     Target Overrides:
@@ -30,6 +32,7 @@ func printUsage() {
       --notify              When used with --status or --verify, dispatch alerts if unhealthy
 
     Configuration & Environment:
+      Architecture:         \(kAppArchitecture)
       Configuration files:  ~/.config/disk-health-monitor/config.json
       Logs directory:       logs/ (or ~/.config/disk-health-monitor/logs)
       Environment variables: DISK_HEALTH_VOLUME, DISK_HEALTH_DEVICE, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -46,6 +49,11 @@ func parseCommandLine() {
         } else if args[i] == "--device" && i + 1 < args.count {
             ConfigManager.shared.overrideTarget(volumePath: nil, deviceQuery: args[i + 1])
         }
+    }
+
+    if args.contains("--version") || args.contains("-v") {
+        print("Universal Disk Health Monitor v\(kAppVersion) (\(kAppArchitecture))")
+        exit(0)
     }
 
     if args.contains("--help") || args.contains("-h") {
@@ -156,7 +164,7 @@ func parseCommandLine() {
         let snap = DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: notify)
 
         print("============================================================")
-        print("  \(snap.overallSeverity.emoji) DISK HEALTH MONITOR — \(snap.overallSeverity.rawValue) (Score: \(snap.healthScore)/100)")
+        print("  \(snap.overallSeverity.emoji) DISK HEALTH MONITOR — \(snap.overallSeverity.rawValue) (Score: \(snap.healthScore)/100) [\(kAppArchShort)]")
         print("============================================================")
         print("  Device         : \(snap.vendorName) \(snap.productName) (\(snap.bsdName.isEmpty ? "offline" : snap.bsdName))")
         print("  Interconnect   : \(snap.interconnectType) (\(snap.isInternal ? "Internal" : "External")) • \(snap.linkSpeedFormatted)")

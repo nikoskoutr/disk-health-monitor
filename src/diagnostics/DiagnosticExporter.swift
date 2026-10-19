@@ -17,7 +17,8 @@ final class DiagnosticExporter {
             "system": [
                 "osVersion": osVersion,
                 "hostName": hostName,
-                "appVersion": "2.1.0 (Build 3)"
+                "appVersion": "\(kAppVersion) (Build \(kAppBuildNumber))",
+                "architecture": kAppArchShort
             ],
             "target": [
                 "volumePath": cfg.targetVolumePath ?? "auto",

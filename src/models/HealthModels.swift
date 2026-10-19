@@ -1,5 +1,21 @@
 import Foundation
 
+// MARK: - Application Version & Architecture Information
+
+#if arch(arm64)
+public let kAppArchitecture = "arm64 (Apple Silicon)"
+public let kAppArchShort = "arm64"
+#elseif arch(x86_64)
+public let kAppArchitecture = "x86_64 (Intel)"
+public let kAppArchShort = "x86_64"
+#else
+public let kAppArchitecture = "unknown"
+public let kAppArchShort = "unknown"
+#endif
+
+public let kAppVersion = "2.1.0"
+public let kAppBuildNumber = "3"
+
 // MARK: - Data Models
 
 enum HealthSeverity: String, Codable {

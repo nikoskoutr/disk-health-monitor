@@ -28,10 +28,17 @@ jobs:
           chmod +x build_and_install.sh tests/run_tests.sh
           ./build_and_install.sh --package
 
-      - name: Verify Universal Binary Architectures (arm64 + x86_64)
+      - name: Verify Exported Architecture Binaries (arm64, x86_64, Universal)
         run: |
+          echo "=== Standalone CLI Architecture Verification ==="
+          file dist/disk-health-arm64 && lipo -info dist/disk-health-arm64
+          file dist/disk-health-x86_64 && lipo -info dist/disk-health-x86_64
+          file dist/disk-health-universal && lipo -info dist/disk-health-universal
+          echo "=== Bundled Binary Verification ==="
           file DiskHealthMonitor.app/Contents/MacOS/DiskHealthMonitor
           lipo -info DiskHealthMonitor.app/Contents/MacOS/DiskHealthMonitor
+          echo "=== Exported Release Assets Check ==="
+          ls -lh dist/
 
       - name: Run C/IOKit Bridge, Swift Core Engine & CLI Test Suite
         run: |
@@ -49,7 +56,15 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.1.0' }}
-          name: Universal Disk Health Monitor ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.1.0' }} (macOS Universal)
+          name: Universal Disk Health Monitor ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.1.0' }} (macOS arm64 / x86_64 / Universal)
+          body: |
+            ### Universal Disk Health Monitor Release
+            Download the appropriate asset for your Mac architecture:
+            - **Apple Silicon (M1/M2/M3/M4)**: `DiskHealthMonitor-macOS-arm64.dmg` or `DiskHealthMonitor-macOS-arm64.zip` (CLI: `disk-health-arm64`)
+            - **Intel Macs (x86_64)**: `DiskHealthMonitor-macOS-x86_64.dmg` or `DiskHealthMonitor-macOS-x86_64.zip` (CLI: `disk-health-x86_64`)
+            - **Universal (All Macs)**: `DiskHealthMonitor-macOS-universal.dmg` or `DiskHealthMonitor-macOS-universal.zip` (CLI: `disk-health-universal`)
+
+            All SHA-256 checksums are verified in `SHA256SUMS.txt`.
           prerelease: false
           make_latest: true
           fail_on_unmatched_files: true

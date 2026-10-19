@@ -613,6 +613,22 @@ struct CoreLogicTestRunner {
         assertTrue(monitor.dailySummaryEnabled == origDigest, "dailySummaryEnabled must restore original state")
         print("  [OK] Daily Digest state synchronization verified")
 
+        print("=== Swift Unit Test 23: Architecture & Version Telemetry Metadata ===")
+        assertTrue(!kAppArchitecture.isEmpty, "kAppArchitecture must not be empty")
+        assertTrue(!kAppArchShort.isEmpty, "kAppArchShort must not be empty")
+        assertTrue(kAppArchShort == "arm64" || kAppArchShort == "x86_64", "kAppArchShort must be either arm64 or x86_64")
+        assertTrue(kAppVersion == "2.1.0", "kAppVersion must match 2.1.0")
+
+        let diag = DiagnosticExporter.shared.generateDiagnosticReport()
+        guard let sys = diag["system"] as? [String: Any] else {
+            fatalError("system dict missing from diagnostic report")
+        }
+        guard let reportedArch = sys["architecture"] as? String else {
+            fatalError("architecture missing from diagnostic report system info")
+        }
+        assertTrue(reportedArch == kAppArchShort, "Diagnostic system architecture must match kAppArchShort")
+        print("  [OK] Architecture (\(kAppArchShort)) & version metadata verified")
+
         print("✅ All Swift Core Logic Unit Tests Passed!")
     }
 }

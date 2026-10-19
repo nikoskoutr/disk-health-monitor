@@ -59,6 +59,17 @@ echo "--- [3/5] Testing CLI Binary Options ---"
 "${ROOT_DIR}/disk-health" --help > /dev/null
 echo "  [OK] disk-health --help"
 
+VERSION_OUTPUT="$("${ROOT_DIR}/disk-health" --version)"
+if echo "${VERSION_OUTPUT}" | grep -q "Universal Disk Health Monitor" && (echo "${VERSION_OUTPUT}" | grep -q -E "arm64|x86_64"); then
+    echo "  [OK] disk-health --version (${VERSION_OUTPUT})"
+else
+    echo "  [FAIL] disk-health --version failed or missing architecture label: ${VERSION_OUTPUT}"
+    exit 1
+fi
+
+"${ROOT_DIR}/disk-health" -v > /dev/null
+echo "  [OK] disk-health -v"
+
 "${ROOT_DIR}/disk-health" --list-disks > /dev/null
 echo "  [OK] disk-health --list-disks"
 

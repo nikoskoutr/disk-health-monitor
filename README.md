@@ -105,8 +105,14 @@ What `./build_and_install.sh` does:
 # Run the C/IOKit, Swift core engine, and CLI integration test suite
 ./build_and_install.sh --test
 
-# Build a Universal Binary (arm64 + x86_64) and package release assets (.zip, .dmg, SHA256SUMS.txt) into dist/
+# Build and package architecture-specific (arm64, x86_64) and Universal assets into dist/
 ./build_and_install.sh --package
+# Produces in dist/:
+#   - DiskHealthMonitor-macOS-arm64.dmg & .zip      (Apple Silicon M1/M2/M3/M4)
+#   - DiskHealthMonitor-macOS-x86_64.dmg & .zip    (Intel 64-bit / x64)
+#   - DiskHealthMonitor-macOS-universal.dmg & .zip (Universal Binary)
+#   - disk-health-arm64, disk-health-x86_64, disk-health-universal (Standalone CLI)
+#   - SHA256SUMS.txt (Cryptographic verification checksums)
 
 # Symlink the CLI binary to /usr/local/bin/disk-health
 ./build_and_install.sh --install-cli
@@ -150,6 +156,7 @@ open DiskHealthMonitor.app
 | `--device <query>` | Override the target BSD device or model name (e.g. `--device disk4`) |
 | `--export-config <path>` | Export the active configuration to `<path>` with secrets automatically redacted |
 | `--export-diagnostics <path>` | Export a comprehensive JSON diagnostic bundle (OS info, disk list, snapshot, redacted config, recent logs) |
+| `--version`, `-v` | Display application version and target binary architecture (`arm64` or `x86_64`) |
 | `--help`, `-h` | Show CLI usage instructions |
 
 ---

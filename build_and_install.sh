@@ -107,7 +107,9 @@ if [[ "${1:-}" == "--package" ]] || [[ "${1:-}" == "--universal" ]]; then
         -o "${BUILD_CACHE_DIR}/${APP_NAME}-x86_64"
 
     lipo -create -output "${BINARY_PATH}" "${BUILD_CACHE_DIR}/${APP_NAME}-arm64" "${BUILD_CACHE_DIR}/${APP_NAME}-x86_64"
-    rm -f "${BUILD_CACHE_DIR}/${APP_NAME}-arm64" "${BUILD_CACHE_DIR}/${APP_NAME}-x86_64"
+    if [[ "${1:-}" != "--package" ]]; then
+        rm -f "${BUILD_CACHE_DIR}/${APP_NAME}-arm64" "${BUILD_CACHE_DIR}/${APP_NAME}-x86_64"
+    fi
 else
     swiftc -O \
         -module-cache-path "${BUILD_CACHE_DIR}/ModuleCache" \
@@ -225,42 +227,105 @@ fi
 # 7. Release Packaging (--package)
 if [[ "${1:-}" == "--package" ]]; then
     DIST_DIR="${SCRIPT_DIR}/dist"
-    DMG_STAGE="${BUILD_CACHE_DIR}/dmg-stage"
-    rm -rf "${DIST_DIR}" "${DMG_STAGE}"
-    mkdir -p "${DIST_DIR}" "${DMG_STAGE}"
+    rm -rf "${DIST_DIR}"
+    mkdir -p "${DIST_DIR}"
 
-    echo "📦 Packaging Universal Release Assets into ${DIST_DIR}..."
-    # Create macOS ZIP preserving bundle metadata and code signature
-    ditto -c -k --sequesterRsrc --keepParent "${APP_BUNDLE}" "${DIST_DIR}/${APP_NAME}-macOS.zip"
+    echo "📦 Packaging Architecture-Specific & Universal Release Assets into ${DIST_DIR}..."
 
-    # Create macOS DMG with Applications symlink
-    cp -R "${APP_BUNDLE}" "${DMG_STAGE}/"
-    ln -s /Applications "${DMG_STAGE}/Applications"
-    cp "${SCRIPT_DIR}/README.md" "${SCRIPT_DIR}/LICENSE" "${DMG_STAGE}/"
-    if ! hdiutil create -volname "Disk Health Monitor" \
-            -srcfolder "${DMG_STAGE}" \
-            -ov -format UDZO \
-            "${DIST_DIR}/${APP_NAME}.dmg" > /dev/null 2>&1; then
-        # Fall back to userspace hybrid imaging if kernel loopback device access is restricted
-        TMP_RAW="${BUILD_CACHE_DIR}/raw.dmg"
-        rm -f "${TMP_RAW}"
-        hdiutil makehybrid -hfs -hfs-volume-name "Disk Health Monitor" -o "${TMP_RAW}" "${DMG_STAGE}" > /dev/null 2>&1
-        hdiutil convert "${TMP_RAW}" -format UDZO -o "${DIST_DIR}/${APP_NAME}.dmg" -ov > /dev/null 2>&1
-        rm -f "${TMP_RAW}"
-    fi
-    rm -rf "${DMG_STAGE}"
+    create_arch_dmg() {
+        local SOURCE_APP="$1"
+        local OUTPUT_DMG="$2"
+        local VOL_LABEL="$3"
+        local STAGE_DIR="${BUILD_CACHE_DIR}/dmg-stage-$$"
 
-    # Fast-fail release hygiene: verify that DMG was created and is non-empty
-    if [[ ! -s "${DIST_DIR}/${APP_NAME}.dmg" ]]; then
-        echo "❌ Error: Failed to produce valid DMG at ${DIST_DIR}/${APP_NAME}.dmg" >&2
-        exit 1
-    fi
+        rm -rf "${STAGE_DIR}"
+        mkdir -p "${STAGE_DIR}"
+        cp -R "${SOURCE_APP}" "${STAGE_DIR}/${APP_NAME}.app"
+        ln -s /Applications "${STAGE_DIR}/Applications"
+        cp "${SCRIPT_DIR}/README.md" "${SCRIPT_DIR}/LICENSE" "${STAGE_DIR}/"
 
-    # Generate SHA-256 Checksums
+        if ! hdiutil create -volname "${VOL_LABEL}" \
+                -srcfolder "${STAGE_DIR}" \
+                -ov -format UDZO \
+                "${OUTPUT_DMG}" > /dev/null 2>&1; then
+            local TMP_RAW="${BUILD_CACHE_DIR}/raw-$$.dmg"
+            rm -f "${TMP_RAW}"
+            hdiutil makehybrid -hfs -hfs-volume-name "${VOL_LABEL}" -o "${TMP_RAW}" "${STAGE_DIR}" > /dev/null 2>&1
+            hdiutil convert "${TMP_RAW}" -format UDZO -o "${OUTPUT_DMG}" -ov > /dev/null 2>&1
+            rm -f "${TMP_RAW}"
+        fi
+        rm -rf "${STAGE_DIR}"
+
+        if [[ ! -s "${OUTPUT_DMG}" ]]; then
+            echo "❌ Error: Failed to produce valid DMG at ${OUTPUT_DMG}" >&2
+            exit 1
+        fi
+    }
+
+    # 1. Standalone Architecture-Specific CLI Binaries
+    echo "  -> Exporting standalone CLI binaries (arm64, x86_64, universal)..."
+    cp "${BUILD_CACHE_DIR}/${APP_NAME}-arm64" "${DIST_DIR}/disk-health-arm64"
+    chmod +x "${DIST_DIR}/disk-health-arm64"
+
+    cp "${BUILD_CACHE_DIR}/${APP_NAME}-x86_64" "${DIST_DIR}/disk-health-x86_64"
+    chmod +x "${DIST_DIR}/disk-health-x86_64"
+
+    cp "${BINARY_PATH}" "${DIST_DIR}/disk-health-universal"
+    chmod +x "${DIST_DIR}/disk-health-universal"
+
+    # 2. Architecture-Specific Application Bundles
+    ARM_APP="${BUILD_CACHE_DIR}/${APP_NAME}-arm64.app"
+    X86_APP="${BUILD_CACHE_DIR}/${APP_NAME}-x86_64.app"
+    rm -rf "${ARM_APP}" "${X86_APP}"
+    cp -R "${APP_BUNDLE}" "${ARM_APP}"
+    cp -R "${APP_BUNDLE}" "${X86_APP}"
+    cp "${BUILD_CACHE_DIR}/${APP_NAME}-arm64" "${ARM_APP}/Contents/MacOS/${APP_NAME}"
+    cp "${BUILD_CACHE_DIR}/${APP_NAME}-x86_64" "${X86_APP}/Contents/MacOS/${APP_NAME}"
+    codesign --force --deep --sign - "${ARM_APP}" 2>/dev/null || true
+    codesign --force --deep --sign - "${X86_APP}" 2>/dev/null || true
+
+    # 3. Zip Archives
+    echo "  -> Packaging arm64 (Apple Silicon) ZIP..."
+    ditto -c -k --sequesterRsrc --keepParent "${ARM_APP}" "${DIST_DIR}/${APP_NAME}-macOS-arm64.zip"
+
+    echo "  -> Packaging x86_64 (Intel) ZIP..."
+    ditto -c -k --sequesterRsrc --keepParent "${X86_APP}" "${DIST_DIR}/${APP_NAME}-macOS-x86_64.zip"
+
+    echo "  -> Packaging Universal (arm64 + x86_64) ZIP..."
+    ditto -c -k --sequesterRsrc --keepParent "${APP_BUNDLE}" "${DIST_DIR}/${APP_NAME}-macOS-universal.zip"
+    cp "${DIST_DIR}/${APP_NAME}-macOS-universal.zip" "${DIST_DIR}/${APP_NAME}-macOS.zip"
+
+    # 4. DMGs
+    echo "  -> Packaging arm64 (Apple Silicon) DMG..."
+    create_arch_dmg "${ARM_APP}" "${DIST_DIR}/${APP_NAME}-macOS-arm64.dmg" "Disk Health Monitor (arm64)"
+
+    echo "  -> Packaging x86_64 (Intel) DMG..."
+    create_arch_dmg "${X86_APP}" "${DIST_DIR}/${APP_NAME}-macOS-x86_64.dmg" "Disk Health Monitor (x86_64)"
+
+    echo "  -> Packaging Universal (arm64 + x86_64) DMG..."
+    create_arch_dmg "${APP_BUNDLE}" "${DIST_DIR}/${APP_NAME}-macOS-universal.dmg" "Disk Health Monitor (Universal)"
+    cp "${DIST_DIR}/${APP_NAME}-macOS-universal.dmg" "${DIST_DIR}/${APP_NAME}.dmg"
+
+    # Clean temporary stage bundles
+    rm -rf "${ARM_APP}" "${X86_APP}" "${BUILD_CACHE_DIR}/${APP_NAME}-arm64" "${BUILD_CACHE_DIR}/${APP_NAME}-x86_64"
+
+    # 5. Generate Checksums
     (
         cd "${DIST_DIR}"
-        shasum -a 256 "${APP_NAME}-macOS.zip" "${APP_NAME}.dmg" > SHA256SUMS.txt
+        shasum -a 256 \
+            "${APP_NAME}-macOS-arm64.dmg" \
+            "${APP_NAME}-macOS-arm64.zip" \
+            "disk-health-arm64" \
+            "${APP_NAME}-macOS-x86_64.dmg" \
+            "${APP_NAME}-macOS-x86_64.zip" \
+            "disk-health-x86_64" \
+            "${APP_NAME}-macOS-universal.dmg" \
+            "${APP_NAME}-macOS-universal.zip" \
+            "disk-health-universal" \
+            "${APP_NAME}.dmg" \
+            "${APP_NAME}-macOS.zip" > SHA256SUMS.txt
     )
+
     echo "✅ Release assets packaged in ${DIST_DIR}:"
     ls -lh "${DIST_DIR}"
 fi
