@@ -82,6 +82,13 @@ final class DiskHealthMonitor: ObservableObject {
         return state
     }
 
+    func mutateStateForTesting(_ block: (inout DiskPersistentState) -> Void) {
+        engineLock.lock()
+        defer { engineLock.unlock() }
+        block(&self.state)
+        saveStateLocked()
+    }
+
     func setMonitoredTarget(volumePath: String?, deviceQuery: String?) {
         engineLock.lock()
         let newTarget = volumePath ?? deviceQuery ?? "auto"
@@ -765,7 +772,12 @@ final class DiskHealthMonitor: ObservableObject {
 
         for issue in snapshot.issues {
             let scopedKey = "\(driveKey):\(issue.code)"
-            let lastSent = state.lastAlertTimestampByCode[scopedKey] ?? state.lastAlertTimestampByCode[issue.code] ?? 0
+            if let legacyTs = state.lastAlertTimestampByCode.removeValue(forKey: issue.code) {
+                if state.lastAlertTimestampByCode[scopedKey] == nil {
+                    state.lastAlertTimestampByCode[scopedKey] = legacyTs
+                }
+            }
+            let lastSent = state.lastAlertTimestampByCode[scopedKey] ?? 0
             if (nowTs - lastSent) >= cooldown {
                 shouldSendAlert = true
                 state.lastAlertTimestampByCode[scopedKey] = nowTs

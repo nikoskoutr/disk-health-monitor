@@ -41,9 +41,7 @@ final class DiagnosticExporter {
         var recentLogLines: [String] = []
         if let logContent = try? String(contentsOfFile: ConfigManager.shared.logFilePath, encoding: .utf8) {
             let token = ConfigManager.shared.resolvedTelegramBotToken
-            let sanitized = (!token.isEmpty)
-                ? logContent.replacingOccurrences(of: token, with: "[REDACTED_TOKEN]")
-                : logContent
+            let sanitized = TelegramNotifier.redactToken(logContent, token: token)
             let allLines = sanitized.components(separatedBy: .newlines).filter { !$0.isEmpty }
             recentLogLines = Array(allLines.suffix(100))
         }
@@ -141,7 +139,7 @@ final class DiagnosticExporter {
                 "enableActiveCanary": cfg.enableActiveCanary,
                 "enableNativeNotifications": cfg.enableNativeNotifications,
                 "telegramBotToken": ConfigManager.shared.resolvedTelegramBotToken.isEmpty ? "None" : "•••••••• (Protected)",
-                "telegramChatId": cfg.telegramChatId.isEmpty ? "None" : cfg.telegramChatId
+                "telegramChatId": ConfigManager.shared.resolvedTelegramChatId.isEmpty ? "None" : ConfigManager.shared.resolvedTelegramChatId
             ],
             "recentLogLines": recentLogLines
         ]

@@ -51,12 +51,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Dynamic timer polling
         schedulePollingTimer(interval: ConfigManager.shared.currentConfig.pollIntervalSeconds)
 
-        configCancellable = ConfigManager.shared.$config
-            .map(\.pollIntervalSeconds)
-            .removeDuplicates()
+        configCancellable = ConfigManager.shared.objectWillChange
             .receive(on: RunLoop.main)
-            .sink { [weak self] newInterval in
-                self?.schedulePollingTimer(interval: newInterval)
+            .sink { [weak self] _ in
+                guard let self = self else { return }
+                let newInterval = ConfigManager.shared.currentConfig.pollIntervalSeconds
+                if abs(newInterval - self.currentPollInterval) > 0.01 {
+                    self.schedulePollingTimer(interval: newInterval)
+                }
             }
 
         ConfigManager.shared.log("Disk Health Monitor Menu Bar App launched.")
@@ -178,12 +180,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func populateSelectDiskMenu() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.populateSelectDiskMenu()
+            }
+            return
+        }
+
         selectDiskMenu.removeAllItems()
 
         cacheLock.lock()
-        let devices = cachedDevices
-        let mounts = cachedMounts
+        var devices = cachedDevices
+        var mounts = cachedMounts
         cacheLock.unlock()
+
+        if devices.isEmpty && mounts.isEmpty {
+            updateDiskCache()
+            cacheLock.lock()
+            devices = cachedDevices
+            mounts = cachedMounts
+            cacheLock.unlock()
+        }
 
         let currentActive = DiskHealthMonitor.shared.currentSnapshot?.bsdName ?? ""
         let currentMount = DiskHealthMonitor.shared.currentSnapshot?.mountPoint ?? ""
@@ -317,6 +334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let snap = DiskHealthMonitor.shared.evaluateHealth(forceCanary: forceCanary, allowNotifications: true)
             DispatchQueue.main.async {
                 self.updateStatusBarButton(with: snap)
+                self.populateSelectDiskMenu()
                 if let hostingView = self.statusItem.menu?.items.first?.view {
                     hostingView.invalidateIntrinsicContentSize()
                     let fitting = hostingView.fittingSize

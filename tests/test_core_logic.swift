@@ -163,14 +163,16 @@ struct CoreLogicTestRunner {
             cfg.targetDeviceQuery = nil
             cfg.telegramBotToken = secretBotToken
         }
-        // Write a test log line with the secret token to simulate legacy log leakage
-        ConfigManager.shared.log("Simulated old log entry with token: \(secretBotToken)")
+        // Write a test log line with both raw and percent-encoded secret tokens to simulate legacy log leakage
+        let encodedBotToken = secretBotToken.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? secretBotToken
+        ConfigManager.shared.log("Simulated old log entry with token: \(secretBotToken) and encoded: \(encodedBotToken)")
         let diagJSON = DiagnosticExporter.shared.exportDiagnosticReportJSON(snapshot: normalSnap)
         assertTrue(diagJSON.contains("\"reportVersion\""), "Diagnostic JSON must include reportVersion")
         assertTrue(diagJSON.contains("\"evaluation\""), "Diagnostic JSON must include evaluation section")
         assertTrue(diagJSON.contains("\"detectedDevices\""), "Diagnostic JSON must include detectedDevices section")
         assertTrue(diagJSON.contains("\"recentLogLines\""), "Diagnostic JSON must include recentLogLines section")
         assertTrue(!diagJSON.contains(secretBotToken), "Diagnostic JSON must never leak raw Telegram Bot Token even if present in health.log")
+        assertTrue(!diagJSON.contains(encodedBotToken), "Diagnostic JSON must never leak percent-encoded Telegram Bot Token")
         assertTrue(diagJSON.contains("[REDACTED_TOKEN]"), "Diagnostic JSON recentLogLines must contain [REDACTED_TOKEN] placeholder")
         SecretStore.shared.deleteSecret(forKey: "telegramBotToken")
         print("  [OK] DiagnosticExporter verified")
@@ -355,7 +357,17 @@ struct CoreLogicTestRunner {
         assertTrue(updatedDriveState.baselineIoWriteRetries == 14, "Advanced baselineIoWriteRetries must be 14")
         print("  [OK] I/O retry baseline advancement verified")
 
-        print("=== Swift Unit Test 12: ConfigManager Concurrency & SynchronizedDateFormatter Thread Safety (IMPROVE-V2-02 & IMPROVE-V3-06) ===")
+        print("=== Swift Unit Test 12: ConfigManager Concurrency & SynchronizedDateFormatter Thread Safety (IMPROVE-V2-02 & IMPROVE-V3-06 & IMPROVE-V6-01) ===")
+        var backgroundPublishesDetected = 0
+        let bgPubLock = NSLock()
+        let cancellable = cfgMgr.objectWillChange.sink { _ in
+            if !Thread.isMainThread {
+                bgPubLock.lock()
+                backgroundPublishesDetected += 1
+                bgPubLock.unlock()
+            }
+        }
+
         let group = DispatchGroup()
         for i in 0..<20 {
             group.enter()
@@ -374,6 +386,9 @@ struct CoreLogicTestRunner {
             }
         }
         group.wait()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
+        cancellable.cancel()
+        assertTrue(backgroundPublishesDetected == 0, "objectWillChange must never be published from a background thread (IMPROVE-V6-01)")
         assertTrue(cfgMgr.currentConfig.tempWarningCelsius >= 40 && cfgMgr.currentConfig.tempWarningCelsius <= 50, "Concurrent updateConfig completed safely")
         print("  [OK] Concurrency & SynchronizedDateFormatter verified")
 
@@ -914,6 +929,63 @@ struct CoreLogicTestRunner {
         let safeEncodedLog = TelegramNotifier.redactToken(encodedLog, token: "777777:SECRET_XYZ")
         assertTrue(!safeEncodedLog.contains("SECRET_XYZ"), "redactToken must remove percent-encoded token")
         assertTrue(safeEncodedLog.contains("[REDACTED_TOKEN]"), "redactToken must insert [REDACTED_TOKEN] for percent-encoded token")
+
+        // 28f. Verify legacy un-scoped cooldown key migration and purging in DiskHealthMonitor (IMPROVE-V6-05)
+        var migrationState = DiskPersistentState()
+        migrationState.lastAlertTimestampByCode["TEMP_WARNING"] = 5000
+        let driveKeyA = "DRIVE_A_SERIAL"
+        let issue = HealthIssue(code: "TEMP_WARNING", severity: .warning, title: "Test Temp", detail: "Test Detail")
+        let scopedKeyA = "\(driveKeyA):\(issue.code)"
+        if let legacyTs = migrationState.lastAlertTimestampByCode.removeValue(forKey: issue.code) {
+            if migrationState.lastAlertTimestampByCode[scopedKeyA] == nil {
+                migrationState.lastAlertTimestampByCode[scopedKeyA] = legacyTs
+            }
+        }
+        assertTrue(migrationState.lastAlertTimestampByCode["TEMP_WARNING"] == nil, "Legacy un-scoped key must be removed from dictionary")
+        assertTrue(migrationState.lastAlertTimestampByCode[scopedKeyA] == 5000, "Drive A scoped key must adopt legacy timestamp")
+
+        // Now if Drive B experiences TEMP_WARNING, it must not inherit Drive A's legacy cooldown
+        let driveKeyB = "DRIVE_B_SERIAL"
+        let scopedKeyB = "\(driveKeyB):\(issue.code)"
+        if let legacyTs = migrationState.lastAlertTimestampByCode.removeValue(forKey: issue.code) {
+            if migrationState.lastAlertTimestampByCode[scopedKeyB] == nil {
+                migrationState.lastAlertTimestampByCode[scopedKeyB] = legacyTs
+            }
+        }
+        let driveBLastSent = migrationState.lastAlertTimestampByCode[scopedKeyB] ?? 0
+        assertTrue(driveBLastSent == 0, "Drive B must start with lastSent == 0 and not inherit Drive A's legacy cooldown")
+
+        // End-to-end verification directly through DiskHealthMonitor engine
+        monitor.resetBaselines()
+        monitor.setMonitoredTarget(volumePath: "/", deviceQuery: nil)
+        cfgMgr.updateConfig { cfg in
+            cfg.diskUsedWarningPercent = 0.01
+            cfg.alertCooldownSeconds = 7200
+            cfg.enableNativeNotifications = false
+        }
+        let legacyAlertTs = Date().timeIntervalSince1970 - 100.0
+        monitor.mutateStateForTesting { state in
+            state.lastAlertTimestampByCode["DISK_SPACE_WARNING"] = legacyAlertTs
+        }
+        assertTrue(monitor.persistentState.lastAlertTimestampByCode["DISK_SPACE_WARNING"] == legacyAlertTs, "Legacy un-scoped key must be seeded in monitor state")
+
+        // Run evaluateHealth: processAlertsAndDigestLocked must migrate the un-scoped key to the scoped drive key and purge the un-scoped key
+        let evalSnap = monitor.evaluateHealth(forceCanary: false, allowNotifications: true)
+        assertTrue(evalSnap.issues.contains(where: { $0.code == "DISK_SPACE_WARNING" }), "DISK_SPACE_WARNING issue must be triggered")
+        assertTrue(monitor.persistentState.lastAlertTimestampByCode["DISK_SPACE_WARNING"] == nil, "Legacy un-scoped key must be purged by DiskHealthMonitor")
+
+        let currentScopedKey = monitor.persistentState.lastAlertTimestampByCode.keys.first(where: { $0.hasSuffix(":DISK_SPACE_WARNING") })
+        assertTrue(currentScopedKey != nil, "Scoped cooldown key must be created for the active drive")
+        assertTrue(monitor.persistentState.lastAlertTimestampByCode[currentScopedKey!] == legacyAlertTs, "Scoped cooldown key must adopt the legacy timestamp")
+
+        // Verify multi-drive isolation: switching targets must not have legacy keys leaking
+        assertTrue(monitor.persistentState.lastAlertTimestampByCode["DISK_SPACE_WARNING"] == nil, "Legacy un-scoped key must remain purged")
+
+        // Restore normal configuration
+        cfgMgr.updateConfig { cfg in
+            cfg.diskUsedWarningPercent = 85.0
+            cfg.enableNativeNotifications = true
+        }
 
         monitor.resetBaselines()
         print("  [OK] Per-drive cooldown scoping, AppleScript escaping, enriched diagnostics & multi-drive isolation verified")

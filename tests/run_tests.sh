@@ -110,6 +110,24 @@ else
 fi
 
 set +e
+"${ROOT_DIR}/disk-health" --volume --status > /dev/null 2>&1
+MISSING_VOL_FLAG_EXIT=$?
+"${ROOT_DIR}/disk-health" --volume > /dev/null 2>&1
+MISSING_VOL_END_EXIT=$?
+"${ROOT_DIR}/disk-health" --device --check > /dev/null 2>&1
+MISSING_DEV_FLAG_EXIT=$?
+"${ROOT_DIR}/disk-health" --device > /dev/null 2>&1
+MISSING_DEV_END_EXIT=$?
+set -e
+if [[ ${MISSING_VOL_FLAG_EXIT} -eq 1 ]] && [[ ${MISSING_VOL_END_EXIT} -eq 1 ]] && \
+   [[ ${MISSING_DEV_FLAG_EXIT} -eq 1 ]] && [[ ${MISSING_DEV_END_EXIT} -eq 1 ]]; then
+    echo "  [OK] disk-health rejects missing --volume / --device arguments across all positions (exit code: 1)"
+else
+    echo "  [FAIL] disk-health did not reject missing --volume (${MISSING_VOL_FLAG_EXIT}, ${MISSING_VOL_END_EXIT}) or --device (${MISSING_DEV_FLAG_EXIT}, ${MISSING_DEV_END_EXIT}) arguments"
+    exit 1
+fi
+
+set +e
 "${ROOT_DIR}/disk-health" --check > "${BUILD_CACHE}/check_output.txt"
 CHECK_EXIT=$?
 set -e

@@ -27,13 +27,21 @@ static uint64_t getCFNumberU64(CFDictionaryRef dict, CFStringRef key) {
     if (!dict || !key) return 0;
     CFTypeRef val = CFDictionaryGetValue(dict, key);
     if (val && CFGetTypeID(val) == CFNumberGetTypeID()) {
-        uint64_t num = 0;
-        CFNumberGetValue((CFNumberRef)val, kCFNumberSInt64Type, &num);
-        return num;
+        int64_t signedNum = 0;
+        if (CFNumberGetValue((CFNumberRef)val, kCFNumberSInt64Type, &signedNum)) {
+            return signedNum < 0 ? 0 : (uint64_t)signedNum;
+        }
+        double dblNum = 0;
+        if (CFNumberGetValue((CFNumberRef)val, kCFNumberDoubleType, &dblNum) && dblNum >= 0.0) {
+            return (uint64_t)dblNum;
+        }
     }
     return 0;
 }
 
+uint64_t DiskExtractCFNumberU64(CFDictionaryRef dict, CFStringRef key) {
+    return getCFNumberU64(dict, key);
+}
 
 // Safely decode 128-bit little-endian NVMe counter to 64-bit unsigned integer
 static uint64_t nvmeLe128ToU64(const void *ptr) {
@@ -98,12 +106,13 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
         }
         if (linkSpeedRef) {
             if (CFGetTypeID(linkSpeedRef) == CFNumberGetTypeID() && outMetrics->linkSpeedBps == 0) {
-                uint64_t speed = 0;
-                CFNumberGetValue((CFNumberRef)linkSpeedRef, kCFNumberSInt64Type, &speed);
-                uint64_t bps = DiskNormalizeLinkSpeedToBps(speed);
-                if (bps > 0) {
-                    outMetrics->linkSpeedBps = bps;
-                    outMetrics->usbLinkSpeedBps = bps;
+                int64_t signedSpeed = 0;
+                if (CFNumberGetValue((CFNumberRef)linkSpeedRef, kCFNumberSInt64Type, &signedSpeed) && signedSpeed > 0) {
+                    uint64_t bps = DiskNormalizeLinkSpeedToBps((uint64_t)signedSpeed);
+                    if (bps > 0) {
+                        outMetrics->linkSpeedBps = bps;
+                        outMetrics->usbLinkSpeedBps = bps;
+                    }
                 }
             }
             CFRelease(linkSpeedRef);
@@ -151,7 +160,7 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
     IOObjectRelease(current);
 }
 
-// Inspect children recursively for IOBlockStorageDriver statistics and BSD Name (e.g. disk6, disk0)
+// Inspect children for IOBlockStorageDriver statistics and physical whole-disk BSD Name (e.g. disk0, disk4)
 static void inspectChildrenForDriverStats(io_registry_entry_t service, DiskHardwareMetrics *outMetrics) {
     io_iterator_t childIter = 0;
     if (IORegistryEntryCreateIterator(service, kIOServicePlane, kIORegistryIterateRecursively, &childIter) != KERN_SUCCESS || !childIter) {
@@ -160,8 +169,17 @@ static void inspectChildrenForDriverStats(io_registry_entry_t service, DiskHardw
 
     io_registry_entry_t child;
     while ((child = IOIteratorNext(childIter)) != 0) {
-        // Look for Driver Statistics dictionary
-        if (!outMetrics->statsValid) {
+        // Stop descending into synthesized APFS containers so we never confuse AppleAPFSMedia (Whole=true)
+        // or virtual container statistics with the physical IOBlockStorageDriver and physical IOMedia.
+        if (IOObjectConformsTo(child, "AppleAPFSContainerScheme") ||
+            IOObjectConformsTo(child, "AppleAPFSContainer") ||
+            IOObjectConformsTo(child, "AppleAPFSMedia")) {
+            IOObjectRelease(child);
+            continue;
+        }
+
+        // Look for Driver Statistics dictionary on IOBlockStorageDriver
+        if (!outMetrics->statsValid && IOObjectConformsTo(child, "IOBlockStorageDriver")) {
             CFTypeRef statsRef = IORegistryEntryCreateCFProperty(child, CFSTR("Statistics"), kCFAllocatorDefault, 0);
             if (statsRef) {
                 if (CFGetTypeID(statsRef) == CFDictionaryGetTypeID()) {
@@ -182,7 +200,7 @@ static void inspectChildrenForDriverStats(io_registry_entry_t service, DiskHardw
             }
         }
 
-        // Look for IOMedia node containing BSD Name (the first Whole media is the physical whole disk)
+        // Look for physical IOMedia node containing BSD Name (Whole == true and not AppleAPFSMedia)
         if (IOObjectConformsTo(child, "IOMedia") && outMetrics->bsdName[0] == '\0') {
             CFTypeRef wholeRef = IORegistryEntryCreateCFProperty(child, CFSTR("Whole"), kCFAllocatorDefault, 0);
             bool isWhole = false;
@@ -205,6 +223,9 @@ static void inspectChildrenForDriverStats(io_registry_entry_t service, DiskHardw
         }
 
         IOObjectRelease(child);
+        if (outMetrics->statsValid && outMetrics->bsdName[0] != '\0') {
+            break;
+        }
     }
     IOObjectRelease(childIter);
 }

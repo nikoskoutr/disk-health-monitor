@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <CoreFoundation/CoreFoundation.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -71,6 +72,9 @@ int32_t DiskConvertNVMeTemperature(uint16_t tempRaw);
 
 // Normalize IOKit USB link speed or discrete speed code to bits per second
 uint64_t DiskNormalizeLinkSpeedToBps(uint64_t rawSpeed);
+
+// Safely extract a 64-bit unsigned integer from a CFDictionary, clamping negative numbers to 0
+uint64_t DiskExtractCFNumberU64(CFDictionaryRef dict, CFStringRef key);
 
 #ifdef __cplusplus
 }

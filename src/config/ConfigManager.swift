@@ -57,9 +57,33 @@ final class ConfigManager: ObservableObject {
     var latestJsonPath: String { "\(logsDir)/latest_status.json" }
 
     private let configLock = NSRecursiveLock()
-    @Published var config: DiskHealthConfig
+    private var _config: DiskHealthConfig
     private(set) var dotEnvTelegramToken: String? = nil
     private(set) var dotEnvChatId: String? = nil
+
+    var config: DiskHealthConfig {
+        get {
+            configLock.lock()
+            defer { configLock.unlock() }
+            return _config
+        }
+        set {
+            notifyObjectWillChangeOnMain()
+            configLock.lock()
+            _config = newValue
+            configLock.unlock()
+        }
+    }
+
+    private func notifyObjectWillChangeOnMain() {
+        if Thread.isMainThread {
+            self.objectWillChange.send()
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.objectWillChange.send()
+            }
+        }
+    }
 
     private init() {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -133,7 +157,7 @@ final class ConfigManager: ObservableObject {
         // 6. Apply Environment variables
         initialConfig = ConfigManager.applyEnvironmentVariables(into: dotConfig)
 
-        self.config = initialConfig
+        self._config = initialConfig
 
         // Enforce 0600 on config.json if it exists
         if FileManager.default.fileExists(atPath: configPath) {
@@ -144,7 +168,7 @@ final class ConfigManager: ObservableObject {
     var currentConfig: DiskHealthConfig {
         configLock.lock()
         defer { configLock.unlock() }
-        return config
+        return _config
     }
 
     private static func isRealSecretToken(_ token: String) -> Bool {
@@ -166,8 +190,8 @@ final class ConfigManager: ObservableObject {
         if let secret = SecretStore.shared.getSecret(forKey: "telegramBotToken"), !secret.isEmpty {
             return secret
         }
-        if ConfigManager.isRealSecretToken(config.telegramBotToken) {
-            return config.telegramBotToken
+        if ConfigManager.isRealSecretToken(_config.telegramBotToken) {
+            return _config.telegramBotToken
         }
         return ""
     }
@@ -181,8 +205,8 @@ final class ConfigManager: ObservableObject {
         if let dotChat = dotEnvChatId, !dotChat.isEmpty {
             return dotChat
         }
-        if !config.telegramChatId.isEmpty {
-            return config.telegramChatId
+        if !_config.telegramChatId.isEmpty {
+            return _config.telegramChatId
         }
         return ""
     }
@@ -289,12 +313,13 @@ final class ConfigManager: ObservableObject {
 
     // In-memory override for CLI invocations (does not mutate config.json)
     func overrideTarget(volumePath: String?, deviceQuery: String?) {
+        notifyObjectWillChangeOnMain()
         configLock.lock()
         defer { configLock.unlock() }
-        var next = self.config
+        var next = self._config
         next.targetVolumePath = volumePath
         next.targetDeviceQuery = deviceQuery
-        self.config = next
+        self._config = next
     }
 
     // Persistent target update (e.g. from Menu Bar UI dropdown)
@@ -306,22 +331,23 @@ final class ConfigManager: ObservableObject {
     }
 
     func updateConfig(_ updater: (inout DiskHealthConfig) -> Void) {
+        notifyObjectWillChangeOnMain()
         configLock.lock()
         defer { configLock.unlock() }
-        var next = self.config
+        var next = self._config
         updater(&next)
         if ConfigManager.isRealSecretToken(next.telegramBotToken) {
             _ = SecretStore.shared.setSecret(next.telegramBotToken, forKey: "telegramBotToken")
             self.dotEnvTelegramToken = nil
             next.telegramBotToken = "REDACTED_IN_KEYCHAIN"
         }
-        self.config = next
+        self._config = next
         saveConfigLocked(next)
     }
 
     func saveConfig() {
         configLock.lock()
-        let current = self.config
+        let current = self._config
         configLock.unlock()
         ConfigManager.saveSanitizedConfigFile(current, path: configFilePath)
     }
@@ -355,7 +381,7 @@ final class ConfigManager: ObservableObject {
 
     func exportSanitizedConfigJSON(includeSecrets: Bool = false) -> String {
         configLock.lock()
-        var exported = self.config
+        var exported = self._config
         configLock.unlock()
         let token = resolvedTelegramBotToken
         if includeSecrets {

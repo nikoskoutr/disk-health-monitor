@@ -249,6 +249,65 @@ int main(void) {
     printf("  Partition slice mount resolution in DiskFindMountForBlockDevice verified (%d slices tested)\n", testedSlices);
     printf("  Exact BSD Name and Serial Number priority over substring matching verified\n");
 
+    printf("\n=== Test 13: APFS Container Filtering & Physical Whole Disk Validation (IMPROVE-V6-02 & IMPROVE-V6-04) ===\n");
+    for (int i = 0; i < count; i++) {
+        assert(strstr(devices[i].bsdName, "disk") != NULL);
+        assert(strstr(devices[i].bsdName, "AppleAPFS") == NULL);
+        if (devices[i].statsValid) {
+            assert(devices[i].bytesRead != UINT64_MAX);
+            assert(devices[i].bytesWritten != UINT64_MAX);
+            assert(devices[i].totalTimeReadNs != UINT64_MAX);
+            assert(devices[i].totalTimeWriteNs != UINT64_MAX);
+        }
+    }
+    printf("  Verified all enumerated devices represent physical whole disks with sane driver stats\n");
+
+    // Synthetic CFNumber boundary & wraparound checks (IMPROVE-V6-04)
+    CFMutableDictionaryRef testDict = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    assert(testDict != NULL);
+
+    int64_t negOne = -1;
+    int64_t negLarge = -9999999LL;
+    int64_t zeroVal = 0;
+    int64_t posVal = 42LL;
+    double dblVal = 123456789.0;
+    double negDbl = -456.78;
+
+    CFNumberRef numNegOne = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &negOne);
+    CFNumberRef numNegLarge = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &negLarge);
+    CFNumberRef numZero = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &zeroVal);
+    CFNumberRef numPos = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &posVal);
+    CFNumberRef numDbl = CFNumberCreate(kCFAllocatorDefault, kCFNumberDoubleType, &dblVal);
+    CFNumberRef numNegDbl = CFNumberCreate(kCFAllocatorDefault, kCFNumberDoubleType, &negDbl);
+
+    CFDictionarySetValue(testDict, CFSTR("NegOne"), numNegOne);
+    CFDictionarySetValue(testDict, CFSTR("NegLarge"), numNegLarge);
+    CFDictionarySetValue(testDict, CFSTR("Zero"), numZero);
+    CFDictionarySetValue(testDict, CFSTR("Pos"), numPos);
+    CFDictionarySetValue(testDict, CFSTR("Double"), numDbl);
+    CFDictionarySetValue(testDict, CFSTR("NegDouble"), numNegDbl);
+    CFDictionarySetValue(testDict, CFSTR("StrVal"), CFSTR("NotANumber"));
+
+    assert(DiskExtractCFNumberU64(testDict, CFSTR("NegOne")) == 0);
+    assert(DiskExtractCFNumberU64(testDict, CFSTR("NegLarge")) == 0);
+    assert(DiskExtractCFNumberU64(testDict, CFSTR("Zero")) == 0);
+    assert(DiskExtractCFNumberU64(testDict, CFSTR("Pos")) == 42ULL);
+    assert(DiskExtractCFNumberU64(testDict, CFSTR("Double")) == 123456789ULL);
+    assert(DiskExtractCFNumberU64(testDict, CFSTR("NegDouble")) == 0);
+    assert(DiskExtractCFNumberU64(testDict, CFSTR("StrVal")) == 0);
+    assert(DiskExtractCFNumberU64(testDict, CFSTR("NonexistentKey")) == 0);
+    assert(DiskExtractCFNumberU64(NULL, CFSTR("Pos")) == 0);
+    assert(DiskExtractCFNumberU64(testDict, NULL) == 0);
+
+    CFRelease(numNegOne);
+    CFRelease(numNegLarge);
+    CFRelease(numZero);
+    CFRelease(numPos);
+    CFRelease(numDbl);
+    CFRelease(numNegDbl);
+    CFRelease(testDict);
+    printf("  DiskExtractCFNumberU64 negative clamping, double fallback, and boundary safety verified\n");
+
     printf("\n=== All Bridge Tests Passed Successfully! ===\n");
     return 0;
 }

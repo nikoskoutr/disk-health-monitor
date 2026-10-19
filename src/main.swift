@@ -44,9 +44,17 @@ func parseCommandLine() {
 
     // Process override flags first (in-memory overrides for this invocation)
     for i in 0..<args.count {
-        if args[i] == "--volume" && i + 1 < args.count {
+        if args[i] == "--volume" {
+            guard i + 1 < args.count, !args[i + 1].hasPrefix("-") else {
+                fputs("Error: --volume requires a mount path argument (e.g., --volume /Volumes/MyDrive).\n", stderr)
+                exit(1)
+            }
             ConfigManager.shared.overrideTarget(volumePath: args[i + 1], deviceQuery: nil)
-        } else if args[i] == "--device" && i + 1 < args.count {
+        } else if args[i] == "--device" {
+            guard i + 1 < args.count, !args[i + 1].hasPrefix("-") else {
+                fputs("Error: --device requires a device query argument (e.g., --device disk4).\n", stderr)
+                exit(1)
+            }
             ConfigManager.shared.overrideTarget(volumePath: nil, deviceQuery: args[i + 1])
         }
     }
