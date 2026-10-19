@@ -4,6 +4,10 @@ A native, zero-dependency macOS hardware telemetry daemon, menu bar application,
 
 Built directly on top of **IOKit**, **DiskArbitration**, **CoreFoundation**, and **SwiftUI/AppKit**, Universal Disk Health Monitor inspects hardware SMART registers, bus negotiation speeds, I/O error counters, thermal states, and filesystem writability in real time—without requiring `smartmontools` or third-party kernel extensions.
 
+<p align="center">
+  <img src="assets/MainWindow.png" alt="Universal Disk Health Monitor Menu Bar Dashboard" width="380">
+</p>
+
 ---
 
 ## Key Capabilities

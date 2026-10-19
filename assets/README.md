@@ -10,6 +10,7 @@ This directory stores the visual branding and icon assets bundled into `DiskHeal
 | :--- | :--- | :--- |
 | [`AppIcon.png`](AppIcon.png) | 1024×1024 RGBA PNG | Master high-resolution application icon rendered by [`scripts/generate_app_icon.swift`](../scripts/generate_app_icon.swift) |
 | [`AppIcon.icns`](AppIcon.icns) | Apple Icon Image (`.icns`) | Multi-resolution icon bundle (`16x16` up to `512x512@2x`) referenced by `CFBundleIconFile` in `DiskHealthMonitor.app/Contents/Info.plist` and displayed in Finder, Dock, Settings (`Cmd+,`), and macOS Notification Center alerts |
+| [`MainWindow.png`](MainWindow.png) | 777×1366 RGBA PNG | Application menu bar dashboard screenshot showcased in [`README.md`](../README.md) |
 
 ---
 
