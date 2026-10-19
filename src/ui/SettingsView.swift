@@ -110,7 +110,31 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
+    private var tokenSaveWorkItem: DispatchWorkItem?
+
+    func updateBotToken(_ newValue: String) {
+        self.botToken = newValue
+        tokenSaveWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.commitBotTokenNow(newValue)
+        }
+        tokenSaveWorkItem = work
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    func commitBotTokenNow(_ val: String) {
+        tokenSaveWorkItem?.cancel()
+        if val.isEmpty {
+            _ = SecretStore.shared.deleteSecret(forKey: "telegramBotToken")
+            ConfigManager.shared.updateConfig { $0.telegramBotToken = "" }
+        } else {
+            _ = SecretStore.shared.setSecret(val, forKey: "telegramBotToken")
+            ConfigManager.shared.updateConfig { $0.telegramBotToken = "REDACTED_IN_KEYCHAIN" }
+        }
+    }
+
     func runTelegramTest() {
+        commitBotTokenNow(botToken)
         isTestingTelegram = true
         testResult = nil
         let token = botToken
@@ -695,32 +719,14 @@ struct NotificationsSettingsTab: View {
                             if viewModel.showToken {
                                 TextField("123456789:ABCDEF...", text: Binding(
                                     get: { viewModel.botToken },
-                                    set: { val in
-                                        viewModel.botToken = val
-                                        if val.isEmpty {
-                                            _ = SecretStore.shared.deleteSecret(forKey: "telegramBotToken")
-                                            configMgr.updateConfig { $0.telegramBotToken = "" }
-                                        } else {
-                                            _ = SecretStore.shared.setSecret(val, forKey: "telegramBotToken")
-                                            configMgr.updateConfig { $0.telegramBotToken = "REDACTED_IN_KEYCHAIN" }
-                                        }
-                                    }
+                                    set: { val in viewModel.updateBotToken(val) }
                                 ))
                                 .textFieldStyle(.roundedBorder)
                                 .font(.system(size: 12, design: .monospaced))
                             } else {
                                 SecureField("Enter Bot Token from @BotFather", text: Binding(
                                     get: { viewModel.botToken },
-                                    set: { val in
-                                        viewModel.botToken = val
-                                        if val.isEmpty {
-                                            _ = SecretStore.shared.deleteSecret(forKey: "telegramBotToken")
-                                            configMgr.updateConfig { $0.telegramBotToken = "" }
-                                        } else {
-                                            _ = SecretStore.shared.setSecret(val, forKey: "telegramBotToken")
-                                            configMgr.updateConfig { $0.telegramBotToken = "REDACTED_IN_KEYCHAIN" }
-                                        }
-                                    }
+                                    set: { val in viewModel.updateBotToken(val) }
                                 ))
                                 .textFieldStyle(.roundedBorder)
                                 .font(.system(size: 12, design: .monospaced))
@@ -812,6 +818,9 @@ struct NotificationsSettingsTab: View {
         }
         .onAppear {
             viewModel.botToken = configMgr.resolvedTelegramBotToken
+        }
+        .onDisappear {
+            viewModel.commitBotTokenNow(viewModel.botToken)
         }
     }
 }

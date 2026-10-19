@@ -7,6 +7,7 @@ final class DiagnosticExporter {
 
     func generateDiagnosticReport(snapshot: DiskHealthSnapshot? = nil) -> [String: Any] {
         let snap = snapshot ?? DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: false)
+        let cfg = ConfigManager.shared.currentConfig
         let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
         let hostName = ProcessInfo.processInfo.hostName
 
@@ -19,8 +20,8 @@ final class DiagnosticExporter {
                 "appVersion": "2.1.0 (Build 3)"
             ],
             "target": [
-                "volumePath": ConfigManager.shared.config.targetVolumePath ?? "auto",
-                "deviceQuery": ConfigManager.shared.config.targetDeviceQuery ?? "auto"
+                "volumePath": cfg.targetVolumePath ?? "auto",
+                "deviceQuery": cfg.targetDeviceQuery ?? "auto"
             ],
             "hardware": [
                 "productName": snap.productName,
@@ -89,19 +90,19 @@ final class DiagnosticExporter {
                 ]}
             ],
             "configuration": [
-                "pollIntervalSeconds": ConfigManager.shared.config.pollIntervalSeconds,
-                "alertCooldownSeconds": ConfigManager.shared.config.alertCooldownSeconds,
-                "tempWarningCelsius": ConfigManager.shared.config.tempWarningCelsius,
-                "tempCriticalCelsius": ConfigManager.shared.config.tempCriticalCelsius,
-                "diskUsedWarningPercent": ConfigManager.shared.config.diskUsedWarningPercent,
-                "diskUsedCriticalPercent": ConfigManager.shared.config.diskUsedCriticalPercent,
-                "minFreeSpaceWarningGB": ConfigManager.shared.config.minFreeSpaceWarningGB,
-                "minFreeSpaceCriticalGB": ConfigManager.shared.config.minFreeSpaceCriticalGB,
-                "minExpectedUsbSpeedBps": ConfigManager.shared.config.minExpectedUsbSpeedBps,
-                "enableActiveCanary": ConfigManager.shared.config.enableActiveCanary,
-                "enableNativeNotifications": ConfigManager.shared.config.enableNativeNotifications,
+                "pollIntervalSeconds": cfg.pollIntervalSeconds,
+                "alertCooldownSeconds": cfg.alertCooldownSeconds,
+                "tempWarningCelsius": cfg.tempWarningCelsius,
+                "tempCriticalCelsius": cfg.tempCriticalCelsius,
+                "diskUsedWarningPercent": cfg.diskUsedWarningPercent,
+                "diskUsedCriticalPercent": cfg.diskUsedCriticalPercent,
+                "minFreeSpaceWarningGB": cfg.minFreeSpaceWarningGB,
+                "minFreeSpaceCriticalGB": cfg.minFreeSpaceCriticalGB,
+                "minExpectedUsbSpeedBps": cfg.minExpectedUsbSpeedBps,
+                "enableActiveCanary": cfg.enableActiveCanary,
+                "enableNativeNotifications": cfg.enableNativeNotifications,
                 "telegramBotToken": ConfigManager.shared.resolvedTelegramBotToken.isEmpty ? "None" : "•••••••• (Protected)",
-                "telegramChatId": ConfigManager.shared.config.telegramChatId.isEmpty ? "None" : ConfigManager.shared.config.telegramChatId
+                "telegramChatId": cfg.telegramChatId.isEmpty ? "None" : cfg.telegramChatId
             ]
         ]
         return report

@@ -41,9 +41,11 @@ swiftc -O \
     "${ROOT_DIR}/src/notifications/TelegramNotifier.swift" \
     "${ROOT_DIR}/src/diagnostics/DiagnosticExporter.swift" \
     "${ROOT_DIR}/src/engine/DiskHealthMonitor.swift" \
+    "${ROOT_DIR}/src/ui/SettingsView.swift" \
     "${SCRIPT_DIR}/test_core_logic.swift" \
     "${BUILD_CACHE}/DiskHealthBridge_test.o" \
     -framework Cocoa \
+    -framework SwiftUI \
     -framework IOKit \
     -framework CoreFoundation \
     -framework UserNotifications \

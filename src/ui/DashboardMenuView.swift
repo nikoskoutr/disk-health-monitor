@@ -8,6 +8,7 @@ struct DashboardMenuView: View {
 
     var body: some View {
         if let snap = monitor.currentSnapshot {
+            let cfg = ConfigManager.shared.currentConfig
             VStack(alignment: .leading, spacing: 10) {
                 // Header
                 HStack(alignment: .center, spacing: 10) {
@@ -96,10 +97,10 @@ struct DashboardMenuView: View {
                         icon: "thermometer.medium",
                         title: "TEMPERATURE",
                         value: snap.smartValid ? "\(snap.temperatureCelsius)°C" : "N/A",
-                        subtitle: snap.smartValid ? "Peak: \(snap.peakTemperatureCelsius)°C (Warn \(ConfigManager.shared.config.tempWarningCelsius)°C)" : "No SMART",
-                        tint: snap.temperatureCelsius >= ConfigManager.shared.config.tempWarningCelsius ? .orange : .green,
-                        progress: snap.smartValid ? min(1.0, max(0.0, Double(snap.temperatureCelsius) / Double(max(1, ConfigManager.shared.config.tempCriticalCelsius)))) : nil,
-                        progressColor: snap.temperatureCelsius >= ConfigManager.shared.config.tempCriticalCelsius ? .red : (snap.temperatureCelsius >= ConfigManager.shared.config.tempWarningCelsius ? .orange : .green)
+                        subtitle: snap.smartValid ? "Peak: \(snap.peakTemperatureCelsius)°C (Warn \(cfg.tempWarningCelsius)°C)" : "No SMART",
+                        tint: snap.temperatureCelsius >= cfg.tempWarningCelsius ? .orange : .green,
+                        progress: snap.smartValid ? min(1.0, max(0.0, Double(snap.temperatureCelsius) / Double(max(1, cfg.tempCriticalCelsius)))) : nil,
+                        progressColor: snap.temperatureCelsius >= cfg.tempCriticalCelsius ? .red : (snap.temperatureCelsius >= cfg.tempWarningCelsius ? .orange : .green)
                     )
                     metricTile(
                         icon: "bolt.heart.fill",
@@ -195,51 +196,6 @@ struct DashboardMenuView: View {
                     .font(.system(size: 9.5))
                     .foregroundColor(.secondary)
                 }
-
-                // Quick Action Bar
-                Divider()
-                HStack(spacing: 8) {
-                    Button(action: {
-                        DispatchQueue.global(qos: .userInitiated).async {
-                            _ = monitor.evaluateHealth(forceCanary: true)
-                        }
-                    }) {
-                        Label("Check", systemImage: "arrow.clockwise")
-                            .font(.system(size: 10))
-                    }
-                    .buttonStyle(.borderless)
-
-                    Button(action: {
-                        monitor.runVolumeVerification(sendTelegram: true)
-                    }) {
-                        Label("Verify", systemImage: "checkmark.shield")
-                            .font(.system(size: 10))
-                    }
-                    .buttonStyle(.borderless)
-
-                    Button(action: {
-                        if let path = DiagnosticExporter.shared.saveDiagnosticReportToFile() {
-                            NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: ConfigManager.shared.logsDir)
-                        }
-                    }) {
-                        Label("Report", systemImage: "square.and.arrow.up")
-                            .font(.system(size: 10))
-                    }
-                    .buttonStyle(.borderless)
-
-                    Spacer()
-
-                    Button(action: {
-                        NSApp.sendAction(#selector(NSMenu.cancelTracking), to: nil, from: nil)
-                        SettingsWindowController.shared.showSettings()
-                    }) {
-                        Label("Settings ⌘,", systemImage: "gearshape")
-                            .font(.system(size: 10, weight: .semibold))
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.mini)
-                }
-                .padding(.top, 2)
             }
             .padding(12)
             .frame(width: 385)

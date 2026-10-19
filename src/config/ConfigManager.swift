@@ -141,6 +141,12 @@ final class ConfigManager: ObservableObject {
         }
     }
 
+    var currentConfig: DiskHealthConfig {
+        configLock.lock()
+        defer { configLock.unlock() }
+        return config
+    }
+
     private static func isRealSecretToken(_ token: String) -> Bool {
         return !token.isEmpty &&
                token != "REDACTED_IN_KEYCHAIN" &&
@@ -149,6 +155,8 @@ final class ConfigManager: ObservableObject {
     }
 
     var resolvedTelegramBotToken: String {
+        configLock.lock()
+        defer { configLock.unlock() }
         if let envToken = ProcessInfo.processInfo.environment["TELEGRAM_BOT_TOKEN"], !envToken.isEmpty {
             return envToken
         }
@@ -165,6 +173,8 @@ final class ConfigManager: ObservableObject {
     }
 
     var resolvedTelegramChatId: String {
+        configLock.lock()
+        defer { configLock.unlock() }
         if let envChat = ProcessInfo.processInfo.environment["TELEGRAM_CHAT_ID"], !envChat.isEmpty {
             return envChat
         }

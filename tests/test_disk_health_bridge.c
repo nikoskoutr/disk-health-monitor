@@ -140,6 +140,49 @@ int main(void) {
     }
     printf("NVMe temperature boundary clamping validated\n");
 
+    printf("\n=== Test 10: DiskFindMountForBlockDevice IOObjectIsEqualTo Fast Resolution (IMPROVE-V3-03) ===\n");
+    char mountBuf[256] = {0};
+    assert(DiskFindMountForBlockDevice("disk0", mountBuf, sizeof(mountBuf)) == true);
+    assert(strcmp(mountBuf, "/") == 0);
+
+    char devMountBuf[256] = {0};
+    assert(DiskFindMountForBlockDevice("/dev/disk0", devMountBuf, sizeof(devMountBuf)) == true);
+    assert(strcmp(devMountBuf, "/") == 0);
+
+    // Dynamic verification across all enumerated devices
+    for (int i = 0; i < count; i++) {
+        char dynamicBuf[256] = {0};
+        bool hasMount = DiskFindMountForBlockDevice(devices[i].bsdName, dynamicBuf, sizeof(dynamicBuf));
+        printf("  Enumerated device %s mount resolution: ok=%d, path='%s'\n",
+               devices[i].bsdName, hasMount, dynamicBuf);
+        if (hasMount) {
+            assert(strlen(dynamicBuf) > 0);
+            assert(dynamicBuf[0] == '/');
+        }
+    }
+
+    // Boundary cases: buffer length edge cases
+    char zeroLenBuf[16] = {0};
+    assert(DiskFindMountForBlockDevice("disk0", zeroLenBuf, 0) == false);
+
+    char oneLenBuf[16] = {'X', 'Y', 0};
+    assert(DiskFindMountForBlockDevice("disk0", oneLenBuf, 1) == true);
+    assert(oneLenBuf[0] == '\0');
+
+    char twoLenBuf[16] = {0};
+    assert(DiskFindMountForBlockDevice("disk0", twoLenBuf, 2) == true);
+    assert(strcmp(twoLenBuf, "/") == 0);
+
+    // Boundary cases: invalid inputs
+    char bogusBuf[256] = {0};
+    assert(DiskFindMountForBlockDevice("disk99999", bogusBuf, sizeof(bogusBuf)) == false);
+    assert(DiskFindMountForBlockDevice("/dev/disk99999", bogusBuf, sizeof(bogusBuf)) == false);
+    assert(DiskFindMountForBlockDevice("/dev/", bogusBuf, sizeof(bogusBuf)) == false);
+    assert(DiskFindMountForBlockDevice("", bogusBuf, sizeof(bogusBuf)) == false);
+    assert(DiskFindMountForBlockDevice(NULL, bogusBuf, sizeof(bogusBuf)) == false);
+    assert(DiskFindMountForBlockDevice("disk0", NULL, sizeof(bogusBuf)) == false);
+    printf("  IOObjectIsEqualTo fast resolution and boundary safety verified\n");
+
     printf("\n=== All Bridge Tests Passed Successfully! ===\n");
     return 0;
 }

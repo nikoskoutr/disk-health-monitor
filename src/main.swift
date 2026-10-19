@@ -167,7 +167,8 @@ func parseCommandLine() {
                          formatBytes(snap.usedBytes), formatBytes(snap.freeBytes), snap.usedPercent, formatBytes(snap.totalBytes)))
         }
         if snap.smartValid {
-            print("  Temperature    : \(snap.temperatureCelsius)°C (Peak: \(snap.peakTemperatureCelsius)°C | Warn: \(ConfigManager.shared.config.tempWarningCelsius)°C | Crit: \(ConfigManager.shared.config.tempCriticalCelsius)°C)")
+            let cfg = ConfigManager.shared.currentConfig
+            print("  Temperature    : \(snap.temperatureCelsius)°C (Peak: \(snap.peakTemperatureCelsius)°C | Warn: \(cfg.tempWarningCelsius)°C | Crit: \(cfg.tempCriticalCelsius)°C)")
             print("  SSD Lifespan   : \(snap.lifeRemainingPercent)% Remaining (Percentage Used: \(snap.percentageUsed)%, Spare: \(snap.availableSpare)% / Thresh: \(snap.availableSpareThreshold)%)")
             print(String(format: "  Lifetime I/O   : %.2f TB Written (TBW) / %.2f TB Read", snap.totalTerabytesWritten, snap.totalTerabytesRead))
             print("  SMART Counters : Power On: \(snap.powerOnHours)h (\(snap.powerOnHours / 24)d) | Cycles: \(snap.powerCycles) | Unsafe Shutdowns: \(snap.unsafeShutdowns)")
@@ -177,7 +178,7 @@ func parseCommandLine() {
             print(String(format: "  Driver Stats   : Errors: %llu R / %llu W | Retries: %llu R / %llu W | Avg Latency: %.2f ms R / %.2f ms W",
                          snap.errorsRead, snap.errorsWritten, snap.retriesRead, snap.retriesWritten, snap.avgReadLatencyMs, snap.avgWriteLatencyMs))
         }
-        if ConfigManager.shared.config.enableActiveCanary {
+        if ConfigManager.shared.currentConfig.enableActiveCanary {
             print(String(format: "  I/O Canary     : %@", snap.canaryOk ? String(format: "PASSED (%.2f ms write+fsync+read)", snap.canaryLatencyMs) : "FAILED (\(snap.canaryError))"))
         }
         print("  File System    : \(snap.lastVerifyResult)")

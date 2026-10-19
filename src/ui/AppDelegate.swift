@@ -49,7 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshHealth(forceCanary: true)
 
         // Dynamic timer polling
-        schedulePollingTimer(interval: ConfigManager.shared.config.pollIntervalSeconds)
+        schedulePollingTimer(interval: ConfigManager.shared.currentConfig.pollIntervalSeconds)
 
         configCancellable = ConfigManager.shared.$config
             .map(\.pollIntervalSeconds)
@@ -119,7 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let hostingItem = NSMenuItem()
         let dashboardView = DashboardMenuView(monitor: DiskHealthMonitor.shared)
         let hostingView = NSHostingView(rootView: dashboardView)
-        hostingView.frame = NSRect(x: 0, y: 0, width: 385, height: 350)
+        hostingView.frame = NSRect(x: 0, y: 0, width: 385, height: 310)
         hostingItem.view = hostingView
         menu.addItem(hostingItem)
 
@@ -187,12 +187,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let currentActive = DiskHealthMonitor.shared.currentSnapshot?.bsdName ?? ""
         let currentMount = DiskHealthMonitor.shared.currentSnapshot?.mountPoint ?? ""
+        let cfg = ConfigManager.shared.currentConfig
 
         // Auto option
         let autoItem = NSMenuItem(title: "Auto-detect First External Volume", action: #selector(selectDiskTarget(_:)), keyEquivalent: "")
         autoItem.target = self
         autoItem.representedObject = "auto"
-        if ConfigManager.shared.config.targetVolumePath == nil && ConfigManager.shared.config.targetDeviceQuery == nil {
+        if cfg.targetVolumePath == nil && cfg.targetDeviceQuery == nil {
             autoItem.state = .on
         }
         selectDiskMenu.addItem(autoItem)
@@ -209,8 +210,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let item = NSMenuItem(title: label, action: #selector(selectDiskTarget(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = bsd
-            if (ConfigManager.shared.config.targetDeviceQuery == bsd) ||
-               (ConfigManager.shared.config.targetDeviceQuery == nil && currentActive == bsd) {
+            if (cfg.targetDeviceQuery == bsd) ||
+               (cfg.targetDeviceQuery == nil && currentActive == bsd) {
                 item.state = .on
             }
             selectDiskMenu.addItem(item)
@@ -227,7 +228,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let item = NSMenuItem(title: "  📂 \(m.name)", action: #selector(selectDiskTarget(_:)), keyEquivalent: "")
                 item.target = self
                 item.representedObject = m.path
-                if ConfigManager.shared.config.targetVolumePath == m.path || currentMount == m.path {
+                if cfg.targetVolumePath == m.path || currentMount == m.path {
                     item.state = .on
                 }
                 selectDiskMenu.addItem(item)
@@ -249,12 +250,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        dailyDigestItem.state = DiskHealthMonitor.shared.dailySummaryEnabled ? .on : .off
         populateSelectDiskMenu()
         refreshHealth(forceCanary: false)
         if let hostingView = menu.items.first?.view {
             hostingView.invalidateIntrinsicContentSize()
             let fitting = hostingView.fittingSize
-            hostingView.frame = NSRect(x: 0, y: 0, width: 385, height: max(350, fitting.height))
+            hostingView.frame = NSRect(x: 0, y: 0, width: 385, height: max(310, fitting.height))
         }
     }
 
@@ -276,7 +278,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) { [weak self] in
             guard let self = self else { return }
             self.refreshHealth(forceCanary: false)
-            self.schedulePollingTimer(interval: ConfigManager.shared.config.pollIntervalSeconds)
+            self.schedulePollingTimer(interval: ConfigManager.shared.currentConfig.pollIntervalSeconds)
         }
     }
 
@@ -318,7 +320,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if let hostingView = self.statusItem.menu?.items.first?.view {
                     hostingView.invalidateIntrinsicContentSize()
                     let fitting = hostingView.fittingSize
-                    hostingView.frame = NSRect(x: 0, y: 0, width: 385, height: max(350, fitting.height))
+                    hostingView.frame = NSRect(x: 0, y: 0, width: 385, height: max(310, fitting.height))
                 }
             }
         }

@@ -76,6 +76,12 @@ final class DiskHealthMonitor: ObservableObject {
         }
     }
 
+    var persistentState: DiskPersistentState {
+        engineLock.lock()
+        defer { engineLock.unlock() }
+        return state
+    }
+
     func setMonitoredTarget(volumePath: String?, deviceQuery: String?) {
         engineLock.lock()
         ConfigManager.shared.updateTarget(volumePath: volumePath, deviceQuery: deviceQuery)
@@ -94,7 +100,25 @@ final class DiskHealthMonitor: ObservableObject {
     func resetBaselines() {
         engineLock.lock()
         defer { engineLock.unlock() }
-        self.state = DiskPersistentState()
+        if let snap = self.currentSnapshot {
+            let key = !snap.serialNumber.isEmpty ? snap.serialNumber : (!snap.bsdName.isEmpty ? snap.bsdName : (snap.mountPoint.isEmpty ? "default" : snap.mountPoint))
+            self.state.updateDriveState(key: key) { d in
+                d.bsdName = snap.bsdName
+                d.serialNumber = snap.serialNumber
+                d.peakTemperatureCelsius = snap.temperatureCelsius
+                d.baselineUnsafeShutdowns = snap.unsafeShutdowns
+                d.baselineMediaErrors = snap.mediaErrors
+                d.baselineErrorLogEntries = snap.errorInfoLogEntries
+                d.baselineIoReadErrors = snap.errorsRead
+                d.baselineIoWriteErrors = snap.errorsWritten
+                d.baselineIoReadRetries = snap.retriesRead
+                d.baselineIoWriteRetries = snap.retriesWritten
+            }
+        } else {
+            self.state = DiskPersistentState()
+        }
+        self.state.lastOverallSeverity = HealthSeverity.healthy.rawValue
+        self.state.lastAlertTimestampByCode.removeAll()
         saveStateLocked()
         ConfigManager.shared.log("Persistent baselines and health state reset.")
     }
@@ -121,7 +145,16 @@ final class DiskHealthMonitor: ObservableObject {
     }
 
     private func performSingleCanaryPass(targetMount: String) -> (Bool, Double, String) {
-        let canaryPath = (targetMount as NSString).appendingPathComponent(".disk_health_canary")
+        // On sealed macOS root volume ("/"), probe via /System/Volumes/Data/private/tmp if writable,
+        // avoiding guaranteed EROFS on "/.disk_health_canary"
+        let effectiveDir: String
+        if targetMount == "/" && FileManager.default.isWritableFile(atPath: "/System/Volumes/Data/private/tmp") {
+            effectiveDir = "/System/Volumes/Data/private/tmp"
+        } else {
+            effectiveDir = targetMount
+        }
+
+        let canaryPath = (effectiveDir as NSString).appendingPathComponent(".disk_health_canary_\(getuid())")
         let token = "DISK_HEALTH_CANARY_\(UUID().uuidString)\n"
         guard let data = token.data(using: .utf8) else {
             return (false, 0, "Encoding error")
@@ -195,7 +228,7 @@ final class DiskHealthMonitor: ObservableObject {
         let nowTs = now.timeIntervalSince1970
         let formattedTime = isoTimestampFormatter.string(from: now)
         let formattedShortTime = shortTimeFormatter.string(from: now)
-        let cfg = ConfigManager.shared.config
+        let cfg = ConfigManager.shared.currentConfig
 
         // 1. Determine Target Mount & Hardware Query
         var targetMount = cfg.targetVolumePath ?? ""
@@ -341,12 +374,12 @@ final class DiskHealthMonitor: ObservableObject {
         }
         if hw.smartValid {
             if driveState.baselineUnsafeShutdowns == nil { driveState.baselineUnsafeShutdowns = hw.unsafeShutdowns }
-            if driveState.baselineMediaErrors == nil { driveState.baselineMediaErrors = hw.mediaErrors }
+            if driveState.baselineMediaErrors == nil { driveState.baselineMediaErrors = 0 }
             if driveState.baselineErrorLogEntries == nil { driveState.baselineErrorLogEntries = hw.errorInfoLogEntries }
         }
         if hw.statsValid {
-            if driveState.baselineIoReadErrors == nil { driveState.baselineIoReadErrors = hw.errorsRead }
-            if driveState.baselineIoWriteErrors == nil { driveState.baselineIoWriteErrors = hw.errorsWritten }
+            if driveState.baselineIoReadErrors == nil { driveState.baselineIoReadErrors = 0 }
+            if driveState.baselineIoWriteErrors == nil { driveState.baselineIoWriteErrors = 0 }
             if driveState.baselineIoReadRetries == nil { driveState.baselineIoReadRetries = hw.retriesRead }
             if driveState.baselineIoWriteRetries == nil { driveState.baselineIoWriteRetries = hw.retriesWritten }
         }
@@ -541,12 +574,12 @@ final class DiskHealthMonitor: ObservableObject {
             }
 
             // Rule 11: Media Errors, Error Log Entries & Unsafe Shutdowns
-            if hw.mediaErrors > (driveState.baselineMediaErrors ?? 0) || hw.mediaErrors > 0 {
+            if hw.mediaErrors > (driveState.baselineMediaErrors ?? 0) {
                 issues.append(HealthIssue(
                     code: "MEDIA_ERRORS",
                     severity: .critical,
                     title: "NVMe Media / Data Integrity Errors",
-                    detail: "Drive reported \(hw.mediaErrors) media/data integrity errors."
+                    detail: "Drive reported \(hw.mediaErrors) media/data integrity errors (baseline: \(driveState.baselineMediaErrors ?? 0))."
                 ))
                 score -= 45
             }
@@ -575,7 +608,7 @@ final class DiskHealthMonitor: ObservableObject {
 
         // Rule 12: Driver I/O Errors & Volume Verification Status
         if hw.statsValid {
-            if hw.errorsRead > (driveState.baselineIoReadErrors ?? 0) || hw.errorsWritten > (driveState.baselineIoWriteErrors ?? 0) || hw.errorsRead > 0 || hw.errorsWritten > 0 {
+            if hw.errorsRead > (driveState.baselineIoReadErrors ?? 0) || hw.errorsWritten > (driveState.baselineIoWriteErrors ?? 0) {
                 issues.append(HealthIssue(
                     code: "IO_DRIVER_ERRORS",
                     severity: .critical,
@@ -706,7 +739,8 @@ final class DiskHealthMonitor: ObservableObject {
 
     private func processAlertsAndDigestLocked(snapshot: DiskHealthSnapshot, rawMetrics hw: DiskHardwareMetrics, driveKey: String) {
         let nowTs = snapshot.timestamp
-        let cooldown = ConfigManager.shared.config.alertCooldownSeconds
+        let cfg = ConfigManager.shared.currentConfig
+        let cooldown = cfg.alertCooldownSeconds
         var shouldSendAlert = false
 
         for issue in snapshot.issues {
@@ -726,7 +760,7 @@ final class DiskHealthMonitor: ObservableObject {
             ConfigManager.shared.log("Alert triggered: \(alertTitle) — \(snapshot.issues.map { $0.title }.joined(separator: ", "))")
 
             // Send macOS notification
-            if ConfigManager.shared.config.enableNativeNotifications {
+            if cfg.enableNativeNotifications {
                 let body = snapshot.issues.map { "• \($0.title)" }.joined(separator: "\n")
                 MacOSNotifier.shared.postNotification(
                     title: alertTitle,
@@ -758,7 +792,7 @@ final class DiskHealthMonitor: ObservableObject {
             ConfigManager.shared.log("Drive recovered to HEALTHY state.")
             state.lastAlertTimestampByCode.removeAll()
 
-            if ConfigManager.shared.config.enableNativeNotifications {
+            if cfg.enableNativeNotifications {
                 MacOSNotifier.shared.postNotification(
                     title: recoveryTitle,
                     subtitle: "Score: \(snapshot.healthScore)/100",
@@ -798,7 +832,7 @@ final class DiskHealthMonitor: ObservableObject {
         }
         isVerifyingInternal = true
         let snapMount = self.currentSnapshot?.mountPoint ?? ""
-        let target = !snapMount.isEmpty ? snapMount : (ConfigManager.shared.config.targetVolumePath ?? "/")
+        let target = !snapMount.isEmpty ? snapMount : (ConfigManager.shared.currentConfig.targetVolumePath ?? "/")
         engineLock.unlock()
 
         if Thread.isMainThread {
@@ -816,27 +850,37 @@ final class DiskHealthMonitor: ObservableObject {
             let pipe = Pipe()
             proc.standardOutput = pipe
             proc.standardError = pipe
+            let readHandle = pipe.fileHandleForReading
 
             var ok = false
             var summary = ""
             do {
                 try proc.run()
 
-                // 180-second watchdog timer in case diskutil hangs on a wedged USB bridge
+                // 180-second watchdog timer in case diskutil or child fsck hangs on a wedged USB bridge
                 var timedOut = false
                 let watchdog = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
                 watchdog.schedule(deadline: .now() + 180.0)
                 watchdog.setEventHandler {
                     if proc.isRunning {
                         timedOut = true
+                        let pid = proc.processIdentifier
                         proc.terminate()
+                        // Close read handle and escalate to SIGKILL after 2s if still alive
+                        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0) {
+                            if proc.isRunning && pid > 0 {
+                                kill(pid, SIGKILL)
+                            }
+                            try? readHandle.close()
+                        }
                     }
                 }
                 watchdog.resume()
 
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let data = (try? readHandle.readToEnd()) ?? Data()
                 proc.waitUntilExit()
                 watchdog.cancel()
+                try? readHandle.close()
 
                 let output = String(decoding: data, as: UTF8.self)
                 let timeStr = shortMonthDateFormatter.string(from: Date())

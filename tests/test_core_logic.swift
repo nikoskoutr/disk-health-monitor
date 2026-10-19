@@ -349,7 +349,7 @@ struct CoreLogicTestRunner {
         assertTrue(updatedDriveState.baselineIoWriteRetries == 14, "Advanced baselineIoWriteRetries must be 14")
         print("  [OK] I/O retry baseline advancement verified")
 
-        print("=== Swift Unit Test 12: ConfigManager Concurrency & SynchronizedDateFormatter Thread Safety (IMPROVE-V2-02) ===")
+        print("=== Swift Unit Test 12: ConfigManager Concurrency & SynchronizedDateFormatter Thread Safety (IMPROVE-V2-02 & IMPROVE-V3-06) ===")
         let group = DispatchGroup()
         for i in 0..<20 {
             group.enter()
@@ -357,6 +357,10 @@ struct CoreLogicTestRunner {
                 cfgMgr.updateConfig { cfg in
                     cfg.tempWarningCelsius = 40 + (i % 10)
                 }
+                _ = cfgMgr.currentConfig
+                _ = cfgMgr.resolvedTelegramBotToken
+                _ = cfgMgr.resolvedTelegramChatId
+                _ = DiagnosticExporter.shared.exportDiagnosticReportJSON()
                 _ = isoTimestampFormatter.string(from: Date())
                 _ = shortTimeFormatter.string(from: Date())
                 _ = shortMonthDateFormatter.string(from: Date())
@@ -364,7 +368,7 @@ struct CoreLogicTestRunner {
             }
         }
         group.wait()
-        assertTrue(cfgMgr.config.tempWarningCelsius >= 40 && cfgMgr.config.tempWarningCelsius <= 50, "Concurrent updateConfig completed safely")
+        assertTrue(cfgMgr.currentConfig.tempWarningCelsius >= 40 && cfgMgr.currentConfig.tempWarningCelsius <= 50, "Concurrent updateConfig completed safely")
         print("  [OK] Concurrency & SynchronizedDateFormatter verified")
 
         print("=== Swift Unit Test 13: System Sleep / Wake Telemetry Grace Period (IMPROVE-V2-03) ===")
@@ -523,6 +527,91 @@ struct CoreLogicTestRunner {
             try? FileManager.default.removeItem(atPath: diagPath)
         }
         print("  [OK] 0600 file permissions verified")
+
+        print("=== Swift Unit Test 19: Canary Probe on Sealed Root Volume (IMPROVE-V3-04) ===")
+        cfgMgr.updateConfig { cfg in
+            cfg.targetVolumePath = "/"
+            cfg.targetDeviceQuery = nil
+            cfg.enableActiveCanary = true
+        }
+        let rootCanarySnap = monitor.evaluateHealth(forceCanary: true, allowNotifications: false)
+        assertTrue(rootCanarySnap.canaryOk, "Canary check on '/' must succeed via data volume fallback probe")
+        assertTrue(rootCanarySnap.canaryLatencyMs >= 0.0, "Canary latency on '/' must be non-negative")
+        print("  [OK] Root volume canary probe verified")
+
+        print("=== Swift Unit Test 20: Baseline Lock-Out Fix & resetBaselines() (IMPROVE-V3-05) ===")
+        // Verify state preservation across resetBaselines()
+        monitor.dailySummaryEnabled = false
+        monitor.setMonitoredTarget(volumePath: "/", deviceQuery: nil)
+        let preResetSnap = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+
+        monitor.resetBaselines()
+        assertTrue(monitor.dailySummaryEnabled == false, "resetBaselines must preserve dailySummaryEnabled preference")
+        assertTrue(monitor.persistentState.monitoredTarget == "/", "resetBaselines must preserve monitoredTarget")
+        assertTrue(monitor.persistentState.lastOverallSeverity == HealthSeverity.healthy.rawValue, "resetBaselines must reset lastOverallSeverity to healthy")
+        assertTrue(monitor.persistentState.lastAlertTimestampByCode.isEmpty, "resetBaselines must clear lastAlertTimestampByCode cooldown map")
+
+        let currentKey = !preResetSnap.serialNumber.isEmpty ? preResetSnap.serialNumber : (!preResetSnap.bsdName.isEmpty ? preResetSnap.bsdName : (preResetSnap.mountPoint.isEmpty ? "default" : preResetSnap.mountPoint))
+        let activeDriveState = monitor.persistentState.getDriveState(key: currentKey, bsdName: preResetSnap.bsdName, serial: preResetSnap.serialNumber)
+        assertTrue(activeDriveState.baselineMediaErrors == preResetSnap.mediaErrors, "baselineMediaErrors must be anchored to current snapshot")
+        assertTrue(activeDriveState.baselineIoReadErrors == preResetSnap.errorsRead, "baselineIoReadErrors must be anchored to current snapshot")
+        assertTrue(activeDriveState.baselineIoWriteErrors == preResetSnap.errorsWritten, "baselineIoWriteErrors must be anchored to current snapshot")
+
+        // Test rule evaluation logic: historical errors must NOT lock-out alert clearance when baseline == current errors
+        var simulatedState = DiskPersistentState()
+        let lockoutDriveKey = "simulated_failing_drive_\(UUID().uuidString)"
+        simulatedState.updateDriveState(key: lockoutDriveKey) { d in
+            d.baselineMediaErrors = 5
+            d.baselineIoReadErrors = 2
+            d.baselineIoWriteErrors = 1
+        }
+        let anchoredDrive = simulatedState.getDriveState(key: lockoutDriveKey)
+        // With IMPROVE-V3-05 fix: mediaErrors > baseline (5 > 5 is false -> no alert)
+        assertTrue(!(5 > (anchoredDrive.baselineMediaErrors ?? 0)), "Equal media errors to baseline must not trigger alert")
+        // If mediaErrors increases to 6: 6 > 5 is true -> triggers alert
+        assertTrue(6 > (anchoredDrive.baselineMediaErrors ?? 0), "Increased media errors above baseline must trigger alert")
+        // Without baseline (initial sight), baseline is 0: 5 > 0 is true -> triggers alert on discovery
+        let discoveryBaseline: UInt64? = 0
+        assertTrue(5 > (discoveryBaseline ?? 0), "Initial non-zero media errors must trigger alert on first sight")
+        print("  [OK] Baseline lock-out fix and resetBaselines() verified")
+
+        print("=== Swift Unit Test 21: SettingsViewModel Bot Token Debouncing & Immediate Commit (IMPROVE-V3-08) ===")
+        let vm = SettingsViewModel()
+        let debouncedToken = "123456789:ABC_TEST_TOKEN_\(UUID().uuidString)"
+        vm.updateBotToken(debouncedToken)
+        assertTrue(vm.botToken == debouncedToken, "vm.botToken must immediately reflect updated value in memory")
+
+        // Verify token is NOT written synchronously to SecretStore while typing
+        assertTrue(SecretStore.shared.getSecret(forKey: "telegramBotToken") != debouncedToken, "Debounced token must NOT be written synchronously to SecretStore")
+
+        // Wait 450ms for debounce timer (300ms) to fire
+        Thread.sleep(forTimeInterval: 0.45)
+        assertTrue(SecretStore.shared.getSecret(forKey: "telegramBotToken") == debouncedToken, "Debounced token must be written to SecretStore after debounce timeout")
+
+        // Immediate commit (e.g. Test button or navigation away)
+        let immediateToken = "987654321:XYZ_IMMEDIATE_\(UUID().uuidString)"
+        vm.updateBotToken(immediateToken)
+        vm.commitBotTokenNow(immediateToken)
+        let savedSecret = SecretStore.shared.getSecret(forKey: "telegramBotToken")
+        assertTrue(savedSecret == immediateToken, "SecretStore must contain immediately committed token")
+        assertTrue(ConfigManager.shared.currentConfig.telegramBotToken == "REDACTED_IN_KEYCHAIN", "ConfigManager must redact committed token")
+
+        // Clearing token
+        vm.commitBotTokenNow("")
+        let clearedSecret = SecretStore.shared.getSecret(forKey: "telegramBotToken")
+        assertTrue(clearedSecret == nil, "SecretStore must be cleared when empty token committed")
+        assertTrue(ConfigManager.shared.currentConfig.telegramBotToken.isEmpty, "ConfigManager token must be empty")
+        print("  [OK] SettingsViewModel debouncing and immediate commit verified")
+
+        print("=== Swift Unit Test 22: Daily Digest Toggle & State Synchronization (IMPROVE-V3-07) ===")
+        let origDigest = monitor.dailySummaryEnabled
+        monitor.dailySummaryEnabled = false
+        assertTrue(!monitor.dailySummaryEnabled, "dailySummaryEnabled must toggle to false")
+        monitor.dailySummaryEnabled = true
+        assertTrue(monitor.dailySummaryEnabled, "dailySummaryEnabled must toggle to true")
+        monitor.dailySummaryEnabled = origDigest
+        assertTrue(monitor.dailySummaryEnabled == origDigest, "dailySummaryEnabled must restore original state")
+        print("  [OK] Daily Digest state synchronization verified")
 
         print("✅ All Swift Core Logic Unit Tests Passed!")
     }

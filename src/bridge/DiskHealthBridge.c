@@ -499,63 +499,30 @@ void DiskReadHardwareMetrics(const char *targetIdentifier, DiskHardwareMetrics *
     }
 }
 
-// Fast helper to extract BSD name from an IOBlockStorageDevice without loading SMART plugins
-static bool getBlockDeviceBSDName(io_service_t service, char *outBsd, size_t maxLen) {
-    if (!service || !outBsd || maxLen == 0) return false;
-    outBsd[0] = '\0';
-
-    io_iterator_t iter = 0;
-    if (IORegistryEntryCreateIterator(service, kIOServicePlane, kIORegistryIterateRecursively, &iter) != KERN_SUCCESS || !iter) {
-        return false;
-    }
-
-    io_registry_entry_t entry;
-    bool found = false;
-    while ((entry = IOIteratorNext(iter)) != 0) {
-        if (IOObjectConformsTo(entry, "IOMedia")) {
-            CFTypeRef wholeRef = IORegistryEntryCreateCFProperty(entry, CFSTR("Whole"), kCFAllocatorDefault, 0);
-            bool isWhole = false;
-            if (wholeRef) {
-                if (CFGetTypeID(wholeRef) == CFBooleanGetTypeID()) {
-                    isWhole = CFBooleanGetValue((CFBooleanRef)wholeRef);
-                }
-                CFRelease(wholeRef);
-            }
-            if (isWhole || outBsd[0] == '\0') {
-                CFTypeRef bsdRef = IORegistryEntryCreateCFProperty(entry, CFSTR("BSD Name"), kCFAllocatorDefault, 0);
-                if (bsdRef) {
-                    if (CFGetTypeID(bsdRef) == CFStringGetTypeID()) {
-                        CFStringGetCString((CFStringRef)bsdRef, outBsd, (CFIndex)maxLen, kCFStringEncodingUTF8);
-                        found = true;
-                    }
-                    CFRelease(bsdRef);
-                }
-                if (isWhole) {
-                    IOObjectRelease(entry);
-                    break;
-                }
-            }
-        }
-        IOObjectRelease(entry);
-    }
-    IOObjectRelease(iter);
-    return found;
-}
-
 // Find the mounted filesystem path for a block storage device (resolving APFS containers and partitions)
 bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint, size_t maxLen) {
-    if (!deviceBsdName || !outMountPoint || maxLen == 0) return false;
+    if (!deviceBsdName || deviceBsdName[0] == '\0' || !outMountPoint || maxLen == 0) return false;
     outMountPoint[0] = '\0';
 
     const char *cleanTargetBsd = deviceBsdName;
     if (strncmp(cleanTargetBsd, "/dev/", 5) == 0) cleanTargetBsd += 5;
+    if (cleanTargetBsd[0] == '\0') return false;
+
+    io_service_t targetDev = findBlockStorageDeviceByBSDName(cleanTargetBsd);
+    if (targetDev == 0) return false;
 
     int numMounts = getfsstat(NULL, 0, MNT_NOWAIT);
-    if (numMounts <= 0) return false;
+    if (numMounts <= 0) {
+        IOObjectRelease(targetDev);
+        return false;
+    }
 
     int allocMounts = numMounts + 4;
     struct statfs *fsList = calloc((size_t)allocMounts, sizeof(struct statfs));
-    if (!fsList) return false;
+    if (!fsList) {
+        IOObjectRelease(targetDev);
+        return false;
+    }
 
     int count = getfsstat(fsList, (int)(sizeof(struct statfs) * allocMounts), MNT_NOWAIT);
     bool found = false;
@@ -568,20 +535,17 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
 
         io_service_t dev = findBlockStorageDeviceByBSDName(fromName);
         if (dev != 0) {
-            char hwBsd[64] = {0};
-            getBlockDeviceBSDName(dev, hwBsd, sizeof(hwBsd));
+            bool isSameDevice = IOObjectIsEqualTo(dev, targetDev);
             IOObjectRelease(dev);
 
-            const char *cleanHwBsd = hwBsd;
-            if (strncmp(cleanHwBsd, "/dev/", 5) == 0) cleanHwBsd += 5;
-
-            if (strcmp(cleanHwBsd, cleanTargetBsd) == 0) {
+            if (isSameDevice) {
                 const char *mountPath = fsList[i].f_mntonname;
                 // Prioritize user-facing mounts:
+                // / = 4 (system root)
                 // /Volumes/* = 3 (external disk volume)
-                // / = 2 (system root)
-                // /System/Volumes/Data = 1
-                // Other /System/Volumes/* = 0 (hidden system partitions)
+                // /System/Volumes/Data = 2
+                // Other mounts = 1
+                // Hidden /System/Volumes/* or /Volumes/Recovery = 0
                 int score = 1;
                 if (strcmp(mountPath, "/") == 0) {
                     score = 4; // Root filesystem is highest priority
@@ -598,7 +562,6 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
                     strlcpy(outMountPoint, mountPath, maxLen);
                     found = true;
                     if (score == 4) {
-                        // Root volume is found
                         break;
                     }
                 }
@@ -607,5 +570,6 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
     }
 
     free(fsList);
+    IOObjectRelease(targetDev);
     return found;
 }
