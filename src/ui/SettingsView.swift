@@ -155,8 +155,13 @@ final class SettingsViewModel: ObservableObject {
         panel.allowedContentTypes = [.json]
         if panel.runModal() == .OK, let url = panel.url {
             let json = ConfigManager.shared.exportSanitizedConfigJSON(includeSecrets: false)
-            try? json.write(to: url, atomically: true, encoding: .utf8)
-            diagnosticsStatusMsg = "Saved configuration to \(url.lastPathComponent)"
+            do {
+                try json.write(to: url, atomically: true, encoding: .utf8)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+                diagnosticsStatusMsg = "Saved configuration to \(url.lastPathComponent)"
+            } catch {
+                diagnosticsStatusMsg = "Failed to save configuration: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -181,9 +186,11 @@ final class SettingsViewModel: ObservableObject {
         panel.nameFieldStringValue = "diagnostic-report.json"
         panel.allowedContentTypes = [.json]
         if panel.runModal() == .OK, let url = panel.url {
-            let json = DiagnosticExporter.shared.exportDiagnosticReportJSON()
-            try? json.write(to: url, atomically: true, encoding: .utf8)
-            diagnosticsStatusMsg = "Saved diagnostic report to \(url.lastPathComponent)"
+            if let savedPath = DiagnosticExporter.shared.saveDiagnosticReportToFile(at: url.path) {
+                diagnosticsStatusMsg = "Saved diagnostic report to \((savedPath as NSString).lastPathComponent)"
+            } else {
+                diagnosticsStatusMsg = "Failed to save diagnostic report."
+            }
         }
     }
 

@@ -478,6 +478,15 @@ void DiskReadHardwareMetrics(const char *targetIdentifier, DiskHardwareMetrics *
     memset(&firstDevice, 0, sizeof(firstDevice));
     bool foundFirst = false;
 
+    DiskHardwareMetrics substringMatch;
+    memset(&substringMatch, 0, sizeof(substringMatch));
+    bool foundSubstring = false;
+
+    const char *query = targetIdentifier;
+    if (query && strncmp(query, "/dev/", 5) == 0) {
+        query += 5;
+    }
+
     while ((service = IOIteratorNext(iter)) != 0) {
         DiskHardwareMetrics metrics;
         populateMetricsFromBlockStorageDevice(service, &metrics);
@@ -496,20 +505,31 @@ void DiskReadHardwareMetrics(const char *targetIdentifier, DiskHardwareMetrics *
                     break;
                 }
             } else {
-                // Match against substring: Product Name, Vendor Name, Serial Number, or BSD Name
-                if ((metrics.productName[0] != '\0' && strcasestr(metrics.productName, targetIdentifier) != NULL) ||
-                    (metrics.vendorName[0] != '\0' && strcasestr(metrics.vendorName, targetIdentifier) != NULL) ||
-                    (metrics.serialNumber[0] != '\0' && strcasestr(metrics.serialNumber, targetIdentifier) != NULL) ||
-                    (metrics.bsdName[0] != '\0' && strcasestr(metrics.bsdName, targetIdentifier) != NULL)) {
+                // 1. Exact match on BSD Name or Serial Number takes immediate priority
+                if ((metrics.bsdName[0] != '\0' && (strcasecmp(metrics.bsdName, targetIdentifier) == 0 || strcasecmp(metrics.bsdName, query) == 0)) ||
+                    (metrics.serialNumber[0] != '\0' && strcasecmp(metrics.serialNumber, targetIdentifier) == 0)) {
                     *outMetrics = metrics;
                     IOObjectRelease(service);
                     break;
+                }
+                // 2. Otherwise record first substring match on Product, Vendor, Serial, or non-disk BSD query
+                if (!foundSubstring &&
+                    ((metrics.productName[0] != '\0' && strcasestr(metrics.productName, targetIdentifier) != NULL) ||
+                     (metrics.vendorName[0] != '\0' && strcasestr(metrics.vendorName, targetIdentifier) != NULL) ||
+                     (metrics.serialNumber[0] != '\0' && strcasestr(metrics.serialNumber, targetIdentifier) != NULL) ||
+                     (strncmp(query, "disk", 4) != 0 && metrics.bsdName[0] != '\0' && strcasestr(metrics.bsdName, query) != NULL))) {
+                    substringMatch = metrics;
+                    foundSubstring = true;
                 }
             }
         }
         IOObjectRelease(service);
     }
     IOObjectRelease(iter);
+
+    if (!isAuto && !outMetrics->found && foundSubstring) {
+        *outMetrics = substringMatch;
+    }
 
     // If auto mode and no external drive was found, fallback to the first device (e.g. internal drive)
     if (isAuto && !outMetrics->found && foundFirst) {
@@ -551,21 +571,34 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
         if (!fromName || fromName[0] == '\0') continue;
         if (strncmp(fromName, "/dev/", 5) != 0) continue; // Skip non-device filesystems (devfs, autofs, nfs)
 
+        const char *cleanFrom = fromName + 5;
+        const char *atSign = strchr(cleanFrom, '@');
+        if (atSign != NULL) {
+            cleanFrom = atSign + 1;
+            if (strncmp(cleanFrom, "/dev/", 5) == 0) cleanFrom += 5;
+        }
+
+        // 1. Exact partition slice or snapshot name match takes absolute priority (score 10)
+        bool isExactSliceMatch = (strcmp(cleanFrom, cleanTargetBsd) == 0);
+
         io_service_t dev = findBlockStorageDeviceByBSDName(fromName);
         if (dev != 0) {
             bool isSameDevice = IOObjectIsEqualTo(dev, targetDev);
             IOObjectRelease(dev);
 
-            if (isSameDevice) {
+            if (isExactSliceMatch || isSameDevice) {
                 const char *mountPath = fsList[i].f_mntonname;
-                // Prioritize user-facing mounts:
+                // Prioritize mounts:
+                // Exact slice match = 10 (target was a partition slice like disk3s5 or disk7s1)
                 // / = 4 (system root)
                 // /Volumes/* = 3 (external disk volume)
                 // /System/Volumes/Data = 2
                 // Other mounts = 1
                 // Hidden /System/Volumes/* or /Volumes/Recovery = 0
                 int score = 1;
-                if (strcmp(mountPath, "/") == 0) {
+                if (isExactSliceMatch) {
+                    score = 10;
+                } else if (strcmp(mountPath, "/") == 0) {
                     score = 4; // Root filesystem is highest priority
                 } else if (strncmp(mountPath, "/Volumes/", 9) == 0 && strcmp(mountPath, "/Volumes/Recovery") != 0) {
                     score = 3; // External user volume
@@ -579,7 +612,7 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
                     bestScore = score;
                     strlcpy(outMountPoint, mountPath, maxLen);
                     found = true;
-                    if (score == 4) {
+                    if (score == 10) {
                         break;
                     }
                 }

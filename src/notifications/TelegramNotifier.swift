@@ -14,6 +14,15 @@ final class TelegramNotifier {
         self.session = URLSession(configuration: config)
     }
 
+    static func redactToken(_ text: String, token: String) -> String {
+        guard !token.isEmpty else { return text }
+        var result = text.replacingOccurrences(of: token, with: "[REDACTED_TOKEN]")
+        if let encoded = token.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed), encoded != token {
+            result = result.replacingOccurrences(of: encoded, with: "[REDACTED_TOKEN]")
+        }
+        return result
+    }
+
     func sendMessageAsync(htmlText: String, disableNotification: Bool = false, completion: ((Bool) -> Void)? = nil) {
         let token = ConfigManager.shared.resolvedTelegramBotToken
         let chatId = ConfigManager.shared.resolvedTelegramChatId
@@ -42,18 +51,22 @@ final class TelegramNotifier {
 
         let task = session.dataTask(with: request) { data, response, error in
             if let error = error {
-                ConfigManager.shared.log("Telegram send error: \(error.localizedDescription)")
+                let safeErr = TelegramNotifier.redactToken(error.localizedDescription, token: token)
+                ConfigManager.shared.log("Telegram send error: \(safeErr)")
                 completion?(false)
                 return
             }
-            if let data = data,
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if statusCode == 200,
+               let data = data,
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let ok = json["ok"] as? Bool, ok {
                 ConfigManager.shared.log("Telegram notification sent successfully.")
                 completion?(true)
             } else {
-                let respStr = data.flatMap { String(data: $0, encoding: .utf8) } ?? "unknown"
-                ConfigManager.shared.log("Telegram API response: \(respStr)")
+                let rawResp = data.flatMap { String(data: $0, encoding: .utf8) } ?? "HTTP \(statusCode)"
+                let safeResp = TelegramNotifier.redactToken(rawResp, token: token)
+                ConfigManager.shared.log("Telegram API error (HTTP \(statusCode)): \(safeResp)")
                 completion?(false)
             }
         }
@@ -104,7 +117,8 @@ final class TelegramNotifier {
 
         let task = session.dataTask(with: request) { data, response, error in
             if let error = error {
-                completion(false, error.localizedDescription)
+                let safeErr = TelegramNotifier.redactToken(error.localizedDescription, token: token)
+                completion(false, safeErr)
                 return
             }
             if let data = data,
@@ -120,7 +134,8 @@ final class TelegramNotifier {
                 } else {
                     desc = data.flatMap { String(data: $0, encoding: .utf8) } ?? "Unknown Telegram error"
                 }
-                completion(false, desc)
+                let safeDesc = TelegramNotifier.redactToken(desc, token: token)
+                completion(false, safeDesc)
             }
         }
         task.resume()

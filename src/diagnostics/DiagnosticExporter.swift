@@ -11,6 +11,43 @@ final class DiagnosticExporter {
         let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
         let hostName = ProcessInfo.processInfo.hostName
 
+        // Enumerate all detected block storage devices for topology diagnostics
+        var rawDevices = [DiskHardwareMetrics](repeating: DiskHardwareMetrics(), count: 32)
+        let devCount = Int(DiskListAllDevices(&rawDevices, 32))
+        var detectedDevicesList: [[String: Any]] = []
+        for i in 0..<devCount {
+            let d = rawDevices[i]
+            let bsd = cStringToSwift(d.bsdName)
+            var cMount = [CChar](repeating: 0, count: 512)
+            let hasMount = !bsd.isEmpty && DiskFindMountForBlockDevice(bsd, &cMount, 512)
+            let mountPath = hasMount ? String(cString: cMount) : ""
+            detectedDevicesList.append([
+                "bsdName": bsd,
+                "vendorName": cStringToSwift(d.vendorName),
+                "productName": cStringToSwift(d.productName),
+                "serialNumber": cStringToSwift(d.serialNumber),
+                "interconnectType": cStringToSwift(d.interconnectType),
+                "protocolType": cStringToSwift(d.protocolType),
+                "isInternal": d.isInternal,
+                "isRemovable": d.isRemovable,
+                "linkSpeedBps": d.linkSpeedBps,
+                "smartValid": d.smartValid,
+                "temperatureCelsius": d.temperatureCelsius,
+                "mountPoint": mountPath
+            ])
+        }
+
+        // Capture up to the last 100 lines of health.log
+        var recentLogLines: [String] = []
+        if let logContent = try? String(contentsOfFile: ConfigManager.shared.logFilePath, encoding: .utf8) {
+            let token = ConfigManager.shared.resolvedTelegramBotToken
+            let sanitized = (!token.isEmpty)
+                ? logContent.replacingOccurrences(of: token, with: "[REDACTED_TOKEN]")
+                : logContent
+            let allLines = sanitized.components(separatedBy: .newlines).filter { !$0.isEmpty }
+            recentLogLines = Array(allLines.suffix(100))
+        }
+
         let report: [String: Any] = [
             "reportVersion": "2.1.0",
             "timestamp": isoTimestampFormatter.string(from: Date()),
@@ -24,6 +61,7 @@ final class DiagnosticExporter {
                 "volumePath": cfg.targetVolumePath ?? "auto",
                 "deviceQuery": cfg.targetDeviceQuery ?? "auto"
             ],
+            "detectedDevices": detectedDevicesList,
             "hardware": [
                 "productName": snap.productName,
                 "vendorName": snap.vendorName,
@@ -104,7 +142,8 @@ final class DiagnosticExporter {
                 "enableNativeNotifications": cfg.enableNativeNotifications,
                 "telegramBotToken": ConfigManager.shared.resolvedTelegramBotToken.isEmpty ? "None" : "•••••••• (Protected)",
                 "telegramChatId": cfg.telegramChatId.isEmpty ? "None" : cfg.telegramChatId
-            ]
+            ],
+            "recentLogLines": recentLogLines
         ]
         return report
     }

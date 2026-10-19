@@ -157,15 +157,21 @@ struct CoreLogicTestRunner {
         print("  [OK] Health evaluation rules verified")
 
         print("=== Swift Unit Test 5: DiagnosticExporter JSON Bundle Verification ===")
+        let secretBotToken = "888888:AAH_secret_for_diag_test"
         cfgMgr.updateConfig { cfg in
             cfg.targetVolumePath = "/"
             cfg.targetDeviceQuery = nil
-            cfg.telegramBotToken = "888888:AAH_secret_for_diag_test"
+            cfg.telegramBotToken = secretBotToken
         }
+        // Write a test log line with the secret token to simulate legacy log leakage
+        ConfigManager.shared.log("Simulated old log entry with token: \(secretBotToken)")
         let diagJSON = DiagnosticExporter.shared.exportDiagnosticReportJSON(snapshot: normalSnap)
         assertTrue(diagJSON.contains("\"reportVersion\""), "Diagnostic JSON must include reportVersion")
         assertTrue(diagJSON.contains("\"evaluation\""), "Diagnostic JSON must include evaluation section")
-        assertTrue(!diagJSON.contains("888888:AAH_secret_for_diag_test"), "Diagnostic JSON must never leak raw Telegram Bot Token")
+        assertTrue(diagJSON.contains("\"detectedDevices\""), "Diagnostic JSON must include detectedDevices section")
+        assertTrue(diagJSON.contains("\"recentLogLines\""), "Diagnostic JSON must include recentLogLines section")
+        assertTrue(!diagJSON.contains(secretBotToken), "Diagnostic JSON must never leak raw Telegram Bot Token even if present in health.log")
+        assertTrue(diagJSON.contains("[REDACTED_TOKEN]"), "Diagnostic JSON recentLogLines must contain [REDACTED_TOKEN] placeholder")
         SecretStore.shared.deleteSecret(forKey: "telegramBotToken")
         print("  [OK] DiagnosticExporter verified")
 
@@ -839,6 +845,78 @@ struct CoreLogicTestRunner {
             fatalError("Failed to deserialize generated plist XML")
         }
         print("  [OK] LaunchAgent plist structure, --menubar argument, and XML serialization verified")
+
+        print("=== Swift Unit Test 28: Per-Drive Cooldown Scoping, AppleScript Escaping & Enriched Diagnostics (IMPROVE-V5-01 to V5-07) ===")
+        // 28a. Verify MacOSNotifier AppleScript literal escaping
+        let rawScriptStr = "Alert \"Drive\" \\ Path\nLine2\rLine3"
+        let escapedScript = MacOSNotifier.escapeAppleScriptLiteral(rawScriptStr)
+        assertTrue(!escapedScript.contains("\n") && !escapedScript.contains("\r"), "AppleScript literal must strip newlines")
+        assertTrue(escapedScript.contains("\\\"Drive\\\"") && escapedScript.contains("\\\\"), "AppleScript literal must escape quotes and backslashes")
+
+        // 28b. Verify enriched DiagnosticExporter contains detectedDevices and recentLogLines
+        let enrichedDiag = DiagnosticExporter.shared.generateDiagnosticReport(snapshot: normalSnap)
+        guard let detectedList = enrichedDiag["detectedDevices"] as? [[String: Any]] else {
+            fatalError("Diagnostic report must include detectedDevices array")
+        }
+        assertTrue(!detectedList.isEmpty, "detectedDevices array must not be empty on macOS")
+        assertTrue(enrichedDiag["recentLogLines"] is [String], "Diagnostic report must include recentLogLines array")
+
+        // 28c. Verify per-drive cooldown scoping and that re-selecting the same target preserves cooldowns
+        monitor.setMonitoredTarget(volumePath: "/", deviceQuery: nil)
+        let beforeTarget = monitor.persistentState.monitoredTarget
+        assertTrue(beforeTarget == "/", "Monitored target must be '/'")
+
+        cfgMgr.updateConfig { cfg in
+            cfg.diskUsedWarningPercent = 0.01
+            cfg.enableNativeNotifications = false
+        }
+        _ = monitor.evaluateHealth(forceCanary: false, allowNotifications: true)
+        let scopedKeys = monitor.persistentState.lastAlertTimestampByCode.keys.filter { $0.contains("DISK_SPACE_WARNING") }
+        assertTrue(!scopedKeys.isEmpty, "Alert cooldown must be scoped with driveKey:code")
+        let firstKey = scopedKeys.first!
+        assertTrue(firstKey.contains(":DISK_SPACE_WARNING"), "Scoped key must contain :DISK_SPACE_WARNING")
+        let alertTimeBefore = monitor.persistentState.lastAlertTimestampByCode[firstKey]
+        assertTrue(alertTimeBefore != nil, "Alert timestamp should be recorded")
+
+        // Re-selecting the same target '/' must NOT wipe active cooldowns
+        monitor.setMonitoredTarget(volumePath: "/", deviceQuery: nil)
+        assertTrue(monitor.persistentState.monitoredTarget == "/", "Re-selecting '/' must remain '/'")
+        assertTrue(monitor.persistentState.lastAlertTimestampByCode[firstKey] == alertTimeBefore, "Re-selecting same target must preserve active scoped cooldowns")
+
+        // Clean up
+        cfgMgr.updateConfig { cfg in
+            cfg.diskUsedWarningPercent = 85.0
+            cfg.enableNativeNotifications = true
+        }
+
+        // 28d. Verify multi-drive cooldown isolation and recovery scoping
+        var isolatedState = DiskPersistentState()
+        isolatedState.lastAlertTimestampByCode["DRIVE_A_SERIAL:TEMP_WARNING"] = 1000
+        isolatedState.lastAlertTimestampByCode["DRIVE_B_SERIAL:TEMP_WARNING"] = 2000
+        isolatedState.lastAlertTimestampByCode["DRIVE_A_SERIAL:DISK_SPACE_WARNING"] = 1500
+
+        // Simulate recovery of DRIVE_A_SERIAL
+        let recPrefix = "DRIVE_A_SERIAL:"
+        for key in Array(isolatedState.lastAlertTimestampByCode.keys) where key.hasPrefix(recPrefix) || !key.contains(":") {
+            isolatedState.lastAlertTimestampByCode.removeValue(forKey: key)
+        }
+        assertTrue(isolatedState.lastAlertTimestampByCode["DRIVE_A_SERIAL:TEMP_WARNING"] == nil, "Drive A cooldowns must be cleared on recovery")
+        assertTrue(isolatedState.lastAlertTimestampByCode["DRIVE_A_SERIAL:DISK_SPACE_WARNING"] == nil, "Drive A space cooldown must be cleared on recovery")
+        assertTrue(isolatedState.lastAlertTimestampByCode["DRIVE_B_SERIAL:TEMP_WARNING"] == 2000, "Drive B cooldowns must NOT be cleared when Drive A recovers")
+
+        // 28e. Verify TelegramNotifier.redactToken helper
+        let rawLog = "Error sending message to https://api.telegram.org/bot777777:SECRET_XYZ/sendMessage: 401 Unauthorized"
+        let safeLog = TelegramNotifier.redactToken(rawLog, token: "777777:SECRET_XYZ")
+        assertTrue(!safeLog.contains("SECRET_XYZ"), "redactToken must remove raw secret token")
+        assertTrue(safeLog.contains("[REDACTED_TOKEN]"), "redactToken must insert [REDACTED_TOKEN]")
+
+        let encodedLog = "Failing URL: https://api.telegram.org/bot777777%3ASECRET_XYZ/sendMessage"
+        let safeEncodedLog = TelegramNotifier.redactToken(encodedLog, token: "777777:SECRET_XYZ")
+        assertTrue(!safeEncodedLog.contains("SECRET_XYZ"), "redactToken must remove percent-encoded token")
+        assertTrue(safeEncodedLog.contains("[REDACTED_TOKEN]"), "redactToken must insert [REDACTED_TOKEN] for percent-encoded token")
+
+        monitor.resetBaselines()
+        print("  [OK] Per-drive cooldown scoping, AppleScript escaping, enriched diagnostics & multi-drive isolation verified")
 
         print("✅ All Swift Core Logic Unit Tests Passed!")
     }

@@ -20,26 +20,27 @@ This directory contains the core hardware and filesystem evaluation engine (`Dis
 #### 3. Deep Filesystem Verification (`runVolumeVerification`)
 - When invoked with `--deep` (or **"Verify Volume"** in the UI / digest dispatches), executes `/usr/sbin/diskutil verifyVolume <target>`.
 - Atomically captures target path and `driveKey` under `engineLock` before dispatching to prevent cross-drive attribution races.
-- Features a 180-second watchdog timer with `NSLock`-synchronized timeout handling, non-blocking pipe drainage via `readToEnd()`, and clean two-stage process termination (`SIGTERM` followed by `SIGKILL` escalation).
+- Features a 180-second watchdog timer with `NSLock`-synchronized timeout handling, non-blocking pipe drainage via `readToEnd()`, cancellable `DispatchWorkItem` escalation, and clean two-stage process termination (`SIGTERM` followed by `SIGKILL` escalation).
 
 #### 4. The 12 Health Evaluation Rules (`evaluateHealth`)
 
 | # | Rule Category | Trigger Condition | Severity | Issue Code |
 | :--- | :--- | :--- | :--- | :--- |
-| **1** | **Mount Availability & Subpaths** | Target volume unmounted, BSD device missing, or required subpaths absent | `CRITICAL` | `REQUIRED_PATH_MISSING`, `VOLUME_UNMOUNTED`, `HW_DISCONNECTED` |
-| **2** | **Hardware SMART Status** | Hardware SMART status failed or NVMe Critical Warning bitmask `!= 0` | `CRITICAL` | `SMART_FAILURE`, `NVME_CRITICAL_WARNING` |
-| **3** | **NVMe Available Spare** | Available spare below threshold or `< 20%` | `WARNING` / `CRITICAL` | `NVME_SPARE_CRITICAL`, `NVME_SPARE_WARNING` |
-| **4** | **NVMe Wear Level** | `percentageUsed >= 90%` (`WARNING`) or `>= 100%` (`CRITICAL`) | `WARNING` / `CRITICAL` | `NVME_WEAR_WARNING`, `NVME_WEAR_CRITICAL` |
+| **1** | **Mount Availability & Subpaths** | Target volume unmounted, BSD device missing, or required subpaths absent | `CRITICAL` | `HW_DISCONNECTED`, `VOLUME_UNMOUNTED`, `REQUIRED_PATH_MISSING` |
+| **2** | **Hardware SMART Status** | NVMe Critical Warning bitmask `!= 0` | `CRITICAL` | `SMART_CRITICAL_WARNING` |
+| **3** | **NVMe Available Spare** | Available spare `<= threshold` / `< 10%` (`CRITICAL`) or `< 25%` (`WARNING`) | `WARNING` / `CRITICAL` | `SPARE_CRITICAL`, `SPARE_WARNING` |
+| **4** | **NVMe Wear Level** | `percentageUsed >= 80%` (`WARNING`) or `>= 95%` (`CRITICAL`) | `WARNING` / `CRITICAL` | `WEAR_WARNING`, `WEAR_CRITICAL` |
 | **5** | **Drive Temperature** | `temperatureCelsius >= tempWarningCelsius` or `>= tempCriticalCelsius` | `WARNING` / `CRITICAL` | `TEMP_WARNING`, `TEMP_CRITICAL` |
 | **6** | **Host Thermal State** | `ProcessInfo.processInfo.thermalState == .critical` | `WARNING` | `HOST_THERMAL_CRITICAL` |
-| **7** | **Media & Kernel I/O Errors** | Non-zero delta in `mediaErrors`, error log entries, or driver read/write errors | `WARNING` / `CRITICAL` | `NEW_MEDIA_ERRORS`, `NVME_ERROR_LOG_INCREASED`, `IO_DRIVER_ERRORS`, `IO_DRIVER_RETRIES` |
+| **7** | **Media & Kernel I/O Errors** | Non-zero delta in `mediaErrors`, error log entries, or driver read/write errors/retries | `WARNING` / `CRITICAL` | `MEDIA_ERRORS`, `ERROR_LOG_INCREASED`, `IO_DRIVER_ERRORS`, `IO_DRIVER_RETRIES` |
 | **8** | **I/O Latency Spikes** | Driver read/write latency exceeds threshold (`> 50 ms` warn, `> 200 ms` crit) for `>= 100` operations | `WARNING` / `CRITICAL` | `IO_LATENCY_WARNING`, `IO_LATENCY_CRITICAL` |
-| **9** | **Bus Speed Negotiation** | External USB drive negotiated below `minExpectedUsbSpeedBps` | `WARNING` | `USB_DOWNGRADED` |
+| **9** | **Bus Speed Negotiation** | External drive negotiated below `minExpectedUsbSpeedBps` | `WARNING` | `USB_LINK_DEGRADED` |
 | **10** | **Unsafe Shutdowns** | `unsafeShutdowns` counter incremented relative to persisted baseline | `WARNING` | `NEW_UNSAFE_SHUTDOWN` |
-| **11** | **Disk Free Space** | Used `%` above ceiling or free GB below configured floor | `WARNING` / `CRITICAL` | `DISK_SPACE_WARNING`, `DISK_SPACE_CRITICAL`, `FREE_SPACE_WARNING`, `FREE_SPACE_CRITICAL` |
-| **12** | **Canary & Verification** | Filesystem mounted read-only, canary probe failed, canary latency `> 250 ms`, or `verifyVolume` failed | `WARNING` / `CRITICAL` | `FILESYSTEM_READ_ONLY`, `CANARY_FAILED`, `CANARY_LATENCY_HIGH`, `VOLUME_VERIFY_FAILED` |
+| **11** | **Disk Free Space** | Used `%` above ceiling or free GB below configured floor | `WARNING` / `CRITICAL` | `DISK_SPACE_WARNING`, `DISK_SPACE_CRITICAL` |
+| **12** | **Canary & Verification** | Filesystem mounted read-only, canary probe failed, canary latency `> 300 ms`, or `verifyVolume` failed | `WARNING` / `CRITICAL` | `VOLUME_READONLY`, `CANARY_IO_FAILED`, `CANARY_HIGH_LATENCY`, `VOLUME_VERIFY_FAILED` |
 
-#### 5. Stateful Alert Cooldowns (`evaluateAndAlert`)
-- Compares current issues against per-drive state in `logs/state.json` (`lastAlertTimestamp`).
+#### 5. Stateful Alert Cooldowns (`processAlertsAndDigestLocked`)
+- Compares current issues against per-drive state in `logs/state.json` (`lastAlertTimestampByCode`, scoped as `"<driveKey>:<issueCode>"`).
 - Suppresses duplicate notifications for the same issue code within `alertCooldownSeconds`.
-- Automatically dispatches recovery notifications (`Disk Health Restored`) when a drive transitions from `WARNING` or `CRITICAL` back to `HEALTHY`.
+- Preserves active cooldowns across drive switches without wiping state.
+- Automatically dispatches recovery notifications (`RECOVERED — HEALTHY`) when a drive transitions from `WARNING` or `CRITICAL` back to `HEALTHY`, clearing scoped cooldowns for that drive.

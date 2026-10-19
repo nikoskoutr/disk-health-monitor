@@ -84,15 +84,18 @@ final class DiskHealthMonitor: ObservableObject {
 
     func setMonitoredTarget(volumePath: String?, deviceQuery: String?) {
         engineLock.lock()
+        let newTarget = volumePath ?? deviceQuery ?? "auto"
+        let targetChanged = (state.monitoredTarget != newTarget)
         ConfigManager.shared.updateTarget(volumePath: volumePath, deviceQuery: deviceQuery)
-        state.monitoredTarget = volumePath ?? deviceQuery ?? "auto"
-        state.lastAlertTimestampByCode.removeAll()
-        state.lastOverallSeverity = HealthSeverity.healthy.rawValue
-        previousDriveKey = ""
-        previousBytesRead = 0
-        previousBytesWritten = 0
-        previousSampleTime = 0
-        lastCanaryRunTime = 0
+        state.monitoredTarget = newTarget
+        if targetChanged {
+            state.lastOverallSeverity = HealthSeverity.healthy.rawValue
+            previousDriveKey = ""
+            previousBytesRead = 0
+            previousBytesWritten = 0
+            previousSampleTime = 0
+            lastCanaryRunTime = 0
+        }
         saveStateLocked()
         engineLock.unlock()
     }
@@ -318,7 +321,6 @@ final class DiskHealthMonitor: ObservableObject {
         if driveKey != previousDriveKey {
             if !previousDriveKey.isEmpty {
                 state.lastOverallSeverity = HealthSeverity.healthy.rawValue
-                state.lastAlertTimestampByCode.removeAll()
             }
             previousDriveKey = driveKey
             previousBytesRead = 0
@@ -762,10 +764,11 @@ final class DiskHealthMonitor: ObservableObject {
         var shouldSendAlert = false
 
         for issue in snapshot.issues {
-            let lastSent = state.lastAlertTimestampByCode[issue.code] ?? 0
+            let scopedKey = "\(driveKey):\(issue.code)"
+            let lastSent = state.lastAlertTimestampByCode[scopedKey] ?? state.lastAlertTimestampByCode[issue.code] ?? 0
             if (nowTs - lastSent) >= cooldown {
                 shouldSendAlert = true
-                state.lastAlertTimestampByCode[issue.code] = nowTs
+                state.lastAlertTimestampByCode[scopedKey] = nowTs
             }
         }
 
@@ -808,7 +811,10 @@ final class DiskHealthMonitor: ObservableObject {
             // Recovery notification
             let recoveryTitle = "\(snapshot.productName) RECOVERED — HEALTHY"
             ConfigManager.shared.log("Drive recovered to HEALTHY state.")
-            state.lastAlertTimestampByCode.removeAll()
+            let prefix = "\(driveKey):"
+            for key in Array(state.lastAlertTimestampByCode.keys) where key.hasPrefix(prefix) || !key.contains(":") {
+                state.lastAlertTimestampByCode.removeValue(forKey: key)
+            }
 
             if cfg.enableNativeNotifications {
                 MacOSNotifier.shared.postNotification(
@@ -883,6 +889,7 @@ final class DiskHealthMonitor: ObservableObject {
                 // 180-second watchdog timer in case diskutil or child fsck hangs on a wedged USB bridge
                 let timeoutLock = NSLock()
                 var timedOut = false
+                var killWorkItem: DispatchWorkItem?
                 let watchdog = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
                 watchdog.schedule(deadline: .now() + 180.0)
                 watchdog.setEventHandler {
@@ -892,13 +899,16 @@ final class DiskHealthMonitor: ObservableObject {
                         timeoutLock.unlock()
                         let pid = proc.processIdentifier
                         proc.terminate()
-                        // Close read handle and escalate to SIGKILL after 2s if still alive
-                        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0) {
+                        // Escalate to SIGKILL after 2s if still alive
+                        let escalation = DispatchWorkItem {
                             if proc.isRunning && pid > 0 {
                                 kill(pid, SIGKILL)
                             }
-                            try? readHandle.close()
                         }
+                        timeoutLock.lock()
+                        killWorkItem = escalation
+                        timeoutLock.unlock()
+                        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0, execute: escalation)
                     }
                 }
                 watchdog.resume()
@@ -906,11 +916,11 @@ final class DiskHealthMonitor: ObservableObject {
                 let data = (try? readHandle.readToEnd()) ?? Data()
                 proc.waitUntilExit()
                 watchdog.cancel()
-                try? readHandle.close()
-
                 timeoutLock.lock()
+                killWorkItem?.cancel()
                 let didTimeout = timedOut
                 timeoutLock.unlock()
+                try? readHandle.close()
 
                 let output = String(decoding: data, as: UTF8.self)
                 let timeStr = shortMonthDateFormatter.string(from: Date())

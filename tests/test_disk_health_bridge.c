@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <sys/param.h>
+#include <sys/mount.h>
 #include "DiskHealthBridge.h"
 
 int main(void) {
@@ -197,6 +199,55 @@ int main(void) {
     assert(DiskNormalizeLinkSpeedToBps(6) == 6);
     assert(DiskNormalizeLinkSpeedToBps(UINT64_MAX) == UINT64_MAX);
     printf("  USB speed codes (0-5), boundaries, and raw bps pass-through verified\n");
+
+    printf("\n=== Test 12: DiskReadHardwareMetrics Exact Matches Over Substrings (IMPROVE-V5-03) ===\n");
+    // 12a. Verify non-existent disk does not falsely match an existing disk via substring
+    DiskHardwareMetrics bogusDiskMatch;
+    DiskReadHardwareMetrics("disk99999", &bogusDiskMatch);
+    assert(bogusDiskMatch.found == false);
+
+    DiskHardwareMetrics bogusDevDiskMatch;
+    DiskReadHardwareMetrics("/dev/disk99999", &bogusDevDiskMatch);
+    assert(bogusDevDiskMatch.found == false);
+
+    // 12b. Verify exact matching on enumerated devices
+    for (int i = 0; i < count; i++) {
+        if (devices[i].bsdName[0] != '\0') {
+            DiskHardwareMetrics exactBsd;
+            DiskReadHardwareMetrics(devices[i].bsdName, &exactBsd);
+            assert(exactBsd.found == true);
+            assert(strcmp(exactBsd.bsdName, devices[i].bsdName) == 0);
+        }
+        if (devices[i].serialNumber[0] != '\0') {
+            DiskHardwareMetrics exactSerial;
+            DiskReadHardwareMetrics(devices[i].serialNumber, &exactSerial);
+            assert(exactSerial.found == true);
+            assert(strcasecmp(exactSerial.serialNumber, devices[i].serialNumber) == 0);
+        }
+    }
+    // 12c. Verify partition slice mount resolution in DiskFindMountForBlockDevice
+    struct statfs sfsList[16];
+    int fsCount = getfsstat(sfsList, (int)(sizeof(struct statfs) * 16), MNT_NOWAIT);
+    int testedSlices = 0;
+    for (int i = 0; i < fsCount; i++) {
+        if (strncmp(sfsList[i].f_mntfromname, "/dev/", 5) == 0) {
+            const char *slice = sfsList[i].f_mntfromname + 5;
+            const char *at = strchr(slice, '@');
+            if (at) {
+                slice = at + 1;
+                if (strncmp(slice, "/dev/", 5) == 0) slice += 5;
+            }
+            char resolvedMount[512] = {0};
+            bool ok = DiskFindMountForBlockDevice(slice, resolvedMount, sizeof(resolvedMount));
+            if (ok) {
+                assert(strcmp(resolvedMount, sfsList[i].f_mntonname) == 0);
+                testedSlices++;
+            }
+        }
+    }
+    assert(testedSlices > 0);
+    printf("  Partition slice mount resolution in DiskFindMountForBlockDevice verified (%d slices tested)\n", testedSlices);
+    printf("  Exact BSD Name and Serial Number priority over substring matching verified\n");
 
     printf("\n=== All Bridge Tests Passed Successfully! ===\n");
     return 0;

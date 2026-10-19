@@ -8,16 +8,20 @@ This directory provides a self-contained diagnostic bundle generator that captur
 
 ### [`DiagnosticExporter.swift`](DiagnosticExporter.swift)
 
-#### 1. `DiagnosticReport` (`Codable`)
-The top-level JSON structure produced by `DiagnosticExporter.shared.generateDiagnosticReport()`:
-- **`generatedAt`**: ISO-8601 UTC timestamp of the export.
-- **`osVersion`**: Full macOS version and build string (`ProcessInfo.processInfo.operatingSystemVersionString`).
-- **`hostname`**: Local machine hostname.
-- **`appVersion`**: Semantic version of Universal Disk Health Monitor (`"2.1.0"`).
-- **`appArchitecture`**: Runtime architecture string (`"arm64 (Apple Silicon)"` or `"x86_64 (Intel)"`).
-- **`redactedConfig`**: The active `DiskHealthConfig` passed through `ConfigManager.redactedConfig(_:)`, ensuring `telegramBotToken` is replaced with `"***REDACTED***"`.
-- **`mountedDisks`**: Array of `DiagnosticDiskSummary` entries populated via the C bridge (`DiskListAllDevices()`) and dynamic mount resolution (`DiskFindMountForBlockDevice()`), listing every block storage device's BSD identifier, volume name, mount path, vendor, product, transport protocol, capacity, and internal/external status.
-- **`latestSnapshot`**: The most recent `DiskHealthSnapshot` (either supplied directly by the running monitor or loaded from `logs/latest_status.json`).
+#### 1. Diagnostic Report Structure
+The JSON dictionary produced by `DiagnosticExporter.shared.generateDiagnosticReport()` and serialized by `exportDiagnosticReportJSON()`:
+- **`reportVersion`**: Semantic report schema version (`"2.1.0"`).
+- **`timestamp`**: ISO-8601 UTC timestamp of the export.
+- **`system`**: Operating system version, hostname, app version, and architecture (`arm64` or `x86_64`).
+- **`target`**: Active monitored `volumePath` and `deviceQuery`.
+- **`detectedDevices`**: Array of all block storage devices enumerated via `DiskListAllDevices()` and mount points resolved via `DiskFindMountForBlockDevice()`.
+- **`hardware`**: Hardware metadata for the target disk (vendor, product, BSD name, interconnect, bus speed).
+- **`filesystem`**: Filesystem metrics (mount point, capacity, free space, used percentage, read-only status, verification result).
+- **`smart`**: NVMe SMART attributes (temperature, spare, wear level, TBW, power cycles, unsafe shutdowns, media errors).
+- **`driverStats`**: Kernel storage driver statistics (read/write latencies, errors, retries, throughput).
+- **`canary`**: Active I/O canary probe status and round-trip latency.
+- **`evaluation`**: Overall health severity, score (0–100), and list of detected issues.
+- **`configuration`**: Active monitoring parameters with sensitive secrets securely masked (`•••••••• (Protected)`).
 - **`recentLogLines`**: Up to the last 100 lines of `logs/health.log` for troubleshooting historical events.
 
 #### 2. Usage
