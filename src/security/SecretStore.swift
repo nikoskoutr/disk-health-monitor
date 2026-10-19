@@ -8,6 +8,13 @@ final class SecretStore {
     private let serviceName = "io.github.disk-health-monitor"
     var configDir: String? = nil
 
+    private var isCustomConfigDirOverride: Bool {
+        if let env = ProcessInfo.processInfo.environment["DISK_HEALTH_CONFIG_DIR"], !env.isEmpty {
+            return true
+        }
+        return false
+    }
+
     private var fallbackSecretsPath: String {
         let base: String
         if let dir = configDir, !dir.isEmpty {
@@ -22,6 +29,7 @@ final class SecretStore {
 
     private init() {}
 
+    @discardableResult
     func setSecret(_ value: String, forKey key: String) -> Bool {
         if value.isEmpty {
             return deleteSecret(forKey: key)
@@ -29,26 +37,37 @@ final class SecretStore {
 
         guard let data = value.data(using: .utf8) else { return false }
 
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: key
-        ]
-
         var keychainSuccess = false
-        let status = SecItemCopyMatching(query as CFDictionary, nil)
-        if status == errSecSuccess {
-            let updateAttrs: [String: Any] = [
-                kSecValueData as String: data
+        if !isCustomConfigDirOverride {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: serviceName,
+                kSecAttrAccount as String: key
             ]
-            let updateStatus = SecItemUpdate(query as CFDictionary, updateAttrs as CFDictionary)
-            keychainSuccess = (updateStatus == errSecSuccess)
-        } else if status == errSecItemNotFound {
-            var newQuery = query
-            newQuery[kSecValueData as String] = data
-            newQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-            let addStatus = SecItemAdd(newQuery as CFDictionary, nil)
-            keychainSuccess = (addStatus == errSecSuccess)
+
+            let status = SecItemCopyMatching(query as CFDictionary, nil)
+            if status == errSecSuccess {
+                let updateAttrs: [String: Any] = [
+                    kSecValueData as String: data
+                ]
+                let updateStatus = SecItemUpdate(query as CFDictionary, updateAttrs as CFDictionary)
+                if updateStatus == errSecSuccess {
+                    keychainSuccess = true
+                } else {
+                    // If ad-hoc signature changed across rebuilds, recreate the item
+                    _ = SecItemDelete(query as CFDictionary)
+                    var newQuery = query
+                    newQuery[kSecValueData as String] = data
+                    newQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+                    keychainSuccess = (SecItemAdd(newQuery as CFDictionary, nil) == errSecSuccess)
+                }
+            } else if status == errSecItemNotFound {
+                var newQuery = query
+                newQuery[kSecValueData as String] = data
+                newQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+                let addStatus = SecItemAdd(newQuery as CFDictionary, nil)
+                keychainSuccess = (addStatus == errSecSuccess)
+            }
         }
 
         // Keep local fallback store synchronized with 0600 POSIX permissions
@@ -60,7 +79,16 @@ final class SecretStore {
     }
 
     func getSecret(forKey key: String) -> String? {
-        // 1. Try Keychain
+        // 1. Check synchronized 0600 fallback store first when using custom config dir or when updated locally
+        let fallback = loadFallbackSecrets()
+        if isCustomConfigDirOverride {
+            if let val = fallback[key], !val.isEmpty {
+                return val
+            }
+            return nil
+        }
+
+        // 2. Try macOS Keychain
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: serviceName,
@@ -72,11 +100,13 @@ final class SecretStore {
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         if status == errSecSuccess, let data = item as? Data, let str = String(data: data, encoding: .utf8), !str.isEmpty {
+            if let fbVal = fallback[key], !fbVal.isEmpty, fbVal != str {
+                return fbVal
+            }
             return str
         }
 
-        // 2. Try Fallback file
-        let fallback = loadFallbackSecrets()
+        // 3. Fallback file
         if let val = fallback[key], !val.isEmpty {
             return val
         }
@@ -84,8 +114,9 @@ final class SecretStore {
         return nil
     }
 
+    @discardableResult
     func deleteSecret(forKey key: String) -> Bool {
-        let kcDeleted = deleteSecretFromKeychain(key: key)
+        let kcDeleted = isCustomConfigDirOverride ? true : deleteSecretFromKeychain(key: key)
         var secrets = loadFallbackSecrets()
         secrets.removeValue(forKey: key)
         saveFallbackSecrets(secrets)

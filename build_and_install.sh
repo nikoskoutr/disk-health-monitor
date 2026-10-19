@@ -44,7 +44,12 @@ fi
 export TMPDIR="${BUILD_CACHE_DIR}"
 
 # 1. Compile C IOKit/NVMe SMART Bridge
-clang -O2 -Wall -Wextra -c "${SCRIPT_DIR}/src/bridge/DiskHealthBridge.c" -o "${BUILD_CACHE_DIR}/DiskHealthBridge.o"
+ARCH_FLAGS=(-mmacosx-version-min=13.0)
+if [[ "${1:-}" == "--package" ]] || [[ "${1:-}" == "--universal" ]]; then
+    echo "🌐 Building Universal Binary (arm64 + x86_64)..."
+    ARCH_FLAGS+=(-arch arm64 -arch x86_64)
+fi
+clang -O2 -Wall -Wextra "${ARCH_FLAGS[@]}" -c "${SCRIPT_DIR}/src/bridge/DiskHealthBridge.c" -o "${BUILD_CACHE_DIR}/DiskHealthBridge.o"
 
 # 2. Compile App Icon if needed
 if [[ ! -f "${SCRIPT_DIR}/assets/AppIcon.icns" ]] || [[ "${1:-}" == "--regenerate-icon" ]]; then
@@ -84,18 +89,39 @@ while IFS= read -r -d '' file; do
 done < <(find "${SCRIPT_DIR}/src" -name "*.swift" -print0 | sort -z)
 
 # 4. Compile Swift App + Link with C Bridge and macOS Frameworks
-swiftc -O \
-    -module-cache-path "${BUILD_CACHE_DIR}/ModuleCache" \
-    -import-objc-header "${SCRIPT_DIR}/src/bridge/DiskHealthBridge.h" \
-    "${SWIFT_SOURCES[@]}" \
-    "${BUILD_CACHE_DIR}/DiskHealthBridge.o" \
-    -framework Cocoa \
-    -framework SwiftUI \
-    -framework IOKit \
-    -framework CoreFoundation \
-    -framework UserNotifications \
-    -framework Security \
-    -o "${BINARY_PATH}"
+if [[ "${1:-}" == "--package" ]] || [[ "${1:-}" == "--universal" ]]; then
+    swiftc -O -target arm64-apple-macos13.0 \
+        -module-cache-path "${BUILD_CACHE_DIR}/ModuleCache-arm64" \
+        -import-objc-header "${SCRIPT_DIR}/src/bridge/DiskHealthBridge.h" \
+        "${SWIFT_SOURCES[@]}" \
+        "${BUILD_CACHE_DIR}/DiskHealthBridge.o" \
+        -framework Cocoa -framework SwiftUI -framework IOKit -framework CoreFoundation -framework UserNotifications -framework Security \
+        -o "${BUILD_CACHE_DIR}/${APP_NAME}-arm64"
+
+    swiftc -O -target x86_64-apple-macos13.0 \
+        -module-cache-path "${BUILD_CACHE_DIR}/ModuleCache-x86_64" \
+        -import-objc-header "${SCRIPT_DIR}/src/bridge/DiskHealthBridge.h" \
+        "${SWIFT_SOURCES[@]}" \
+        "${BUILD_CACHE_DIR}/DiskHealthBridge.o" \
+        -framework Cocoa -framework SwiftUI -framework IOKit -framework CoreFoundation -framework UserNotifications -framework Security \
+        -o "${BUILD_CACHE_DIR}/${APP_NAME}-x86_64"
+
+    lipo -create -output "${BINARY_PATH}" "${BUILD_CACHE_DIR}/${APP_NAME}-arm64" "${BUILD_CACHE_DIR}/${APP_NAME}-x86_64"
+    rm -f "${BUILD_CACHE_DIR}/${APP_NAME}-arm64" "${BUILD_CACHE_DIR}/${APP_NAME}-x86_64"
+else
+    swiftc -O \
+        -module-cache-path "${BUILD_CACHE_DIR}/ModuleCache" \
+        -import-objc-header "${SCRIPT_DIR}/src/bridge/DiskHealthBridge.h" \
+        "${SWIFT_SOURCES[@]}" \
+        "${BUILD_CACHE_DIR}/DiskHealthBridge.o" \
+        -framework Cocoa \
+        -framework SwiftUI \
+        -framework IOKit \
+        -framework CoreFoundation \
+        -framework UserNotifications \
+        -framework Security \
+        -o "${BINARY_PATH}"
+fi
 
 rm -f "${BUILD_CACHE_DIR}/DiskHealthBridge.o"
 chmod +x "${BINARY_PATH}"
@@ -195,3 +221,34 @@ EOF
     launchctl bootstrap "gui/$(id -u)" "${SERVICE_PLIST}"
     echo "🚀 LaunchAgent registered: ${SERVICE_PLIST}"
 fi
+
+# 7. Release Packaging (--package)
+if [[ "${1:-}" == "--package" ]]; then
+    DIST_DIR="${SCRIPT_DIR}/dist"
+    DMG_STAGE="${BUILD_CACHE_DIR}/dmg-stage"
+    rm -rf "${DIST_DIR}" "${DMG_STAGE}"
+    mkdir -p "${DIST_DIR}" "${DMG_STAGE}"
+
+    echo "📦 Packaging Universal Release Assets into ${DIST_DIR}..."
+    # Create macOS ZIP preserving bundle metadata and code signature
+    ditto -c -k --sequesterRsrc --keepParent "${APP_BUNDLE}" "${DIST_DIR}/${APP_NAME}-macOS.zip"
+
+    # Create macOS DMG with Applications symlink
+    cp -R "${APP_BUNDLE}" "${DMG_STAGE}/"
+    ln -s /Applications "${DMG_STAGE}/Applications"
+    cp "${SCRIPT_DIR}/README.md" "${SCRIPT_DIR}/LICENSE" "${DMG_STAGE}/"
+    hdiutil create -volname "Disk Health Monitor" \
+        -srcfolder "${DMG_STAGE}" \
+        -ov -format UDZO \
+        "${DIST_DIR}/${APP_NAME}.dmg" > /dev/null 2>&1 || true
+    rm -rf "${DMG_STAGE}"
+
+    # Generate SHA-256 Checksums
+    (
+        cd "${DIST_DIR}"
+        shasum -a 256 ./* > SHA256SUMS.txt
+    )
+    echo "✅ Release assets packaged in ${DIST_DIR}:"
+    ls -lh "${DIST_DIR}"
+fi
+

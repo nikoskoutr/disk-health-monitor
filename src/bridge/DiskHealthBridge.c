@@ -207,10 +207,12 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
         CFRelease(proto);
     }
 
-    // Class name check for internal NVMe / Apple fabric
+    // Class name check for internal NVMe / Apple fabric / VirtIO VM disks
     io_name_t deviceClassName;
     if (IOObjectGetClass(service, deviceClassName) == KERN_SUCCESS) {
-        if (strstr(deviceClassName, "AppleANS") != NULL || strstr(deviceClassName, "EmbeddedNVMe") != NULL) {
+        if (strstr(deviceClassName, "AppleANS") != NULL ||
+            strstr(deviceClassName, "EmbeddedNVMe") != NULL ||
+            strstr(deviceClassName, "VirtIO") != NULL) {
             outMetrics->isInternal = true;
             if (outMetrics->interconnectType[0] == '\0') {
                 strncpy(outMetrics->interconnectType, "PCI-Express", sizeof(outMetrics->interconnectType) - 1);
@@ -220,6 +222,9 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
 
     // 3. Inspect parents for bus speed, serial number, and interconnect fallback
     inspectParentsForBusProperties(service, outMetrics);
+
+    // 4. Inspect children for driver statistics and BSD Name
+    inspectChildrenForDriverStats(service, outMetrics);
 
     // If interconnectType is still unset, default based on known clues
     if (outMetrics->interconnectType[0] == '\0') {
@@ -238,11 +243,11 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
             strcasecmp(outMetrics->interconnectType, "Thunderbolt") == 0 ||
             outMetrics->isRemovable) {
             outMetrics->isInternal = false;
+        } else if (strcasecmp(outMetrics->interconnectType, "Virtual Interface") == 0 ||
+                   strcmp(outMetrics->bsdName, "disk0") == 0) {
+            outMetrics->isInternal = true;
         }
     }
-
-    // 4. Inspect children for driver statistics and BSD Name
-    inspectChildrenForDriverStats(service, outMetrics);
 
     // 5. Read NVMe SMART data via NVMeSMARTLib.plugin
     IOCFPlugInInterface **plugin = NULL;

@@ -165,8 +165,10 @@ final class ConfigManager: ObservableObject {
             searchPaths.append((customEnv as NSString).standardizingPath)
         }
         searchPaths.append("\(configDir)/.env")
-        searchPaths.append("\(currentDir)/.env")
-        searchPaths.append("\(bundleDir)/.env")
+        if ProcessInfo.processInfo.environment["DISK_HEALTH_CONFIG_DIR"]?.isEmpty ?? true {
+            searchPaths.append("\(currentDir)/.env")
+            searchPaths.append("\(bundleDir)/.env")
+        }
 
         for path in searchPaths {
             guard FileManager.default.fileExists(atPath: path),
@@ -246,6 +248,7 @@ final class ConfigManager: ObservableObject {
         updater(&self.config)
         if ConfigManager.isRealSecretToken(self.config.telegramBotToken) {
             _ = SecretStore.shared.setSecret(self.config.telegramBotToken, forKey: "telegramBotToken")
+            self.dotEnvTelegramToken = nil
             self.config.telegramBotToken = "REDACTED_IN_KEYCHAIN"
         }
         saveConfig()

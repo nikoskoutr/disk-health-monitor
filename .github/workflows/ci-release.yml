@@ -1,0 +1,55 @@
+name: Build, Test & Release macOS App
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-package:
+    name: Build Universal App, Run Tests & Package Assets
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build Universal App & Package Release Assets
+        run: |
+          chmod +x build_and_install.sh tests/run_tests.sh
+          ./build_and_install.sh --package
+
+      - name: Verify Universal Binary Architectures (arm64 + x86_64)
+        run: |
+          file DiskHealthMonitor.app/Contents/MacOS/DiskHealthMonitor
+          lipo -info DiskHealthMonitor.app/Contents/MacOS/DiskHealthMonitor
+
+      - name: Run C/IOKit Bridge, Swift Core Engine & CLI Test Suite
+        run: |
+          ./build_and_install.sh --test
+
+      - name: Upload Build Artifacts (ZIP, DMG & SHA256SUMS)
+        uses: actions/upload-artifact@v4
+        with:
+          name: DiskHealthMonitor-macOS-Universal
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release Assets
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.1.0' }}
+          name: Universal Disk Health Monitor ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.1.0' }} (macOS Universal)
+          prerelease: false
+          generate_release_notes: true
+          files: dist/*

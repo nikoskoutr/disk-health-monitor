@@ -4,25 +4,56 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BUILD_CACHE="${ROOT_DIR}/.build-cache"
+TEST_SANDBOX_DIR="${BUILD_CACHE}/test-sandbox"
 
 mkdir -p "${BUILD_CACHE}"
+rm -rf "${TEST_SANDBOX_DIR}"
+mkdir -p "${TEST_SANDBOX_DIR}/config" "${TEST_SANDBOX_DIR}/logs"
+
+export TMPDIR="${BUILD_CACHE}"
+export DISK_HEALTH_CONFIG_DIR="${TEST_SANDBOX_DIR}/config"
+export DISK_HEALTH_LOGS_DIR="${TEST_SANDBOX_DIR}/logs"
 
 echo "================================================================================"
 echo "🧪 RUNNING DISK HEALTH MONITOR TEST SUITE"
 echo "================================================================================"
 
 # 1. Test DiskHealthBridge C Unit Tests
-echo "--- [1/4] Building & Running test_disk_health_bridge ---"
+echo "--- [1/5] Building & Running test_disk_health_bridge (C/IOKit Unit Tests) ---"
+clang -O2 -Wall -Wextra -c "${ROOT_DIR}/src/bridge/DiskHealthBridge.c" -o "${BUILD_CACHE}/DiskHealthBridge_test.o"
 clang -O2 -Wall -Wextra -I"${ROOT_DIR}/src/bridge" -I"${ROOT_DIR}" \
     "${SCRIPT_DIR}/test_disk_health_bridge.c" \
-    "${ROOT_DIR}/src/bridge/DiskHealthBridge.c" \
+    "${BUILD_CACHE}/DiskHealthBridge_test.o" \
     -framework IOKit -framework CoreFoundation \
     -o "${BUILD_CACHE}/test_disk_health_bridge"
 "${BUILD_CACHE}/test_disk_health_bridge"
 echo "✅ test_disk_health_bridge passed!"
 
-# 2. Test CLI binary commands
-echo "--- [2/4] Testing CLI Binary Options ---"
+# 2. Test Swift Core Logic & Health Evaluation Engine Unit Tests
+echo "--- [2/5] Building & Running test_core_logic (Swift Engine & Config Unit Tests) ---"
+swiftc -O \
+    -module-cache-path "${BUILD_CACHE}/ModuleCache" \
+    -import-objc-header "${ROOT_DIR}/src/bridge/DiskHealthBridge.h" \
+    "${ROOT_DIR}/src/models/HealthModels.swift" \
+    "${ROOT_DIR}/src/security/SecretStore.swift" \
+    "${ROOT_DIR}/src/config/ConfigManager.swift" \
+    "${ROOT_DIR}/src/notifications/MacOSNotifier.swift" \
+    "${ROOT_DIR}/src/notifications/TelegramNotifier.swift" \
+    "${ROOT_DIR}/src/diagnostics/DiagnosticExporter.swift" \
+    "${ROOT_DIR}/src/engine/DiskHealthMonitor.swift" \
+    "${SCRIPT_DIR}/test_core_logic.swift" \
+    "${BUILD_CACHE}/DiskHealthBridge_test.o" \
+    -framework Cocoa \
+    -framework IOKit \
+    -framework CoreFoundation \
+    -framework UserNotifications \
+    -framework Security \
+    -o "${BUILD_CACHE}/test_core_logic"
+"${BUILD_CACHE}/test_core_logic"
+rm -f "${BUILD_CACHE}/DiskHealthBridge_test.o"
+
+# 3. Test CLI binary commands
+echo "--- [3/5] Testing CLI Binary Options ---"
 "${ROOT_DIR}/disk-health" --help > /dev/null
 echo "  [OK] disk-health --help"
 
@@ -65,8 +96,8 @@ else
     exit 1
 fi
 
-# 3. Test Export Configuration & Diagnostics
-echo "--- [3/4] Testing Config & Diagnostic Exporters ---"
+# 4. Test Export Configuration & Diagnostics
+echo "--- [4/5] Testing Config & Diagnostic Exporters ---"
 TEST_SECRET_TOKEN="test_secret_bot_token_8899"
 CONFIG_EXPORT="$(TELEGRAM_BOT_TOKEN="${TEST_SECRET_TOKEN}" "${ROOT_DIR}/disk-health" --export-config)"
 if echo "${CONFIG_EXPORT}" | grep -q "Protected" && ! echo "${CONFIG_EXPORT}" | grep -q "${TEST_SECRET_TOKEN}"; then
@@ -94,7 +125,7 @@ else
     exit 1
 fi
 
-TEST_DIAG_PATH="${ROOT_DIR}/logs/test_diag_export.json"
+TEST_DIAG_PATH="${TEST_SANDBOX_DIR}/logs/test_diag_export.json"
 "${ROOT_DIR}/disk-health" --export-diagnostics "${TEST_DIAG_PATH}" > /dev/null
 if [[ -f "${TEST_DIAG_PATH}" ]] && grep -q "reportVersion" "${TEST_DIAG_PATH}"; then
     echo "  [OK] disk-health --export-diagnostics generated valid report"
@@ -104,8 +135,8 @@ else
     exit 1
 fi
 
-# 4. Verify Project Assets & Directory Standardization
-echo "--- [4/4] Verifying Directory Layout & AppIcon Bundle Assets ---"
+# 5. Verify Project Assets & Directory Standardization
+echo "--- [5/5] Verifying Directory Layout & AppIcon Bundle Assets ---"
 if [[ -d "${ROOT_DIR}/logs" ]]; then
     echo "  [OK] logs/ directory exists"
 else
@@ -141,6 +172,8 @@ else
     echo "  [FAIL] Info.plist CFBundleIconFile is not set to AppIcon: '${ICON_PLIST}'"
     exit 1
 fi
+
+rm -rf "${TEST_SANDBOX_DIR}"
 
 echo "================================================================================"
 echo "🎉 ALL TESTS PASSED SUCCESSFULLY!"

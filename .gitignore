@@ -8,12 +8,15 @@
 .build-cache/
 .build/
 build/
+dist/
 DerivedData/
 *.o
 *.dSYM/
 *.app/
 *.plist
 *.iconset/
+*.dmg
+*.zip
 disk-health
 
 # Editor & IDE Directories

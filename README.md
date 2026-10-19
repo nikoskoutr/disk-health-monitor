@@ -73,10 +73,11 @@ disk-health-monitor/
 | [`src/diagnostics/`](src/diagnostics/README.md) | [src/diagnostics/README.md](src/diagnostics/README.md) | Self-contained diagnostic report exporter (`DiagnosticReport`) |
 | [`src/engine/`](src/engine/README.md) | [src/engine/README.md](src/engine/README.md) | Core health check orchestration, 12 evaluation rules, canary write probe, and alert cooldowns |
 | [`src/ui/`](src/ui/README.md) | [src/ui/README.md](src/ui/README.md) | Menu bar controller, popover telemetry card, and 4-tab `Cmd+,` Settings window |
-| [`tests/`](tests/README.md) | [tests/README.md](tests/README.md) | C/IOKit unit and hardware integration test suite |
+| [`tests/`](tests/README.md) | [tests/README.md](tests/README.md) | C/IOKit unit, Swift core engine unit, and CLI integration test suite |
 | [`scripts/`](scripts/README.md) | [scripts/README.md](scripts/README.md) | CoreGraphics vector icon generator script |
-| [`assets/`](assets/README.md) | [assets/README.md](assets/README.md) | Generated application icons (`AppIcon.png`, `AppIcon.icns`) |
+| [`assets/`](assets/README.md) | [assets/README.md](assets/README.md) | Generated application icons (`AppIcon.png`, `AppIcon.icns`) and UI screenshots |
 | [`logs/`](logs/README.md) | [logs/README.md](logs/README.md) | Runtime log files, latest telemetry JSON, and delta state persistence |
+| [`.github/`](.github/README.md) | [.github/README.md](.github/README.md) | GitHub Actions CI test pipeline and automated Universal macOS Release packager |
 
 ---
 
@@ -98,16 +99,19 @@ What `./build_and_install.sh` does:
 4. Ad-hoc codesigns `DiskHealthMonitor.app`.
 5. Creates a local convenience symlink `./disk-health -> DiskHealthMonitor.app/Contents/MacOS/DiskHealthMonitor` (git-ignored) so you can run CLI commands directly from the project root.
 
-### Optional Build & Install Flags
+### Optional Build, Test & Packaging Flags
 
 ```bash
-# Run the C/IOKit and CLI unit/integration test suite
+# Run the C/IOKit, Swift core engine, and CLI integration test suite
 ./build_and_install.sh --test
+
+# Build a Universal Binary (arm64 + x86_64) and package release assets (.zip, .dmg, SHA256SUMS.txt) into dist/
+./build_and_install.sh --package
 
 # Symlink the CLI binary to /usr/local/bin/disk-health
 ./build_and_install.sh --install-cli
 
-# Install and start background LaunchAgents (periodic 15-min check + mount watcher + menu bar agent)
+# Install and start background LaunchAgents
 ./build_and_install.sh --install-service
 
 # Stop and remove background LaunchAgents
