@@ -23,29 +23,24 @@ final class SettingsViewModel: ObservableObject {
 
     func checkLaunchAgent() {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let plistPath = "\(home)/Library/LaunchAgents/io.github.disk-health-monitor.plist"
+        let bundleId = Bundle.main.bundleIdentifier ?? "io.github.disk-health-monitor"
+        let plistPath = "\(home)/Library/LaunchAgents/\(bundleId).plist"
         launchAgentInstalled = FileManager.default.fileExists(atPath: plistPath)
     }
 
     func toggleLaunchAgent() {
-        let scriptPath = Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("build_and_install.sh").path
-        if FileManager.default.fileExists(atPath: scriptPath) {
-            let task = Process()
-            task.launchPath = "/bin/bash"
-            task.arguments = [scriptPath, launchAgentInstalled ? "--uninstall-service" : "--install-service"]
-            try? task.run()
-            task.waitUntilExit()
-        } else {
-            let home = FileManager.default.homeDirectoryForCurrentUser.path
-            let bundleId = "io.github.disk-health-monitor"
-            let agentsDir = "\(home)/Library/LaunchAgents"
-            let plistPath = "\(agentsDir)/\(bundleId).plist"
-            let binaryPath = Bundle.main.executablePath ?? "/Applications/DiskHealthMonitor.app/Contents/MacOS/DiskHealthMonitor"
-            let logsDir = ConfigManager.shared.logsDir
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let bundleId = Bundle.main.bundleIdentifier ?? "io.github.disk-health-monitor"
+        let agentsDir = "\(home)/Library/LaunchAgents"
+        let plistPath = "\(agentsDir)/\(bundleId).plist"
+        let binaryPath = Bundle.main.executablePath ?? "/Applications/DiskHealthMonitor.app/Contents/MacOS/DiskHealthMonitor"
+        let logsDir = ConfigManager.shared.logsDir
+        let isCurrentlyInstalled = launchAgentInstalled
 
-            if launchAgentInstalled {
+        DispatchQueue.global(qos: .userInitiated).async {
+            if isCurrentlyInstalled {
                 let bootout = Process()
-                bootout.launchPath = "/bin/launchctl"
+                bootout.executableURL = URL(fileURLWithPath: "/bin/launchctl")
                 bootout.arguments = ["bootout", "gui/\(getuid())/\(bundleId)"]
                 try? bootout.run()
                 bootout.waitUntilExit()
@@ -80,13 +75,15 @@ final class SettingsViewModel: ObservableObject {
                 """
                 try? plistContent.write(toFile: plistPath, atomically: true, encoding: .utf8)
                 let bootstrap = Process()
-                bootstrap.launchPath = "/bin/launchctl"
+                bootstrap.executableURL = URL(fileURLWithPath: "/bin/launchctl")
                 bootstrap.arguments = ["bootstrap", "gui/\(getuid())", plistPath]
                 try? bootstrap.run()
                 bootstrap.waitUntilExit()
             }
+            DispatchQueue.main.async {
+                self.checkLaunchAgent()
+            }
         }
-        checkLaunchAgent()
     }
 
     func refreshDiskList() {
@@ -105,15 +102,18 @@ final class SettingsViewModel: ObservableObject {
 
         let numMounts = getfsstat(nil, 0, MNT_NOWAIT)
         if numMounts > 0 {
-            var fsList = Array<Darwin.statfs>(repeating: Darwin.statfs(), count: Int(numMounts))
-            let mCount = getfsstat(&fsList, Int32(MemoryLayout<Darwin.statfs>.size * Int(numMounts)), MNT_NOWAIT)
-            for i in 0..<Int(mCount) {
-                let volPath = cStringToSwift(fsList[i].f_mntonname)
-                let flags = UInt32(fsList[i].f_flags)
-                let isLocal = (flags & UInt32(MNT_LOCAL)) != 0
-                if isLocal && (volPath.hasPrefix("/Volumes/") || volPath == "/") {
-                    let displayName = volPath == "/" ? "Macintosh HD (/)" : (volPath as NSString).lastPathComponent
-                    items.append((id: volPath, name: "📂 \(displayName) (\(volPath))"))
+            let allocCount = Int(numMounts) + 4
+            var fsList = Array<Darwin.statfs>(repeating: Darwin.statfs(), count: allocCount)
+            let mCount = getfsstat(&fsList, Int32(MemoryLayout<Darwin.statfs>.size * allocCount), MNT_NOWAIT)
+            if mCount > 0 {
+                for i in 0..<min(Int(mCount), allocCount) {
+                    let volPath = cStringToSwift(fsList[i].f_mntonname)
+                    let flags = UInt32(fsList[i].f_flags)
+                    let isLocal = (flags & UInt32(MNT_LOCAL)) != 0
+                    if isLocal && (volPath.hasPrefix("/Volumes/") || volPath == "/") {
+                        let displayName = volPath == "/" ? "Macintosh HD (/)" : (volPath as NSString).lastPathComponent
+                        items.append((id: volPath, name: "📂 \(displayName) (\(volPath))"))
+                    }
                 }
             }
         }
@@ -144,6 +144,21 @@ final class SettingsViewModel: ObservableObject {
             let json = ConfigManager.shared.exportSanitizedConfigJSON(includeSecrets: false)
             try? json.write(to: url, atomically: true, encoding: .utf8)
             diagnosticsStatusMsg = "Saved configuration to \(url.lastPathComponent)"
+        }
+    }
+
+    func importConfigAction() {
+        let panel = NSOpenPanel()
+        panel.title = "Import Configuration JSON"
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            if ConfigManager.shared.importConfigFile(at: url) {
+                self.botToken = ConfigManager.shared.resolvedTelegramBotToken
+                diagnosticsStatusMsg = "Imported configuration from \(url.lastPathComponent)"
+            } else {
+                diagnosticsStatusMsg = "Failed to decode configuration file."
+            }
         }
     }
 
@@ -869,6 +884,20 @@ struct DiagnosticsAndExportTab: View {
                             viewModel.exportConfigAction()
                         }) {
                             Text("Export Config...")
+                                .frame(width: 128)
+                        }
+                    }
+
+                    Divider()
+
+                    SettingsRow(
+                        title: "Import Configuration Profile",
+                        subtitle: "Restore configuration settings from an exported JSON profile."
+                    ) {
+                        Button(action: {
+                            viewModel.importConfigAction()
+                        }) {
+                            Text("Import Config...")
                                 .frame(width: 128)
                         }
                     }

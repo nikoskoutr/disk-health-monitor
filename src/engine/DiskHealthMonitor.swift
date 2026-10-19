@@ -12,6 +12,7 @@ final class DiskHealthMonitor: ObservableObject {
 
     private let engineLock = NSRecursiveLock()
     private var state: DiskPersistentState
+    private var previousDriveKey: String = ""
     private var previousBytesRead: UInt64 = 0
     private var previousBytesWritten: UInt64 = 0
     private var previousSampleTime: TimeInterval = 0
@@ -61,6 +62,11 @@ final class DiskHealthMonitor: ObservableObject {
         ConfigManager.shared.updateTarget(volumePath: volumePath, deviceQuery: deviceQuery)
         state.monitoredTarget = volumePath ?? deviceQuery ?? "auto"
         state.lastAlertTimestampByCode.removeAll()
+        previousDriveKey = ""
+        previousBytesRead = 0
+        previousBytesWritten = 0
+        previousSampleTime = 0
+        lastCanaryRunTime = 0
         saveStateLocked()
         engineLock.unlock()
     }
@@ -210,9 +216,23 @@ final class DiskHealthMonitor: ObservableObject {
         if !mountToInspect.isEmpty {
             var sfs = statfs()
             if statfs(mountToInspect, &sfs) == 0 {
-                mountPoint = cStringToSwift(sfs.f_mntonname)
+                let resolvedMountPoint = (cStringToSwift(sfs.f_mntonname) as NSString).standardizingPath
+                let resolvedInspect = (mountToInspect as NSString).standardizingPath
                 fsType = cStringToSwift(sfs.f_fstypename)
-                if mountPoint == mountToInspect || mountToInspect.hasPrefix(mountPoint) || mountPoint.hasPrefix(mountToInspect) {
+
+                // If inspecting "/", resolvedMountPoint must be "/".
+                // If inspecting "/Volumes/Foo", resolvedMountPoint must equal "/Volumes/Foo"
+                // (not "/" when "/Volumes/Foo" is an unmounted stub directory).
+                let isValidMatch: Bool
+                if resolvedInspect == "/" {
+                    isValidMatch = (resolvedMountPoint == "/")
+                } else {
+                    isValidMatch = (resolvedMountPoint == resolvedInspect) ||
+                                   (resolvedMountPoint != "/" && resolvedInspect.hasPrefix(resolvedMountPoint + "/"))
+                }
+
+                if isValidMatch {
+                    mountPoint = resolvedMountPoint
                     isMounted = true
                     isReadOnly = (sfs.f_flags & UInt32(MNT_RDONLY)) != 0
                     let bsize = UInt64(sfs.f_bsize)
@@ -231,6 +251,15 @@ final class DiskHealthMonitor: ObservableObject {
             var isDir: ObjCBool = false
             let exists = isMounted && FileManager.default.fileExists(atPath: fullSubpath, isDirectory: &isDir)
             subpathsStatus[subpath] = exists
+        }
+
+        let driveKey = !serialNumber.isEmpty ? serialNumber : (!bsdName.isEmpty ? bsdName : (targetMount.isEmpty ? "default" : targetMount))
+        if driveKey != previousDriveKey {
+            previousDriveKey = driveKey
+            previousBytesRead = 0
+            previousBytesWritten = 0
+            previousSampleTime = 0
+            lastCanaryRunTime = 0
         }
 
         // 5. Active I/O Canary Probe
@@ -272,7 +301,6 @@ final class DiskHealthMonitor: ObservableObject {
             : 0.0
 
         // 7. Update Peak Temp & Baselines for this specific physical drive
-        let driveKey = !serialNumber.isEmpty ? serialNumber : (!bsdName.isEmpty ? bsdName : (targetMount.isEmpty ? "default" : targetMount))
         var driveState = state.getDriveState(key: driveKey, bsdName: bsdName, serial: serialNumber)
 
         let tempC = Int(hw.temperatureCelsius)
@@ -669,6 +697,12 @@ final class DiskHealthMonitor: ObservableObject {
             if snapshot.issues.contains(where: { $0.code == "ERROR_LOG_INCREASED" }) && hw.smartValid {
                 self.state.updateDriveState(key: driveKey) { $0.baselineErrorLogEntries = hw.errorInfoLogEntries }
             }
+            if snapshot.issues.contains(where: { $0.code == "IO_DRIVER_RETRIES" }) && hw.statsValid {
+                self.state.updateDriveState(key: driveKey) {
+                    $0.baselineIoReadRetries = hw.retriesRead
+                    $0.baselineIoWriteRetries = hw.retriesWritten
+                }
+            }
 
             // Send Telegram alert
             let htmlMsg = TelegramNotifier.shared.formatReportHTML(snapshot: snapshot, title: alertTitle)
@@ -739,9 +773,9 @@ final class DiskHealthMonitor: ObservableObject {
             var summary = ""
             do {
                 try proc.run()
-                proc.waitUntilExit()
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
+                proc.waitUntilExit()
+                let output = String(decoding: data, as: UTF8.self)
                 ok = (proc.terminationStatus == 0) && (output.contains("appears to be OK") || output.contains("Finished file system verification") || output.contains("File system check exit code is 0"))
                 let timeStr = shortMonthDateFormatter.string(from: Date())
                 if ok {

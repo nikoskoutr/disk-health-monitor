@@ -169,6 +169,188 @@ struct CoreLogicTestRunner {
         SecretStore.shared.deleteSecret(forKey: "telegramBotToken")
         print("  [OK] DiagnosticExporter verified")
 
+        print("=== Swift Unit Test 6: HTML Entity Escaping (TelegramNotifier) ===")
+        let rawHtmlStr = "<script>alert('test & pass')</script> /Volumes/A&B/Path > Foo"
+        let escaped = TelegramNotifier.shared.escapeHTML(rawHtmlStr)
+        assertTrue(escaped == "&lt;script&gt;alert('test &amp; pass')&lt;/script&gt; /Volumes/A&amp;B/Path &gt; Foo", "escapeHTML must convert <, >, and & correctly")
+
+        let dummySnap = DiskHealthSnapshot(
+            timestamp: normalSnap.timestamp,
+            formattedTime: normalSnap.formattedTime,
+            formattedShortTime: normalSnap.formattedShortTime,
+            overallSeverity: .warning,
+            healthScore: 85,
+            issues: [
+                HealthIssue(code: "TEST_HTML", severity: .warning, title: "Issue <Title>", detail: "Detail & <More>")
+            ],
+            hardwareFound: true,
+            vendorName: "Vendor & Co",
+            productName: "Bad <Name> & Drive",
+            productRevision: "1.0",
+            bsdName: "disk9",
+            serialNumber: "SN&123<4>",
+            usbSerialNumber: "SN&123<4>",
+            interconnectType: "USB",
+            protocolType: "NVMe",
+            isInternal: false,
+            isRemovable: true,
+            linkSpeedBps: 5_000_000_000,
+            linkSpeedFormatted: "5 Gbps",
+            isMounted: true,
+            mountPoint: "/Volumes/Test & <Drive>",
+            filesystemType: "apfs",
+            isReadOnly: false,
+            totalBytes: 1_000_000,
+            freeBytes: 500_000,
+            usedBytes: 500_000,
+            usedPercent: 50.0,
+            subpathsStatus: [:],
+            canaryOk: false,
+            canaryLatencyMs: 0.0,
+            canaryError: "Error: size < 0 & failed",
+            smartValid: false,
+            criticalWarning: 0,
+            temperatureCelsius: 0,
+            peakTemperatureCelsius: 0,
+            availableSpare: 0,
+            availableSpareThreshold: 0,
+            percentageUsed: 0,
+            lifeRemainingPercent: 0,
+            totalTerabytesRead: 0.0,
+            totalTerabytesWritten: 0.0,
+            powerCycles: 0,
+            powerOnHours: 0,
+            unsafeShutdowns: 0,
+            mediaErrors: 0,
+            errorInfoLogEntries: 0,
+            statsValid: false,
+            sessionBytesRead: 0,
+            sessionBytesWritten: 0,
+            operationsRead: 0,
+            operationsWritten: 0,
+            errorsRead: 0,
+            errorsWritten: 0,
+            retriesRead: 0,
+            retriesWritten: 0,
+            avgReadLatencyMs: 0.0,
+            avgWriteLatencyMs: 0.0,
+            readThroughputMBps: 0.0,
+            writeThroughputMBps: 0.0,
+            lastVerifyResult: "fsck: found 1 <error> & 2 warnings",
+            lastVerifyOk: false
+        )
+        let reportHtml = TelegramNotifier.shared.formatReportHTML(snapshot: dummySnap, title: "Report <1> & <2>")
+        assertTrue(!reportHtml.contains("<Name>"), "HTML report must escape productName <Name>")
+        assertTrue(reportHtml.contains("&lt;Name&gt;"), "HTML report must contain &lt;Name&gt;")
+        assertTrue(reportHtml.contains("&amp; Drive"), "HTML report must contain &amp; Drive")
+        assertTrue(reportHtml.contains("&lt;1&gt; &amp; &lt;2&gt;"), "HTML report must escape title entities")
+        assertTrue(reportHtml.contains("Detail &amp; &lt;More&gt;"), "HTML report must escape issue detail entities")
+        print("  [OK] HTML escaping verified")
+
+        print("=== Swift Unit Test 7: Unmounted Stub Directory Detection ===")
+        let stubDir = "\(NSTemporaryDirectory())unmounted_stub_test_\(UUID().uuidString)"
+        try? FileManager.default.createDirectory(atPath: stubDir, withIntermediateDirectories: true)
+        cfgMgr.updateConfig { cfg in
+            cfg.targetVolumePath = stubDir
+            cfg.targetDeviceQuery = nil
+        }
+        let stubSnap = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        assertTrue(!stubSnap.isMounted, "Unmounted stub directory on root filesystem must evaluate to isMounted == false")
+        assertTrue(stubSnap.issues.contains(where: { $0.code == "VOLUME_UNMOUNTED" }), "Unmounted stub directory must trigger VOLUME_UNMOUNTED issue")
+        try? FileManager.default.removeItem(atPath: stubDir)
+        print("  [OK] Unmounted stub directory detection verified")
+
+        print("=== Swift Unit Test 8: Configuration Import Logic & Secret Preservation ===")
+        let initialToken = "7777777:AAH_initial_token_before_import"
+        cfgMgr.updateConfig { cfg in
+            cfg.targetVolumePath = "/"
+            cfg.telegramBotToken = initialToken
+            cfg.pollIntervalSeconds = 45.0
+            cfg.tempWarningCelsius = 55
+        }
+        assertTrue(cfgMgr.resolvedTelegramBotToken == initialToken, "Initial token must be resolved")
+
+        // Simulate importing a config where telegramBotToken is masked or REDACTED_IN_KEYCHAIN
+        let exportedSanitized = cfgMgr.exportSanitizedConfigJSON(includeSecrets: false)
+        assertTrue(exportedSanitized.contains("Protected"), "Exported config must have Protected placeholder")
+
+        if let data = exportedSanitized.data(using: .utf8),
+           var importedCfg = try? JSONDecoder().decode(DiskHealthConfig.self, from: data) {
+            importedCfg.pollIntervalSeconds = 15.0
+            importedCfg.tempWarningCelsius = 42
+
+            let modifiedData = (try? JSONEncoder().encode(importedCfg)) ?? Data()
+            let importOk = cfgMgr.importConfig(from: modifiedData)
+            assertTrue(importOk, "ConfigManager.importConfig must succeed")
+            assertTrue(cfgMgr.config.pollIntervalSeconds == 15.0, "Imported pollIntervalSeconds must be 15.0")
+            assertTrue(cfgMgr.config.tempWarningCelsius == 42, "Imported tempWarningCelsius must be 42")
+            assertTrue(cfgMgr.resolvedTelegramBotToken == initialToken, "Existing Keychain token must be preserved after import")
+        } else {
+            assertTrue(false, "Failed to decode exported sanitized config JSON")
+        }
+        SecretStore.shared.deleteSecret(forKey: "telegramBotToken")
+        print("  [OK] Config import and secret preservation verified")
+
+        print("=== Swift Unit Test 9: Thread-Safe Logging and Log File Rotation ===")
+        let logPath = cfgMgr.logFilePath
+        let rotatedPath = "\(logPath).1"
+        try? FileManager.default.removeItem(atPath: logPath)
+        try? FileManager.default.removeItem(atPath: rotatedPath)
+
+        cfgMgr.log("Initial test log entry")
+        assertTrue(FileManager.default.fileExists(atPath: logPath), "health.log must be created by ConfigManager.log")
+
+        // Create a large file (> 5 MB) at logFilePath to trigger rotation
+        let largeBuffer = Data(repeating: 0x41, count: 5 * 1024 * 1024 + 1024)
+        try? largeBuffer.write(to: URL(fileURLWithPath: logPath))
+
+        cfgMgr.log("Rotated test log entry")
+        assertTrue(FileManager.default.fileExists(atPath: rotatedPath), "health.log.1 must exist after log rotation")
+        let rotatedAttrs = try? FileManager.default.attributesOfItem(atPath: rotatedPath)
+        let rotatedSize = (rotatedAttrs?[.size] as? UInt64) ?? 0
+        assertTrue(rotatedSize > 5 * 1024 * 1024, "Rotated log size must be > 5 MB")
+
+        let newLogContent = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
+        assertTrue(newLogContent.contains("Rotated test log entry"), "New health.log must contain the latest log entry")
+        assertTrue(!newLogContent.contains("Initial test log entry"), "New health.log must not contain old entries")
+
+        // Clean up
+        try? FileManager.default.removeItem(atPath: rotatedPath)
+        print("  [OK] Log rotation verified")
+
+        print("=== Swift Unit Test 10: Target Switch State Invalidation (IMPROVE-06) ===")
+        monitor.setMonitoredTarget(volumePath: "/", deviceQuery: nil)
+        let rootSnap = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        assertTrue(rootSnap.hardwareFound, "Root target must be found")
+
+        let bogusTarget = "/Volumes/Bogus_\(UUID().uuidString)"
+        monitor.setMonitoredTarget(volumePath: bogusTarget, deviceQuery: nil)
+        let bogusSnap = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        assertTrue(bogusSnap.readThroughputMBps == 0.0, "Throughput read must reset to 0.0 MBps on target switch")
+        assertTrue(bogusSnap.writeThroughputMBps == 0.0, "Throughput write must reset to 0.0 MBps on target switch")
+        monitor.setMonitoredTarget(volumePath: "/", deviceQuery: nil)
+        print("  [OK] Target switch state reset verified")
+
+        print("=== Swift Unit Test 11: I/O Retry Baseline Advancement (IMPROVE-15) ===")
+        var testPersistentState = DiskPersistentState()
+        let testDriveKey = "retry_test_drive_\(UUID().uuidString)"
+        testPersistentState.updateDriveState(key: testDriveKey) {
+            $0.baselineIoReadRetries = 10
+            $0.baselineIoWriteRetries = 5
+        }
+        let initDriveState = testPersistentState.getDriveState(key: testDriveKey, bsdName: "disk9", serial: "SN_TEST")
+        assertTrue(initDriveState.baselineIoReadRetries == 10, "Initial baselineIoReadRetries must be 10")
+        assertTrue(initDriveState.baselineIoWriteRetries == 5, "Initial baselineIoWriteRetries must be 5")
+
+        testPersistentState.updateDriveState(key: testDriveKey) {
+            $0.baselineIoReadRetries = 25
+            $0.baselineIoWriteRetries = 14
+        }
+        let updatedDriveState = testPersistentState.getDriveState(key: testDriveKey, bsdName: "disk9", serial: "SN_TEST")
+        assertTrue(updatedDriveState.baselineIoReadRetries == 25, "Advanced baselineIoReadRetries must be 25")
+        assertTrue(updatedDriveState.baselineIoWriteRetries == 14, "Advanced baselineIoWriteRetries must be 14")
+        print("  [OK] I/O retry baseline advancement verified")
+
         print("✅ All Swift Core Logic Unit Tests Passed!")
     }
 }

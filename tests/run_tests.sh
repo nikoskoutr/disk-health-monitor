@@ -96,8 +96,54 @@ else
     exit 1
 fi
 
-# 4. Test Export Configuration & Diagnostics
+set +e
+"${ROOT_DIR}/disk-health" --check > "${BUILD_CACHE}/check_output.txt"
+CHECK_EXIT=$?
+set -e
+if [[ ${CHECK_EXIT} -le 2 ]] && grep -q "DISK HEALTH MONITOR" "${BUILD_CACHE}/check_output.txt"; then
+    echo "  [OK] disk-health --check (exit code: ${CHECK_EXIT})"
+else
+    echo "  [FAIL] disk-health --check failed or crashed with exit code ${CHECK_EXIT}"
+    cat "${BUILD_CACHE}/check_output.txt"
+    exit 1
+fi
+
+set +e
+"${ROOT_DIR}/disk-health" --watch-mounts > "${BUILD_CACHE}/watch_output.txt"
+WATCH_EXIT=$?
+set -e
+if [[ ${WATCH_EXIT} -le 2 ]] && grep -q "DISK HEALTH MONITOR" "${BUILD_CACHE}/watch_output.txt"; then
+    echo "  [OK] disk-health --watch-mounts (exit code: ${WATCH_EXIT})"
+else
+    echo "  [FAIL] disk-health --watch-mounts failed or crashed with exit code ${WATCH_EXIT}"
+    cat "${BUILD_CACHE}/watch_output.txt"
+    exit 1
+fi
+
+set +e
+"${ROOT_DIR}/disk-health" --deep > "${BUILD_CACHE}/deep_output.txt"
+DEEP_EXIT=$?
+set -e
+if [[ ${DEEP_EXIT} -le 2 ]] && grep -q "DISK HEALTH MONITOR" "${BUILD_CACHE}/deep_output.txt"; then
+    echo "  [OK] disk-health --deep (exit code: ${DEEP_EXIT})"
+else
+    echo "  [FAIL] disk-health --deep failed or crashed with exit code ${DEEP_EXIT}"
+    cat "${BUILD_CACHE}/deep_output.txt"
+    exit 1
+fi
+
+# 4. Test Export & Import Configuration & Diagnostics
 echo "--- [4/5] Testing Config & Diagnostic Exporters ---"
+TEST_IMPORT_PATH="${TEST_SANDBOX_DIR}/config/import_test.json"
+echo '{"pollIntervalSeconds": 22.0, "tempWarningCelsius": 48}' > "${TEST_IMPORT_PATH}"
+"${ROOT_DIR}/disk-health" --import-config "${TEST_IMPORT_PATH}" > "${BUILD_CACHE}/import_cli_output.txt"
+if grep -q "Configuration imported successfully" "${BUILD_CACHE}/import_cli_output.txt"; then
+    echo "  [OK] disk-health --import-config"
+else
+    echo "  [FAIL] disk-health --import-config failed"
+    cat "${BUILD_CACHE}/import_cli_output.txt"
+    exit 1
+fi
 TEST_SECRET_TOKEN="test_secret_bot_token_8899"
 CONFIG_EXPORT="$(TELEGRAM_BOT_TOKEN="${TEST_SECRET_TOKEN}" "${ROOT_DIR}/disk-health" --export-config)"
 if echo "${CONFIG_EXPORT}" | grep -q "Protected" && ! echo "${CONFIG_EXPORT}" | grep -q "${TEST_SECRET_TOKEN}"; then

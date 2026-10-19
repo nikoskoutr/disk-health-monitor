@@ -70,25 +70,31 @@ final class SecretStore {
             }
         }
 
-        // Keep local fallback store synchronized with 0600 POSIX permissions
+        if keychainSuccess {
+            // Remove any stale plaintext copy from fallback file if Keychain succeeded
+            var secrets = loadFallbackSecrets()
+            if secrets.removeValue(forKey: key) != nil {
+                saveFallbackSecrets(secrets)
+            }
+            return true
+        }
+
+        // Only write to 0600 fallback file in headless/SSH environments or custom test sandboxes
         var secrets = loadFallbackSecrets()
         secrets[key] = value
-        saveFallbackSecrets(secrets)
-
-        return keychainSuccess || true
+        return saveFallbackSecrets(secrets)
     }
 
     func getSecret(forKey key: String) -> String? {
-        // 1. Check synchronized 0600 fallback store first when using custom config dir or when updated locally
-        let fallback = loadFallbackSecrets()
         if isCustomConfigDirOverride {
+            let fallback = loadFallbackSecrets()
             if let val = fallback[key], !val.isEmpty {
                 return val
             }
             return nil
         }
 
-        // 2. Try macOS Keychain
+        // 1. Try macOS Keychain first
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: serviceName,
@@ -100,13 +106,11 @@ final class SecretStore {
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         if status == errSecSuccess, let data = item as? Data, let str = String(data: data, encoding: .utf8), !str.isEmpty {
-            if let fbVal = fallback[key], !fbVal.isEmpty, fbVal != str {
-                return fbVal
-            }
             return str
         }
 
-        // 3. Fallback file
+        // 2. Fallback file (headless / non-Keychain environments)
+        let fallback = loadFallbackSecrets()
         if let val = fallback[key], !val.isEmpty {
             return val
         }
@@ -143,19 +147,24 @@ final class SecretStore {
         return json
     }
 
-    private func saveFallbackSecrets(_ secrets: [String: String]) {
+    @discardableResult
+    private func saveFallbackSecrets(_ secrets: [String: String]) -> Bool {
         let path = fallbackSecretsPath
         if secrets.isEmpty {
             try? FileManager.default.removeItem(atPath: path)
-            return
+            return true
         }
         let url = URL(fileURLWithPath: path)
         let parentDir = url.deletingLastPathComponent().path
-        try? FileManager.default.createDirectory(atPath: parentDir, withIntermediateDirectories: true)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parentDir)
-        if let data = try? JSONEncoder().encode(secrets) {
-            try? data.write(to: url, options: .atomic)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+        do {
+            try FileManager.default.createDirectory(atPath: parentDir, withIntermediateDirectories: true)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parentDir)
+            let data = try JSONEncoder().encode(secrets)
+            try data.write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+            return true
+        } catch {
+            return false
         }
     }
 }

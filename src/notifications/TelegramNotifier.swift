@@ -126,10 +126,17 @@ final class TelegramNotifier {
         task.resume()
     }
 
+    func escapeHTML(_ raw: String) -> String {
+        return raw
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+    }
+
     func formatReportHTML(snapshot: DiskHealthSnapshot, title: String) -> String {
-        let statusLine = "\(snapshot.overallSeverity.emoji) <b>\(title)</b>"
+        let statusLine = "\(snapshot.overallSeverity.emoji) <b>\(escapeHTML(title))</b>"
         let mountState = snapshot.isMounted
-            ? "✅ Mounted (<code>\(snapshot.mountPoint)</code>, \(snapshot.isReadOnly ? "⚠️ READ-ONLY" : "R/W"))"
+            ? "✅ Mounted (<code>\(escapeHTML(snapshot.mountPoint))</code>, \(snapshot.isReadOnly ? "⚠️ READ-ONLY" : "R/W"))"
             : "❌ <b>UNMOUNTED / OFFLINE</b>"
         let capacityLine = snapshot.isMounted
             ? String(format: "%@ used / %@ free (%.1f%% of %@)",
@@ -144,15 +151,15 @@ final class TelegramNotifier {
         let smartCounters = snapshot.smartValid
             ? "POH: \(snapshot.powerOnHours)h | Cycles: \(snapshot.powerCycles) | Unsafe: \(snapshot.unsafeShutdowns) | Media Err: \(snapshot.mediaErrors)"
             : "N/A"
-        let canaryStr = snapshot.canaryOk ? String(format: "✅ OK (%.2f ms)", snapshot.canaryLatencyMs) : "❌ FAILED (\(snapshot.canaryError))"
+        let canaryStr = snapshot.canaryOk ? String(format: "✅ OK (%.2f ms)", snapshot.canaryLatencyMs) : "❌ FAILED (\(escapeHTML(snapshot.canaryError)))"
 
         var lines: [String] = [
             statusLine,
             "━━━━━━━━━━━━━━━━━━━━",
             "• <b>Status:</b> \(snapshot.overallSeverity.rawValue) (Score: \(snapshot.healthScore)/100)",
-            "• <b>Device:</b> \(snapshot.vendorName) \(snapshot.productName) (<code>\(snapshot.bsdName.isEmpty ? "offline" : snapshot.bsdName)</code>)",
-            "• <b>Bus / Link:</b> \(snapshot.interconnectType) • \(snapshot.linkSpeedFormatted)",
-            "• <b>Serial:</b> <code>\(snapshot.serialNumber.isEmpty ? "N/A" : snapshot.serialNumber)</code>",
+            "• <b>Device:</b> \(escapeHTML(snapshot.vendorName)) \(escapeHTML(snapshot.productName)) (<code>\(escapeHTML(snapshot.bsdName.isEmpty ? "offline" : snapshot.bsdName))</code>)",
+            "• <b>Bus / Link:</b> \(escapeHTML(snapshot.interconnectType)) • \(escapeHTML(snapshot.linkSpeedFormatted))",
+            "• <b>Serial:</b> <code>\(escapeHTML(snapshot.serialNumber.isEmpty ? "N/A" : snapshot.serialNumber))</code>",
             "• <b>Volume:</b> \(mountState)",
             "• <b>Capacity:</b> \(capacityLine)",
             "• <b>Temperature:</b> \(smartTemp)",
@@ -161,14 +168,14 @@ final class TelegramNotifier {
             "• <b>SMART Counters:</b> \(smartCounters)",
             "• <b>Driver I/O Errors:</b> \(snapshot.errorsRead) R / \(snapshot.errorsWritten) W (Retries: \(snapshot.retriesRead) R / \(snapshot.retriesWritten) W)",
             "• <b>I/O Canary Probe:</b> \(canaryStr)",
-            "• <b>File System Check:</b> \(snapshot.lastVerifyResult)"
+            "• <b>File System Check:</b> \(escapeHTML(snapshot.lastVerifyResult))"
         ]
 
         if !snapshot.issues.isEmpty {
             lines.append("")
             lines.append("⚠️ <b>Active Health Findings:</b>")
             for issue in snapshot.issues {
-                lines.append("  \(issue.severity.emoji) <b>\(issue.title):</b> \(issue.detail)")
+                lines.append("  \(issue.severity.emoji) <b>\(escapeHTML(issue.title)):</b> \(escapeHTML(issue.detail))")
             }
         }
 

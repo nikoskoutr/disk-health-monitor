@@ -200,7 +200,9 @@ struct DashboardMenuView: View {
                 Divider()
                 HStack(spacing: 8) {
                     Button(action: {
-                        _ = monitor.evaluateHealth(forceCanary: true)
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            _ = monitor.evaluateHealth(forceCanary: true)
+                        }
                     }) {
                         Label("Check", systemImage: "arrow.clockwise")
                             .font(.system(size: 10))

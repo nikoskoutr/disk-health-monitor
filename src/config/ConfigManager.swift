@@ -20,6 +20,29 @@ struct DiskHealthConfig: Codable, Equatable {
     var enableNativeNotifications: Bool = true
     var telegramBotToken: String = ""
     var telegramChatId: String = ""
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = DiskHealthConfig()
+        targetVolumePath = try container.decodeIfPresent(String.self, forKey: .targetVolumePath) ?? defaults.targetVolumePath
+        targetDeviceQuery = try container.decodeIfPresent(String.self, forKey: .targetDeviceQuery) ?? defaults.targetDeviceQuery
+        requiredSubpaths = try container.decodeIfPresent([String].self, forKey: .requiredSubpaths) ?? defaults.requiredSubpaths
+        enableActiveCanary = try container.decodeIfPresent(Bool.self, forKey: .enableActiveCanary) ?? defaults.enableActiveCanary
+        pollIntervalSeconds = try container.decodeIfPresent(TimeInterval.self, forKey: .pollIntervalSeconds) ?? defaults.pollIntervalSeconds
+        alertCooldownSeconds = try container.decodeIfPresent(TimeInterval.self, forKey: .alertCooldownSeconds) ?? defaults.alertCooldownSeconds
+        tempWarningCelsius = try container.decodeIfPresent(Int.self, forKey: .tempWarningCelsius) ?? defaults.tempWarningCelsius
+        tempCriticalCelsius = try container.decodeIfPresent(Int.self, forKey: .tempCriticalCelsius) ?? defaults.tempCriticalCelsius
+        diskUsedWarningPercent = try container.decodeIfPresent(Double.self, forKey: .diskUsedWarningPercent) ?? defaults.diskUsedWarningPercent
+        diskUsedCriticalPercent = try container.decodeIfPresent(Double.self, forKey: .diskUsedCriticalPercent) ?? defaults.diskUsedCriticalPercent
+        minFreeSpaceCriticalGB = try container.decodeIfPresent(Double.self, forKey: .minFreeSpaceCriticalGB) ?? defaults.minFreeSpaceCriticalGB
+        minFreeSpaceWarningGB = try container.decodeIfPresent(Double.self, forKey: .minFreeSpaceWarningGB) ?? defaults.minFreeSpaceWarningGB
+        minExpectedUsbSpeedBps = try container.decodeIfPresent(UInt64.self, forKey: .minExpectedUsbSpeedBps) ?? defaults.minExpectedUsbSpeedBps
+        enableNativeNotifications = try container.decodeIfPresent(Bool.self, forKey: .enableNativeNotifications) ?? defaults.enableNativeNotifications
+        telegramBotToken = try container.decodeIfPresent(String.self, forKey: .telegramBotToken) ?? defaults.telegramBotToken
+        telegramChatId = try container.decodeIfPresent(String.self, forKey: .telegramChatId) ?? defaults.telegramChatId
+    }
 }
 
 final class ConfigManager: ObservableObject {
@@ -300,18 +323,59 @@ final class ConfigManager: ObservableObject {
         return "{}"
     }
 
-    func log(_ message: String) {
-        let line = "[\(isoTimestampFormatter.string(from: Date()))] \(message)\n"
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: logFilePath) {
-                if let handle = FileHandle(forWritingAtPath: logFilePath) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    try? handle.close()
-                }
-            } else {
-                try? data.write(to: URL(fileURLWithPath: logFilePath))
+    @discardableResult
+    func importConfig(from data: Data) -> Bool {
+        guard let imported = try? JSONDecoder().decode(DiskHealthConfig.self, from: data) else {
+            return false
+        }
+        updateConfig { cfg in
+            let existingToken = cfg.telegramBotToken
+            cfg = imported
+            if imported.telegramBotToken.isEmpty || imported.telegramBotToken.contains("Protected") || imported.telegramBotToken == "REDACTED_IN_KEYCHAIN" {
+                cfg.telegramBotToken = existingToken
             }
+        }
+        return true
+    }
+
+    @discardableResult
+    func importConfigFile(at url: URL) -> Bool {
+        guard let data = try? Data(contentsOf: url) else { return false }
+        return importConfig(from: data)
+    }
+
+    private let logLock = NSLock()
+    private let maxLogFileBytes: UInt64 = 5 * 1024 * 1024 // 5 MB
+
+    func log(_ message: String) {
+        logLock.lock()
+        defer { logLock.unlock() }
+
+        let line = "[\(isoTimestampFormatter.string(from: Date()))] \(message)\n"
+        guard let data = line.data(using: .utf8) else { return }
+
+        let fm = FileManager.default
+        let parentDir = (logFilePath as NSString).deletingLastPathComponent
+        if !fm.fileExists(atPath: parentDir) {
+            try? fm.createDirectory(atPath: parentDir, withIntermediateDirectories: true)
+        }
+
+        if fm.fileExists(atPath: logFilePath) {
+            if let attrs = try? fm.attributesOfItem(atPath: logFilePath),
+               let fileSize = attrs[.size] as? UInt64,
+               fileSize > maxLogFileBytes {
+                let rotatedPath = "\(logFilePath).1"
+                try? fm.removeItem(atPath: rotatedPath)
+                try? fm.moveItem(atPath: logFilePath, toPath: rotatedPath)
+            }
+        }
+
+        if fm.fileExists(atPath: logFilePath), let handle = FileHandle(forWritingAtPath: logFilePath) {
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+            try? handle.close()
+        } else {
+            try? data.write(to: URL(fileURLWithPath: logFilePath), options: .atomic)
         }
     }
 }

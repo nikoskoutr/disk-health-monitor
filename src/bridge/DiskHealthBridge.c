@@ -38,9 +38,15 @@ static uint64_t getCFNumberU64(CFDictionaryRef dict, CFStringRef key) {
 // Safely decode 128-bit little-endian NVMe counter to 64-bit unsigned integer
 static uint64_t nvmeLe128ToU64(const void *ptr) {
     if (!ptr) return 0;
-    uint64_t val = 0;
-    memcpy(&val, ptr, sizeof(uint64_t));
-    return CFSwapInt64LittleToHost(val);
+    const uint8_t *bytes = (const uint8_t *)ptr;
+    uint64_t low = 0;
+    uint64_t high = 0;
+    memcpy(&low, bytes, sizeof(uint64_t));
+    memcpy(&high, bytes + sizeof(uint64_t), sizeof(uint64_t));
+    if (CFSwapInt64LittleToHost(high) != 0) {
+        return UINT64_MAX;
+    }
+    return CFSwapInt64LittleToHost(low);
 }
 
 // Inspect parent chain for USB / Thunderbolt / Interconnect properties
@@ -83,7 +89,7 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
             if (serialRef) {
                 if (CFGetTypeID(serialRef) == CFStringGetTypeID()) {
                     CFStringGetCString((CFStringRef)serialRef, outMetrics->serialNumber, sizeof(outMetrics->serialNumber), kCFStringEncodingUTF8);
-                    strncpy(outMetrics->usbSerialNumber, outMetrics->serialNumber, sizeof(outMetrics->usbSerialNumber) - 1);
+                    strlcpy(outMetrics->usbSerialNumber, outMetrics->serialNumber, sizeof(outMetrics->usbSerialNumber));
                 }
                 CFRelease(serialRef);
             }
@@ -94,11 +100,11 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
         if (IOObjectGetClass(parent, className) == KERN_SUCCESS) {
             if (outMetrics->interconnectType[0] == '\0') {
                 if (strstr(className, "USB") != NULL) {
-                    strncpy(outMetrics->interconnectType, "USB", sizeof(outMetrics->interconnectType) - 1);
+                    strlcpy(outMetrics->interconnectType, "USB", sizeof(outMetrics->interconnectType));
                 } else if (strstr(className, "Thunderbolt") != NULL) {
-                    strncpy(outMetrics->interconnectType, "Thunderbolt", sizeof(outMetrics->interconnectType) - 1);
+                    strlcpy(outMetrics->interconnectType, "Thunderbolt", sizeof(outMetrics->interconnectType));
                 } else if (strstr(className, "PCI") != NULL || strstr(className, "NVMe") != NULL) {
-                    strncpy(outMetrics->interconnectType, "PCI-Express", sizeof(outMetrics->interconnectType) - 1);
+                    strlcpy(outMetrics->interconnectType, "PCI-Express", sizeof(outMetrics->interconnectType));
                 }
             }
         }
@@ -124,20 +130,23 @@ static void inspectChildrenForDriverStats(io_registry_entry_t service, DiskHardw
     while ((child = IOIteratorNext(childIter)) != 0) {
         // Look for Driver Statistics dictionary
         if (!outMetrics->statsValid) {
-            CFDictionaryRef stats = IORegistryEntryCreateCFProperty(child, CFSTR("Statistics"), kCFAllocatorDefault, 0);
-            if (stats && CFGetTypeID(stats) == CFDictionaryGetTypeID()) {
-                outMetrics->statsValid = true;
-                outMetrics->bytesRead = getCFNumberU64(stats, CFSTR("Bytes (Read)"));
-                outMetrics->bytesWritten = getCFNumberU64(stats, CFSTR("Bytes (Write)"));
-                outMetrics->operationsRead = getCFNumberU64(stats, CFSTR("Operations (Read)"));
-                outMetrics->operationsWritten = getCFNumberU64(stats, CFSTR("Operations (Write)"));
-                outMetrics->errorsRead = getCFNumberU64(stats, CFSTR("Errors (Read)"));
-                outMetrics->errorsWritten = getCFNumberU64(stats, CFSTR("Errors (Write)"));
-                outMetrics->retriesRead = getCFNumberU64(stats, CFSTR("Retries (Read)"));
-                outMetrics->retriesWritten = getCFNumberU64(stats, CFSTR("Retries (Write)"));
-                outMetrics->totalTimeReadNs = getCFNumberU64(stats, CFSTR("Total Time (Read)"));
-                outMetrics->totalTimeWriteNs = getCFNumberU64(stats, CFSTR("Total Time (Write)"));
-                CFRelease(stats);
+            CFTypeRef statsRef = IORegistryEntryCreateCFProperty(child, CFSTR("Statistics"), kCFAllocatorDefault, 0);
+            if (statsRef) {
+                if (CFGetTypeID(statsRef) == CFDictionaryGetTypeID()) {
+                    CFDictionaryRef stats = (CFDictionaryRef)statsRef;
+                    outMetrics->statsValid = true;
+                    outMetrics->bytesRead = getCFNumberU64(stats, CFSTR("Bytes (Read)"));
+                    outMetrics->bytesWritten = getCFNumberU64(stats, CFSTR("Bytes (Write)"));
+                    outMetrics->operationsRead = getCFNumberU64(stats, CFSTR("Operations (Read)"));
+                    outMetrics->operationsWritten = getCFNumberU64(stats, CFSTR("Operations (Write)"));
+                    outMetrics->errorsRead = getCFNumberU64(stats, CFSTR("Errors (Read)"));
+                    outMetrics->errorsWritten = getCFNumberU64(stats, CFSTR("Errors (Write)"));
+                    outMetrics->retriesRead = getCFNumberU64(stats, CFSTR("Retries (Read)"));
+                    outMetrics->retriesWritten = getCFNumberU64(stats, CFSTR("Retries (Write)"));
+                    outMetrics->totalTimeReadNs = getCFNumberU64(stats, CFSTR("Total Time (Read)"));
+                    outMetrics->totalTimeWriteNs = getCFNumberU64(stats, CFSTR("Total Time (Write)"));
+                }
+                CFRelease(statsRef);
             }
         }
 
@@ -175,36 +184,42 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
     outMetrics->found = true;
 
     // 1. Device Characteristics
-    CFDictionaryRef chars = IORegistryEntryCreateCFProperty(service, CFSTR("Device Characteristics"), kCFAllocatorDefault, 0);
-    if (chars && CFGetTypeID(chars) == CFDictionaryGetTypeID()) {
-        getCFString(chars, CFSTR("Product Name"), outMetrics->productName, sizeof(outMetrics->productName));
-        getCFString(chars, CFSTR("Vendor Name"), outMetrics->vendorName, sizeof(outMetrics->vendorName));
-        getCFString(chars, CFSTR("Product Revision Level"), outMetrics->productRevision, sizeof(outMetrics->productRevision));
-        getCFString(chars, CFSTR("Serial Number"), outMetrics->serialNumber, sizeof(outMetrics->serialNumber));
-        strncpy(outMetrics->usbSerialNumber, outMetrics->serialNumber, sizeof(outMetrics->usbSerialNumber) - 1);
+    CFTypeRef charsRef = IORegistryEntryCreateCFProperty(service, CFSTR("Device Characteristics"), kCFAllocatorDefault, 0);
+    if (charsRef) {
+        if (CFGetTypeID(charsRef) == CFDictionaryGetTypeID()) {
+            CFDictionaryRef chars = (CFDictionaryRef)charsRef;
+            getCFString(chars, CFSTR("Product Name"), outMetrics->productName, sizeof(outMetrics->productName));
+            getCFString(chars, CFSTR("Vendor Name"), outMetrics->vendorName, sizeof(outMetrics->vendorName));
+            getCFString(chars, CFSTR("Product Revision Level"), outMetrics->productRevision, sizeof(outMetrics->productRevision));
+            getCFString(chars, CFSTR("Serial Number"), outMetrics->serialNumber, sizeof(outMetrics->serialNumber));
+            strlcpy(outMetrics->usbSerialNumber, outMetrics->serialNumber, sizeof(outMetrics->usbSerialNumber));
 
-        char removableStr[32] = {0};
-        if (getCFString(chars, CFSTR("Removable Media"), removableStr, sizeof(removableStr))) {
-            if (strcasecmp(removableStr, "Yes") == 0 || strcasecmp(removableStr, "True") == 0) {
-                outMetrics->isRemovable = true;
+            char removableStr[32] = {0};
+            if (getCFString(chars, CFSTR("Removable Media"), removableStr, sizeof(removableStr))) {
+                if (strcasecmp(removableStr, "Yes") == 0 || strcasecmp(removableStr, "True") == 0) {
+                    outMetrics->isRemovable = true;
+                }
             }
         }
-        CFRelease(chars);
+        CFRelease(charsRef);
     }
 
     // 2. Protocol Characteristics
-    CFDictionaryRef proto = IORegistryEntryCreateCFProperty(service, CFSTR("Protocol Characteristics"), kCFAllocatorDefault, 0);
-    if (proto && CFGetTypeID(proto) == CFDictionaryGetTypeID()) {
-        getCFString(proto, CFSTR("Physical Interconnect"), outMetrics->interconnectType, sizeof(outMetrics->interconnectType));
-        char location[64] = {0};
-        if (getCFString(proto, CFSTR("Physical Interconnect Location"), location, sizeof(location))) {
-            if (strcasecmp(location, "Internal") == 0) {
-                outMetrics->isInternal = true;
-            } else if (strcasecmp(location, "External") == 0) {
-                outMetrics->isInternal = false;
+    CFTypeRef protoRef = IORegistryEntryCreateCFProperty(service, CFSTR("Protocol Characteristics"), kCFAllocatorDefault, 0);
+    if (protoRef) {
+        if (CFGetTypeID(protoRef) == CFDictionaryGetTypeID()) {
+            CFDictionaryRef proto = (CFDictionaryRef)protoRef;
+            getCFString(proto, CFSTR("Physical Interconnect"), outMetrics->interconnectType, sizeof(outMetrics->interconnectType));
+            char location[64] = {0};
+            if (getCFString(proto, CFSTR("Physical Interconnect Location"), location, sizeof(location))) {
+                if (strcasecmp(location, "Internal") == 0) {
+                    outMetrics->isInternal = true;
+                } else if (strcasecmp(location, "External") == 0) {
+                    outMetrics->isInternal = false;
+                }
             }
         }
-        CFRelease(proto);
+        CFRelease(protoRef);
     }
 
     // Class name check for internal NVMe / Apple fabric / VirtIO VM disks
@@ -215,7 +230,7 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
             strstr(deviceClassName, "VirtIO") != NULL) {
             outMetrics->isInternal = true;
             if (outMetrics->interconnectType[0] == '\0') {
-                strncpy(outMetrics->interconnectType, "PCI-Express", sizeof(outMetrics->interconnectType) - 1);
+                strlcpy(outMetrics->interconnectType, "PCI-Express", sizeof(outMetrics->interconnectType));
             }
         }
     }
@@ -229,11 +244,11 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
     // If interconnectType is still unset, default based on known clues
     if (outMetrics->interconnectType[0] == '\0') {
         if (outMetrics->linkSpeedBps > 0) {
-            strncpy(outMetrics->interconnectType, "USB", sizeof(outMetrics->interconnectType) - 1);
+            strlcpy(outMetrics->interconnectType, "USB", sizeof(outMetrics->interconnectType));
         } else if (outMetrics->isInternal) {
-            strncpy(outMetrics->interconnectType, "PCI-Express", sizeof(outMetrics->interconnectType) - 1);
+            strlcpy(outMetrics->interconnectType, "PCI-Express", sizeof(outMetrics->interconnectType));
         } else {
-            strncpy(outMetrics->interconnectType, "Storage", sizeof(outMetrics->interconnectType) - 1);
+            strlcpy(outMetrics->interconnectType, "Storage", sizeof(outMetrics->interconnectType));
         }
     }
 
@@ -261,7 +276,7 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
     );
 
     if (kr == kIOReturnSuccess && plugin) {
-        strncpy(outMetrics->protocolType, "NVMe", sizeof(outMetrics->protocolType) - 1);
+        strlcpy(outMetrics->protocolType, "NVMe", sizeof(outMetrics->protocolType));
         IONVMeSMARTInterface **smart = NULL;
         HRESULT hr = (*plugin)->QueryInterface(
             plugin,
@@ -305,7 +320,7 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
         IODestroyPlugInInterface(plugin);
     } else {
         if (outMetrics->protocolType[0] == '\0') {
-            strncpy(outMetrics->protocolType, "SCSI/Block", sizeof(outMetrics->protocolType) - 1);
+            strlcpy(outMetrics->protocolType, "SCSI/Block", sizeof(outMetrics->protocolType));
         }
     }
 }
@@ -512,10 +527,11 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
     int numMounts = getfsstat(NULL, 0, MNT_NOWAIT);
     if (numMounts <= 0) return false;
 
-    struct statfs *fsList = malloc(sizeof(struct statfs) * numMounts);
+    int allocMounts = numMounts + 4;
+    struct statfs *fsList = calloc((size_t)allocMounts, sizeof(struct statfs));
     if (!fsList) return false;
 
-    int count = getfsstat(fsList, (int)(sizeof(struct statfs) * numMounts), MNT_NOWAIT);
+    int count = getfsstat(fsList, (int)(sizeof(struct statfs) * allocMounts), MNT_NOWAIT);
     bool found = false;
     int bestScore = -1;
 
@@ -553,8 +569,7 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
 
                 if (score > bestScore) {
                     bestScore = score;
-                    strncpy(outMountPoint, mountPath, maxLen - 1);
-                    outMountPoint[maxLen - 1] = '\0';
+                    strlcpy(outMountPoint, mountPath, maxLen);
                     found = true;
                     if (score == 4) {
                         // Root volume is found

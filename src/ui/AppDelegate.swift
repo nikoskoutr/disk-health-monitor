@@ -1,12 +1,15 @@
 import AppKit
 import SwiftUI
 import Darwin
+import Combine
 
 // MARK: - AppKit Menu Bar Controller & Dynamic Drive Selection
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var pollTimer: Timer?
+    private var currentPollInterval: TimeInterval = 30.0
+    private var configCancellable: AnyCancellable?
     private var dailyDigestItem: NSMenuItem!
     private var selectDiskMenu: NSMenu!
     private var selectDiskMenuItem: NSMenuItem!
@@ -40,14 +43,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Initial check
         refreshHealth(forceCanary: true)
 
-        // Timer polling
-        let interval = ConfigManager.shared.config.pollIntervalSeconds
-        pollTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            self?.refreshHealth(forceCanary: false)
-        }
-        RunLoop.main.add(pollTimer!, forMode: .common)
+        // Dynamic timer polling
+        schedulePollingTimer(interval: ConfigManager.shared.config.pollIntervalSeconds)
+
+        configCancellable = ConfigManager.shared.$config
+            .map(\.pollIntervalSeconds)
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] newInterval in
+                self?.schedulePollingTimer(interval: newInterval)
+            }
 
         ConfigManager.shared.log("Disk Health Monitor Menu Bar App launched.")
+    }
+
+    private func schedulePollingTimer(interval: TimeInterval) {
+        let safeInterval = max(5.0, interval)
+        pollTimer?.invalidate()
+        currentPollInterval = safeInterval
+        let timer = Timer.scheduledTimer(withTimeInterval: safeInterval, repeats: true) { [weak self] _ in
+            self?.refreshHealth(forceCanary: false)
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        pollTimer = timer
     }
 
     private func setupMainMenuForShortcuts() {
@@ -200,21 +218,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let numMounts = getfsstat(nil, 0, MNT_NOWAIT)
         if numMounts > 0 {
-            var fsList = Array<Darwin.statfs>(repeating: Darwin.statfs(), count: Int(numMounts))
-            let mCount = getfsstat(&fsList, Int32(MemoryLayout<Darwin.statfs>.size * Int(numMounts)), MNT_NOWAIT)
-            for i in 0..<Int(mCount) {
-                let volPath = cStringToSwift(fsList[i].f_mntonname)
-                let flags = UInt32(fsList[i].f_flags)
-                let isLocal = (flags & UInt32(MNT_LOCAL)) != 0
-                if isLocal && (volPath.hasPrefix("/Volumes/") || volPath == "/") {
-                    let displayName = volPath == "/" ? "Macintosh HD (/)" : (volPath as NSString).lastPathComponent
-                    let item = NSMenuItem(title: "  📂 \(displayName)", action: #selector(selectDiskTarget(_:)), keyEquivalent: "")
-                    item.target = self
-                    item.representedObject = volPath
-                    if ConfigManager.shared.config.targetVolumePath == volPath || currentMount == volPath {
-                        item.state = .on
+            let allocCount = Int(numMounts) + 4
+            var fsList = Array<Darwin.statfs>(repeating: Darwin.statfs(), count: allocCount)
+            let mCount = getfsstat(&fsList, Int32(MemoryLayout<Darwin.statfs>.size * allocCount), MNT_NOWAIT)
+            if mCount > 0 {
+                for i in 0..<min(Int(mCount), allocCount) {
+                    let volPath = cStringToSwift(fsList[i].f_mntonname)
+                    let flags = UInt32(fsList[i].f_flags)
+                    let isLocal = (flags & UInt32(MNT_LOCAL)) != 0
+                    if isLocal && (volPath.hasPrefix("/Volumes/") || volPath == "/") {
+                        let displayName = volPath == "/" ? "Macintosh HD (/)" : (volPath as NSString).lastPathComponent
+                        let item = NSMenuItem(title: "  📂 \(displayName)", action: #selector(selectDiskTarget(_:)), keyEquivalent: "")
+                        item.target = self
+                        item.representedObject = volPath
+                        if ConfigManager.shared.config.targetVolumePath == volPath || currentMount == volPath {
+                            item.state = .on
+                        }
+                        selectDiskMenu.addItem(item)
                     }
-                    selectDiskMenu.addItem(item)
                 }
             }
         }

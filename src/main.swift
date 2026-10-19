@@ -11,12 +11,17 @@ func printUsage() {
 
     Commands & Modes:
       --status              Print human-readable disk health summary and active issues
+      --check               Run a single background check cycle and send alerts
+      --watch-mounts        Run a check triggered by a mount event
+      --deep                Include filesystem verification (diskutil verifyVolume)
       --list-disks          List all detected block storage devices, buses, and SMART status
       --json                Dump current telemetry snapshot as pretty-printed JSON
       --export-config       Export current configuration as sanitized JSON (--unmasked for secrets)
+      --import-config <file> Import and apply configuration profile from a JSON file
       --export-diagnostics  Generate comprehensive JSON diagnostic report in logs/ (or [path])
       --verify              Run volume filesystem verification (diskutil verifyVolume)
       --send-report         Dispatch on-demand HTML health report to Telegram
+      --menubar             Launch the macOS Menu Bar status item application (default)
       --help, -h            Show this help manual
 
     Target Overrides:
@@ -53,6 +58,28 @@ func parseCommandLine() {
         let json = ConfigManager.shared.exportSanitizedConfigJSON(includeSecrets: unmasked)
         print(json)
         exit(0)
+    }
+
+    if args.contains("--import-config") {
+        var inPath: String? = nil
+        for i in 0..<args.count {
+            if args[i] == "--import-config" && i + 1 < args.count && !args[i + 1].hasPrefix("-") {
+                inPath = args[i + 1]
+                break
+            }
+        }
+        guard let path = inPath else {
+            fputs("Error: --import-config requires a path to a configuration JSON file.\n", stderr)
+            exit(1)
+        }
+        let url = URL(fileURLWithPath: (path as NSString).standardizingPath)
+        if ConfigManager.shared.importConfigFile(at: url) {
+            print("Configuration imported successfully from: \(url.path)")
+            exit(0)
+        } else {
+            fputs("Error: Failed to import configuration from \(url.path)\n", stderr)
+            exit(1)
+        }
     }
 
     if args.contains("--export-diagnostics") {
@@ -116,8 +143,16 @@ func parseCommandLine() {
         exit(Int32(snap.overallSeverity.rank))
     }
 
-    if args.contains("--cli") || args.contains("--status") {
-        let notify = args.contains("--notify") || args.contains("--notify-if-unhealthy")
+    let isCheckMode = args.contains("--cli") || args.contains("--status") || args.contains("--check") || args.contains("--watch-mounts") || args.contains("--deep")
+    if isCheckMode {
+        let notify = args.contains("--notify") || args.contains("--notify-if-unhealthy") || args.contains("--check") || args.contains("--watch-mounts")
+        if args.contains("--deep") {
+            let sem = DispatchSemaphore(value: 0)
+            DiskHealthMonitor.shared.runVolumeVerification(sendTelegram: notify) { _, _ in
+                sem.signal()
+            }
+            sem.wait()
+        }
         let snap = DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: notify)
 
         print("============================================================")
