@@ -77,7 +77,7 @@ disk-health-monitor/
 | [`scripts/`](scripts/README.md) | [scripts/README.md](scripts/README.md) | CoreGraphics vector icon generator script |
 | [`assets/`](assets/README.md) | [assets/README.md](assets/README.md) | Generated application icons (`AppIcon.png`, `AppIcon.icns`) and UI screenshots |
 | [`logs/`](logs/README.md) | [logs/README.md](logs/README.md) | Runtime log files, latest telemetry JSON, and delta state persistence |
-| [`.github/`](.github/README.md) | [.github/README.md](.github/README.md) | GitHub Actions CI test pipeline and automated Universal macOS Release packager |
+| [`.github/workflows/`](.github/workflows/ci-release.yml) | [ci-release.yml](.github/workflows/ci-release.yml) | GitHub Actions CI test pipeline and automated Universal macOS Release packager |
 
 ---
 
