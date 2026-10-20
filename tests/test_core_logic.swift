@@ -55,6 +55,27 @@ struct CoreLogicTestRunner {
         assertTrue(decodedState?.monitoredTarget == "/Volumes/TestDrive", "Decoded monitoredTarget must match")
         assertTrue(decodedState?.getDriveState(key: "SERIAL123").peakTemperatureCelsius == 49, "Decoded peak temp must be 49")
         assertTrue(decodedState?.getDriveState(key: "SERIAL123").baselineUnsafeShutdowns == 4, "Decoded baseline unsafe shutdowns must be 4")
+
+        // Verify backwards compatibility with legacy state JSON missing lastOverallSeverity
+        let legacyJson = """
+        {
+            "monitoredTarget": "/Volumes/LegacyDrive",
+            "drives": {
+                "LEGACY_DRIVE_1": {
+                    "bsdName": "disk5",
+                    "peakTemperatureCelsius": 42
+                }
+            }
+        }
+        """.data(using: .utf8)!
+        let decodedLegacy = try? JSONDecoder().decode(DiskPersistentState.self, from: legacyJson)
+        assertTrue(decodedLegacy != nil, "DiskPersistentState must decode legacy state JSON missing lastOverallSeverity")
+        let legacyDrive = decodedLegacy?.getDriveState(key: "LEGACY_DRIVE_1")
+        assertTrue(legacyDrive?.bsdName == "disk5", "Legacy drive bsdName must match")
+        assertTrue(legacyDrive?.peakTemperatureCelsius == 42, "Legacy drive peak temp must match")
+        assertTrue(legacyDrive?.lastOverallSeverity == HealthSeverity.healthy.rawValue, "Legacy drive lastOverallSeverity must default to healthy")
+        assertTrue(legacyDrive?.lastVerifyResult == "Not run yet", "Legacy drive lastVerifyResult must default")
+        assertTrue(legacyDrive?.lastVerifyOk == true, "Legacy drive lastVerifyOk must default to true")
         print("  [OK] Models & Codable serialization verified")
 
         print("=== Swift Unit Test 3: ConfigManager Sanitization, Redaction & 0600 Permissions ===")
@@ -866,7 +887,7 @@ struct CoreLogicTestRunner {
 
         // Verify POSIX flock single-instance lock mechanics, PID writing, and 0600 permissions
         let testLockPath = "\(NSTemporaryDirectory())test_menubar_\(UUID().uuidString).lock"
-        let fd1 = open(testLockPath, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        let fd1 = open(testLockPath, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
         assertTrue(fd1 >= 0, "First open on lockfile must succeed")
         fchmod(fd1, 0o600)
         assertTrue(flock(fd1, LOCK_EX | LOCK_NB) == 0, "First non-blocking exclusive flock must succeed")
@@ -891,7 +912,7 @@ struct CoreLogicTestRunner {
             assertTrue(perms.intValue == 0o600, "Lockfile must enforce 0600 permissions, got \(String(perms.intValue, radix: 8))")
         }
 
-        let fd2 = open(testLockPath, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        let fd2 = open(testLockPath, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
         assertTrue(fd2 >= 0, "Second open on lockfile must succeed")
         assertTrue(flock(fd2, LOCK_EX | LOCK_NB) != 0 && errno == EWOULDBLOCK, "Second concurrent flock must fail with EWOULDBLOCK")
 
@@ -901,6 +922,20 @@ struct CoreLogicTestRunner {
         flock(fd2, LOCK_UN)
         close(fd2)
         try? FileManager.default.removeItem(atPath: testLockPath)
+
+        // Verify O_NOFOLLOW symlink rejection and target protection (IMPROVE-V8-02)
+        let symTarget = "\(NSTemporaryDirectory())test_target_\(UUID().uuidString).txt"
+        let symLock = "\(NSTemporaryDirectory())test_symlink_\(UUID().uuidString).lock"
+        try? "PROTECTED_TARGET_CONTENT".write(toFile: symTarget, atomically: true, encoding: .utf8)
+        try? FileManager.default.createSymbolicLink(atPath: symLock, withDestinationPath: symTarget)
+
+        let symFd = open(symLock, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        assertTrue(symFd < 0, "open() with O_NOFOLLOW on a symlink must fail")
+        let targetContent = try? String(contentsOfFile: symTarget, encoding: .utf8)
+        assertTrue(targetContent == "PROTECTED_TARGET_CONTENT", "Symlink target contents must remain intact and not truncated")
+
+        try? FileManager.default.removeItem(atPath: symLock)
+        try? FileManager.default.removeItem(atPath: symTarget)
         print("  [OK] LaunchAgent plist structure, --menubar argument, and XML serialization verified")
 
         print("=== Swift Unit Test 28: Per-Drive Cooldown Scoping, AppleScript Escaping & Enriched Diagnostics (IMPROVE-V5-01 to V5-07) ===")
@@ -1031,6 +1066,65 @@ struct CoreLogicTestRunner {
 
         monitor.resetBaselines()
         print("  [OK] Per-drive cooldown scoping, AppleScript escaping, enriched diagnostics & multi-drive isolation verified")
+
+        print("=== Swift Unit Test 29: Per-Drive lastOverallSeverity Tracking & Cross-Target Recovery (IMPROVE-V8-01 & IMPROVE-V8-04) ===")
+        // 29a. Verify DriveBaselineState default initialization
+        let baseDrive = DriveBaselineState()
+        assertTrue(baseDrive.lastOverallSeverity == HealthSeverity.healthy.rawValue, "DriveBaselineState must default lastOverallSeverity to healthy")
+
+        // 29b. Verify persistent state per-drive lastOverallSeverity retention across target switches
+        var multiState = DiskPersistentState()
+        multiState.updateDriveState(key: "DRIVE_ALPHA") { d in
+            d.bsdName = "disk1"
+            d.lastOverallSeverity = HealthSeverity.warning.rawValue
+        }
+        multiState.updateDriveState(key: "DRIVE_BETA") { d in
+            d.bsdName = "disk2"
+            d.lastOverallSeverity = HealthSeverity.healthy.rawValue
+        }
+        assertTrue(multiState.drives["DRIVE_ALPHA"]?.lastOverallSeverity == HealthSeverity.warning.rawValue, "Drive ALPHA must retain warning severity")
+        assertTrue(multiState.drives["DRIVE_BETA"]?.lastOverallSeverity == HealthSeverity.healthy.rawValue, "Drive BETA must retain healthy severity")
+
+        // 29c. Verify target switch does NOT wipe out per-drive lastOverallSeverity in DiskHealthMonitor
+        monitor.resetBaselines()
+        monitor.mutateStateForTesting { st in
+            st.updateDriveState(key: "DRIVE_TEST_A") { d in
+                d.bsdName = "disk8"
+                d.lastOverallSeverity = HealthSeverity.warning.rawValue
+            }
+        }
+        // Switch monitored target to DRIVE_TEST_B
+        monitor.setMonitoredTarget(volumePath: "/Volumes/TestDriveB", deviceQuery: nil)
+        assertTrue(monitor.persistentState.drives["DRIVE_TEST_A"]?.lastOverallSeverity == HealthSeverity.warning.rawValue, "Drive A lastOverallSeverity must be preserved in drives dictionary when switching targets")
+
+        // 29d. Verify resetBaselines() resets lastOverallSeverity to healthy across all recorded drives
+        monitor.resetBaselines()
+        let resetDrives = monitor.persistentState.drives
+        assertTrue(!resetDrives.isEmpty, "resetDrives must not be empty after resetBaselines()")
+        assertTrue(resetDrives["DRIVE_TEST_A"]?.lastOverallSeverity == HealthSeverity.healthy.rawValue, "DRIVE_TEST_A lastOverallSeverity must be reset to healthy")
+        for (_, d) in resetDrives {
+            assertTrue(d.lastOverallSeverity == HealthSeverity.healthy.rawValue, "resetBaselines must reset per-drive lastOverallSeverity to healthy")
+        }
+
+        // 29e. Verify resetBaselines() when currentSnapshot is nil preserves monitoredTarget and dailySummaryEnabled
+        monitor.clearCurrentSnapshotForTesting()
+        monitor.dailySummaryEnabled = false
+        monitor.setMonitoredTarget(volumePath: "/Volumes/CustomDrive", deviceQuery: nil)
+        monitor.mutateStateForTesting { st in
+            st.updateDriveState(key: "STANDALONE_DRIVE") { d in
+                d.lastOverallSeverity = HealthSeverity.critical.rawValue
+            }
+        }
+        monitor.resetBaselines()
+        assertTrue(monitor.persistentState.monitoredTarget == "/Volumes/CustomDrive", "resetBaselines without snapshot must preserve monitoredTarget")
+        assertTrue(monitor.persistentState.dailySummaryEnabled == false, "resetBaselines without snapshot must preserve dailySummaryEnabled")
+        assertTrue(monitor.persistentState.lastOverallSeverity == HealthSeverity.healthy.rawValue, "resetBaselines without snapshot must reset lastOverallSeverity")
+        assertTrue(monitor.persistentState.drives["STANDALONE_DRIVE"]?.lastOverallSeverity == HealthSeverity.healthy.rawValue, "resetBaselines without snapshot must reset STANDALONE_DRIVE lastOverallSeverity")
+
+        // 29f. Verify SettingsViewModel.isUpdatingLaunchAgent busy flag
+        let testVM = SettingsViewModel()
+        assertTrue(testVM.isUpdatingLaunchAgent == false, "isUpdatingLaunchAgent must initialize to false")
+        print("  [OK] Per-drive lastOverallSeverity tracking and cross-target recovery verified")
 
         print("✅ All Swift Core Logic Unit Tests Passed!")
     }

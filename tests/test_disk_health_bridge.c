@@ -308,6 +308,34 @@ int main(void) {
     CFRelease(testDict);
     printf("  DiskExtractCFNumberU64 negative clamping, double fallback, and boundary safety verified\n");
 
+    printf("\n=== Test 14: SATA / AHCI Bus Detection & Link Speed Space Parsing (IMPROVE-V8-06) ===\n");
+    // Verify SATA 6Gbps raw link speed normalization pass-through
+    assert(DiskNormalizeLinkSpeedToBps(6000000000ULL) == 6000000000ULL);
+    assert(DiskNormalizeLinkSpeedToBps(3000000000ULL) == 3000000000ULL);
+    assert(DiskNormalizeLinkSpeedToBps(1500000000ULL) == 1500000000ULL);
+
+    // Verify CFDictionary extraction with space-separated "Link Speed"
+    CFMutableDictionaryRef linkDict = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    int64_t sataSpeed = 6000000000LL;
+    CFNumberRef sataNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &sataSpeed);
+    CFDictionarySetValue(linkDict, CFSTR("Link Speed"), sataNum);
+    assert(DiskExtractCFNumberU64(linkDict, CFSTR("Link Speed")) == 6000000000ULL);
+    CFRelease(sataNum);
+    CFRelease(linkDict);
+
+    // Verify all enumerated block devices have known valid interconnects
+    for (int i = 0; i < count; i++) {
+        bool validBus = (strcmp(devices[i].interconnectType, "PCI-Express") == 0 ||
+                         strcmp(devices[i].interconnectType, "USB") == 0 ||
+                         strcmp(devices[i].interconnectType, "Thunderbolt") == 0 ||
+                         strcmp(devices[i].interconnectType, "SATA") == 0 ||
+                         strcmp(devices[i].interconnectType, "Apple Fabric") == 0 ||
+                         strcmp(devices[i].interconnectType, "Storage") == 0 ||
+                         strstr(devices[i].interconnectType, "Virtual") != NULL);
+        assert(validBus);
+    }
+    printf("  SATA link speeds, space-separated 'Link Speed' key, and bus type validation verified\n");
+
     printf("\n=== All Bridge Tests Passed Successfully! ===\n");
     return 0;
 }

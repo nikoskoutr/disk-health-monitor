@@ -163,6 +163,20 @@ else
     exit 1
 fi
 
+# Verify SingleInstanceLock O_NOFOLLOW symlink rejection in live binary (IMPROVE-V8-02)
+SYMLINK_TARGET="${TEST_SANDBOX_DIR}/symlink_target.txt"
+SYMLINK_LOCK="${DISK_HEALTH_CONFIG_DIR}/menubar.lock"
+echo "CRITICAL_SYSTEM_DATA" > "${SYMLINK_TARGET}"
+ln -sf "${SYMLINK_TARGET}" "${SYMLINK_LOCK}"
+"${ROOT_DIR}/disk-health" --menubar > /dev/null 2>&1 || true
+if [[ "$(cat "${SYMLINK_TARGET}")" == "CRITICAL_SYSTEM_DATA" ]]; then
+    echo "  [OK] SingleInstanceLock O_NOFOLLOW symlink protection verified"
+else
+    echo "  [FAIL] SingleInstanceLock compromised symlink target!"
+    exit 1
+fi
+rm -f "${SYMLINK_LOCK}" "${SYMLINK_TARGET}"
+
 # 4. Test Export & Import Configuration & Diagnostics
 echo "--- [4/5] Testing Config & Diagnostic Exporters ---"
 TEST_IMPORT_PATH="${TEST_SANDBOX_DIR}/config/import_test.json"

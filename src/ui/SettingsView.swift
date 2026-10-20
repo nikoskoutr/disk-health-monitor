@@ -9,6 +9,7 @@ final class SettingsViewModel: ObservableObject {
     @Published var selectedTab: Int = 0
     @Published var availableDisks: [(id: String, name: String)] = []
     @Published var launchAgentInstalled: Bool = false
+    @Published var isUpdatingLaunchAgent: Bool = false
     @Published var botToken: String = ""
     @Published var showToken: Bool = false
     @Published var isTestingTelegram: Bool = false
@@ -30,6 +31,8 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func toggleLaunchAgent() {
+        guard !isUpdatingLaunchAgent else { return }
+        isUpdatingLaunchAgent = true
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let bundleId = Bundle.main.bundleIdentifier ?? "io.github.disk-health-monitor"
         let agentsDir = "\(home)/Library/LaunchAgents"
@@ -42,7 +45,16 @@ final class SettingsViewModel: ObservableObject {
             // Temporarily ignore SIGTERM so `launchctl bootout` does not kill the currently
             // running GUI process if this instance was originally spawned by launchd.
             let prevSigTerm = signal(SIGTERM, SIG_IGN)
-            defer { signal(SIGTERM, prevSigTerm) }
+            defer {
+                let prevPtr = unsafeBitCast(prevSigTerm, to: UnsafeRawPointer?.self)
+                let ignPtr = unsafeBitCast(SIG_IGN, to: UnsafeRawPointer?.self)
+                let errPtr = unsafeBitCast(SIG_ERR, to: UnsafeRawPointer?.self)
+                if prevPtr != ignPtr && prevPtr != errPtr {
+                    signal(SIGTERM, prevSigTerm)
+                } else {
+                    signal(SIGTERM, SIG_DFL)
+                }
+            }
 
             if isCurrentlyInstalled {
                 let bootout = Process()
@@ -73,6 +85,7 @@ final class SettingsViewModel: ObservableObject {
             }
             DispatchQueue.main.async {
                 self.checkLaunchAgent()
+                self.isUpdatingLaunchAgent = false
             }
         }
     }
@@ -491,6 +504,7 @@ struct GeneralSettingsTab: View {
                                 viewModel.toggleLaunchAgent()
                             }
                             .controlSize(.regular)
+                            .disabled(viewModel.isUpdatingLaunchAgent)
                         }
                     }
                 }

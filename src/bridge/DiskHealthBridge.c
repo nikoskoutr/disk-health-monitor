@@ -102,6 +102,9 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
             linkSpeedRef = IORegistryEntryCreateCFProperty(parent, CFSTR("LinkSpeed"), kCFAllocatorDefault, 0);
         }
         if (!linkSpeedRef) {
+            linkSpeedRef = IORegistryEntryCreateCFProperty(parent, CFSTR("Link Speed"), kCFAllocatorDefault, 0);
+        }
+        if (!linkSpeedRef) {
             linkSpeedRef = IORegistryEntryCreateCFProperty(parent, CFSTR("Device Speed"), kCFAllocatorDefault, 0);
         }
         if (linkSpeedRef) {
@@ -144,6 +147,8 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
                     strlcpy(outMetrics->interconnectType, "USB", sizeof(outMetrics->interconnectType));
                 } else if (strstr(className, "Thunderbolt") != NULL) {
                     strlcpy(outMetrics->interconnectType, "Thunderbolt", sizeof(outMetrics->interconnectType));
+                } else if (strstr(className, "AHCI") != NULL || strstr(className, "SATA") != NULL) {
+                    strlcpy(outMetrics->interconnectType, "SATA", sizeof(outMetrics->interconnectType));
                 } else if (strstr(className, "PCI") != NULL || strstr(className, "NVMe") != NULL) {
                     strlcpy(outMetrics->interconnectType, "PCI-Express", sizeof(outMetrics->interconnectType));
                 }

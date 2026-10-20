@@ -9,20 +9,22 @@ This directory contains the native macOS user interface layer built with AppKit 
 ### 1. [`AppDelegate.swift`](AppDelegate.swift)
 Manages the application lifecycle, menu bar status item, background refresh timer, and Settings window:
 - **Menu Bar Status Item (`NSStatusBar`)**:
-  - Dynamically updates the menu bar SF Symbol icon based on the latest health state (`externaldrive.badge.checkmark` for healthy, `externaldrive.trianglebadge.exclamationmark` for warning/critical, or `externaldrive.badge.questionmark` when unmounted).
+  - Dynamically updates the menu bar SF Symbol icon based on the latest health state (`externaldrive.fill.badge.checkmark` for healthy, `externaldrive.trianglebadge.exclamationmark` for warning, or `externaldrive.fill.badge.xmark` for critical).
 - **Embedded SwiftUI Dashboard (`NSHostingView`)**:
-  - Hosts `DashboardMenuView` (360×510 pt) at the top of the status bar menu alongside native `NSMenuItem` shortcuts:
-    - **Run Quick Check Now** (`Cmd+R`)
-    - **Run Deep Check (`verifyVolume`)** (`Cmd+D`)
-    - **Switch Monitored Drive** (dynamically populated from `DiskListMountedDisks()`)
-    - **Settings (`Cmd+,`)...**
-    - **Export Diagnostic Report...** (`Cmd+E`)
-    - **Open Drive in Finder** (`Cmd+O`)
-    - **View Health Log** (`Cmd+L`)
-- **Standard Edit Menu (`setupMainMenu`)**:
+  - Hosts `DashboardMenuView` (385 pt wide) at the top of the status bar menu alongside native `NSMenuItem` shortcuts:
+    - **Select Monitored Disk** (dynamically populated from `DiskListAllDevices()` and `getfsstat()`)
+    - **Run Deep Health & Canary Check Now** (`Cmd+R`)
+    - **Verify Volume File System (`diskutil`)...** (`Cmd+V`)
+    - **Send Status Report to Telegram Now** (`Cmd+T`)
+    - **Daily Telegram Health Digest (09:00)**
+    - **Export Diagnostic Report (JSON)...** (`Cmd+E`)
+    - **Settings...** (`Cmd+,`)
+    - **Open Volume in Finder** (`Cmd+O`)
+    - **View Health Monitor Log** (`Cmd+L`)
+- **Standard Edit Menu (`setupMainMenuForShortcuts`)**:
   - Installs a standard macOS `Edit` menu (`Undo`, `Redo`, `Cut`, `Copy`, `Paste`, `Select All`) so keyboard shortcuts (`Cmd+C`, `Cmd+V`, `Cmd+A`) work natively inside the Settings window's text and password fields.
 - **Observer Registration**:
-  - Listens for `.diskHealthConfigDidChange` notifications from `SettingsView` to immediately reload configuration and re-run a health check when the user saves settings.
+  - Subscribes to `ConfigManager.shared.objectWillChange` on `RunLoop.main` to dynamically reschedule the polling timer whenever `pollIntervalSeconds` changes, and observes `NSWorkspace` mount/unmount and sleep/wake notifications.
 
 ### 2. [`DashboardMenuView.swift`](DashboardMenuView.swift)
 Renders the visual telemetry popover card inside the menu bar dropdown:

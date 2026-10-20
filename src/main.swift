@@ -33,7 +33,7 @@ final class SingleInstanceLock {
         let parentDir = (path as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: parentDir, withIntermediateDirectories: true)
 
-        let fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        let fd = open(path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard fd >= 0 else {
             return false
         }

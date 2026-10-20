@@ -225,9 +225,9 @@ EOF
 
     # Reload service and ensure any standalone GUI instance hands off cleanly to launchd
     launchctl bootout "gui/$(id -u)/${BUNDLE_ID}" 2>/dev/null || true
-    pkill -f "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" 2>/dev/null || true
+    pkill -f "^${BINARY_PATH}( --menubar)?$" 2>/dev/null || true
     for _ in {1..20}; do
-        pgrep -f "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" >/dev/null 2>&1 || break
+        pgrep -f "^${BINARY_PATH}( --menubar)?$" >/dev/null 2>&1 || break
         sleep 0.1
     done
     launchctl bootstrap "gui/$(id -u)" "${SERVICE_PLIST}"

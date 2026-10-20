@@ -89,11 +89,17 @@ final class DiskHealthMonitor: ObservableObject {
         saveStateLocked()
     }
 
+    func clearCurrentSnapshotForTesting() {
+        engineLock.lock()
+        defer { engineLock.unlock() }
+        self.currentSnapshot = nil
+    }
+
     func setMonitoredTarget(volumePath: String?, deviceQuery: String?) {
+        ConfigManager.shared.updateTarget(volumePath: volumePath, deviceQuery: deviceQuery)
         engineLock.lock()
         let newTarget = volumePath ?? deviceQuery ?? "auto"
         let targetChanged = (state.monitoredTarget != newTarget)
-        ConfigManager.shared.updateTarget(volumePath: volumePath, deviceQuery: deviceQuery)
         state.monitoredTarget = newTarget
         if targetChanged {
             state.lastOverallSeverity = HealthSeverity.healthy.rawValue
@@ -110,6 +116,8 @@ final class DiskHealthMonitor: ObservableObject {
     func resetBaselines() {
         engineLock.lock()
         defer { engineLock.unlock() }
+        let oldTarget = self.state.monitoredTarget
+        let oldDaily = self.state.dailySummaryEnabled
         if let snap = self.currentSnapshot {
             let key = !snap.serialNumber.isEmpty ? snap.serialNumber : (!snap.bsdName.isEmpty ? snap.bsdName : (snap.mountPoint.isEmpty ? "default" : snap.mountPoint))
             self.state.updateDriveState(key: key) { d in
@@ -123,9 +131,28 @@ final class DiskHealthMonitor: ObservableObject {
                 d.baselineIoWriteErrors = snap.errorsWritten
                 d.baselineIoReadRetries = snap.retriesRead
                 d.baselineIoWriteRetries = snap.retriesWritten
+                d.lastOverallSeverity = HealthSeverity.healthy.rawValue
             }
         } else {
-            self.state = DiskPersistentState()
+            for k in Array(self.state.drives.keys) {
+                self.state.updateDriveState(key: k) { d in
+                    d.baselineUnsafeShutdowns = nil
+                    d.baselineMediaErrors = nil
+                    d.baselineErrorLogEntries = nil
+                    d.baselineIoReadErrors = nil
+                    d.baselineIoWriteErrors = nil
+                    d.baselineIoReadRetries = nil
+                    d.baselineIoWriteRetries = nil
+                    d.lastOverallSeverity = HealthSeverity.healthy.rawValue
+                }
+            }
+            self.state.monitoredTarget = oldTarget
+            self.state.dailySummaryEnabled = oldDaily
+        }
+        for k in Array(self.state.drives.keys) {
+            self.state.updateDriveState(key: k) {
+                $0.lastOverallSeverity = HealthSeverity.healthy.rawValue
+            }
         }
         self.state.lastOverallSeverity = HealthSeverity.healthy.rawValue
         self.state.lastAlertTimestampByCode.removeAll()
@@ -784,7 +811,8 @@ final class DiskHealthMonitor: ObservableObject {
             }
         }
 
-        let prevSeverity = HealthSeverity(rawValue: state.lastOverallSeverity) ?? .healthy
+        let driveSeverityRaw = state.drives[driveKey]?.lastOverallSeverity ?? state.lastOverallSeverity
+        let prevSeverity = HealthSeverity(rawValue: driveSeverityRaw) ?? .healthy
         if shouldSendAlert {
             let alertTitle = snapshot.overallSeverity == .critical
                 ? "\(snapshot.productName) CRITICAL HEALTH ALERT"
@@ -841,6 +869,9 @@ final class DiskHealthMonitor: ObservableObject {
         }
 
         state.lastOverallSeverity = snapshot.overallSeverity.rawValue
+        state.updateDriveState(key: driveKey) {
+            $0.lastOverallSeverity = snapshot.overallSeverity.rawValue
+        }
 
         // Daily Digest at 09:00
         if state.dailySummaryEnabled {

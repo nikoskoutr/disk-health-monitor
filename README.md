@@ -89,8 +89,8 @@ Each check cycle collects a `DiskHealthSnapshot` via `DiskHealthBridge.c` and ev
 | :--- | :--- | :--- | :--- | :--- |
 | **1** | **Mount Availability & Subpaths** | `statfs(2)`, `FileManager` | Target volume unmounted or any configured `requiredSubpaths` missing | `CRITICAL` |
 | **2** | **Hardware SMART Status** | `IOBlockStorageDevice` / NVMe Critical Warning (`Byte 0`) | Hardware reports SMART failure or NVMe Critical Warning bitmask `!= 0` | `CRITICAL` |
-| **3** | **NVMe Available Spare** | NVMe SMART Log `02h` (`Bytes 3–4`) | `availableSpare < availableSpareThreshold` (`CRITICAL`) or `< 20%` (`WARNING`) | `WARNING` / `CRITICAL` |
-| **4** | **NVMe Wear (`Percentage Used`)** | NVMe SMART Log `02h` (`Byte 5`) | `percentageUsed >= 90%` (`WARNING`) or `>= 100%` (`CRITICAL`) | `WARNING` / `CRITICAL` |
+| **3** | **NVMe Available Spare** | NVMe SMART Log `02h` (`Bytes 3–4`) | `availableSpare <= availableSpareThreshold` / `< 10%` (`CRITICAL`) or `< 25%` (`WARNING`) | `WARNING` / `CRITICAL` |
+| **4** | **NVMe Wear (`Percentage Used`)** | NVMe SMART Log `02h` (`Byte 5`) | `percentageUsed >= 80%` (`WARNING`) or `>= 95%` (`CRITICAL`) | `WARNING` / `CRITICAL` |
 | **5** | **Drive Composite Temperature** | NVMe SMART Log `02h` (`Bytes 1–2`) | `temperatureCelsius >= tempWarningCelsius` or `>= tempCriticalCelsius` | `WARNING` / `CRITICAL` |
 | **6** | **Host Thermal State** | `ProcessInfo.processInfo.thermalState` | Host macOS thermal state in `.critical` (`WARNING`) | `WARNING` |
 | **7** | **Media & Kernel I/O Errors** | NVMe Log `02h` (`Bytes 160–175`) & `IOBlockStorageDriver` | Non-zero delta in `mediaErrors`, `Read Errors`, or `Write Errors` since prior snapshot | `WARNING` / `CRITICAL` |

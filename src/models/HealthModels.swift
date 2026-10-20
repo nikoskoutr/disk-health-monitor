@@ -62,6 +62,40 @@ struct DriveBaselineState: Codable {
     var lastVerifyTimestamp: TimeInterval = 0
     var lastVerifyResult: String = "Not run yet"
     var lastVerifyOk: Bool = true
+    var lastOverallSeverity: String = HealthSeverity.healthy.rawValue
+
+    init(bsdName: String = "", serialNumber: String = "") {
+        self.bsdName = bsdName
+        self.serialNumber = serialNumber
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case bsdName, serialNumber
+        case baselineUnsafeShutdowns, baselineMediaErrors, baselineErrorLogEntries
+        case baselineIoReadErrors, baselineIoWriteErrors
+        case baselineIoReadRetries, baselineIoWriteRetries
+        case peakTemperatureCelsius, lastVerifyTimestamp, lastVerifyResult, lastVerifyOk
+        case lastOverallSeverity
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let def = DriveBaselineState()
+        bsdName = try c.decodeIfPresent(String.self, forKey: .bsdName) ?? def.bsdName
+        serialNumber = try c.decodeIfPresent(String.self, forKey: .serialNumber) ?? def.serialNumber
+        baselineUnsafeShutdowns = try c.decodeIfPresent(UInt64.self, forKey: .baselineUnsafeShutdowns)
+        baselineMediaErrors = try c.decodeIfPresent(UInt64.self, forKey: .baselineMediaErrors)
+        baselineErrorLogEntries = try c.decodeIfPresent(UInt64.self, forKey: .baselineErrorLogEntries)
+        baselineIoReadErrors = try c.decodeIfPresent(UInt64.self, forKey: .baselineIoReadErrors)
+        baselineIoWriteErrors = try c.decodeIfPresent(UInt64.self, forKey: .baselineIoWriteErrors)
+        baselineIoReadRetries = try c.decodeIfPresent(UInt64.self, forKey: .baselineIoReadRetries)
+        baselineIoWriteRetries = try c.decodeIfPresent(UInt64.self, forKey: .baselineIoWriteRetries)
+        peakTemperatureCelsius = try c.decodeIfPresent(Int.self, forKey: .peakTemperatureCelsius) ?? def.peakTemperatureCelsius
+        lastVerifyTimestamp = try c.decodeIfPresent(TimeInterval.self, forKey: .lastVerifyTimestamp) ?? def.lastVerifyTimestamp
+        lastVerifyResult = try c.decodeIfPresent(String.self, forKey: .lastVerifyResult) ?? def.lastVerifyResult
+        lastVerifyOk = try c.decodeIfPresent(Bool.self, forKey: .lastVerifyOk) ?? def.lastVerifyOk
+        lastOverallSeverity = try c.decodeIfPresent(String.self, forKey: .lastOverallSeverity) ?? def.lastOverallSeverity
+    }
 }
 
 struct DiskPersistentState: Codable {
@@ -71,6 +105,24 @@ struct DiskPersistentState: Codable {
     var lastOverallSeverity: String = HealthSeverity.healthy.rawValue
     var dailySummaryEnabled: Bool = true
     var lastDailySummaryDate: String = ""
+
+    init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case monitoredTarget, drives, lastAlertTimestampByCode
+        case lastOverallSeverity, dailySummaryEnabled, lastDailySummaryDate
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let def = DiskPersistentState()
+        monitoredTarget = try c.decodeIfPresent(String.self, forKey: .monitoredTarget) ?? def.monitoredTarget
+        drives = try c.decodeIfPresent([String: DriveBaselineState].self, forKey: .drives) ?? def.drives
+        lastAlertTimestampByCode = try c.decodeIfPresent([String: TimeInterval].self, forKey: .lastAlertTimestampByCode) ?? def.lastAlertTimestampByCode
+        lastOverallSeverity = try c.decodeIfPresent(String.self, forKey: .lastOverallSeverity) ?? def.lastOverallSeverity
+        dailySummaryEnabled = try c.decodeIfPresent(Bool.self, forKey: .dailySummaryEnabled) ?? def.dailySummaryEnabled
+        lastDailySummaryDate = try c.decodeIfPresent(String.self, forKey: .lastDailySummaryDate) ?? def.lastDailySummaryDate
+    }
 
     func getDriveState(key: String, bsdName: String = "", serial: String = "") -> DriveBaselineState {
         drives[key] ?? DriveBaselineState(bsdName: bsdName, serialNumber: serial)
