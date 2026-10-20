@@ -1443,11 +1443,32 @@ struct CoreLogicTestRunner {
             try? FileManager.default.removeItem(atPath: htmlSaved)
         }
 
-        // 32d. COMP-04: Non-Destructive Surface Read Sample Probe
-        let scanRes = monitor.runSurfaceReadScan(maxBytesToScan: 2 * 1024 * 1024)
+        // 32d. COMP-04: Non-Destructive Surface Read Sample Probe & Multi-Tier Modes
+        assertTrue(DiskHealthMonitor.SurfaceScanMode.allCases.count == 3, "SurfaceScanMode must support quick, standard, and full modes")
+        assertTrue(DiskHealthMonitor.SurfaceScanMode.quick.shortLabel == "Quick (64 MB)", "Quick mode shortLabel")
+        assertTrue(DiskHealthMonitor.SurfaceScanMode.standard.shortLabel == "Standard (2 GB)", "Standard mode shortLabel")
+        assertTrue(DiskHealthMonitor.SurfaceScanMode.full.shortLabel == "Full Volume", "Full mode shortLabel")
+
+        // Progress callback tracking
+        var progressUpdatesCount = 0
+        let scanRes = monitor.runSurfaceReadScan(mode: .quick, maxBytesToScan: 2 * 1024 * 1024) { prog in
+            progressUpdatesCount += 1
+            _ = prog.formattedBytesScanned
+            _ = prog.formattedTargetBytes
+            _ = prog.formattedThroughput
+            _ = prog.formattedPercent
+        }
         assertTrue(scanRes.ok == true, "Surface read scan on root volume must succeed with 0 EIO errors")
         assertTrue(scanRes.filesScanned > 0, "Surface read scan must sample at least 1 file")
         assertTrue(scanRes.bytesScanned > 0, "Surface read scan must read physical bytes")
+        assertTrue(progressUpdatesCount > 0, "Surface scan progress handler must be called during execution")
+
+        // Test Cooperative Cancellation Token
+        let cancelToken = DiskHealthMonitor.SurfaceScanCancellationToken()
+        cancelToken.cancel()
+        assertTrue(cancelToken.isCancelled == true, "CancellationToken must report isCancelled == true")
+        let cancelledScanRes = monitor.runSurfaceReadScan(mode: .standard, maxBytesToScan: 10 * 1024 * 1024, cancellationToken: cancelToken)
+        assertTrue(cancelledScanRes.summary.uppercased().contains("CANCELLED"), "Pre-cancelled surface scan must report cancellation in summary")
 
         // 32e. COMP-05: Custom Alert Script Execution Hook
         let tempScriptPath = "\(cfgMgr.configDir)/test_alert_hook.sh"

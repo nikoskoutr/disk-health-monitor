@@ -23,7 +23,7 @@ func printUsage() {
       --import-config <file> Import and apply configuration profile from a JSON file
       --export-diagnostics  Generate comprehensive JSON diagnostic report in logs/ (or [path])
       --export-html         Generate standalone HTML health & RMA report in logs/ (or [path])
-      --surface-scan        Run non-destructive physical media read validation (F_NOCACHE)
+      --surface-scan [mode] Run non-destructive F_NOCACHE surface scan (modes: quick, standard, full)
       --verify              Run volume filesystem verification (diskutil verifyVolume)
       --send-report         Dispatch on-demand HTML health report to Telegram
       --menubar             Launch the macOS Menu Bar status item application (default)
@@ -136,8 +136,54 @@ func parseCommandLine() {
         }
     }
 
-    if args.contains("--surface-scan") {
-        let res = DiskHealthMonitor.shared.runSurfaceReadScan()
+    if let scanIdx = args.firstIndex(where: { $0 == "--surface-scan" || $0.hasPrefix("--surface-scan=") }) {
+        var selectedMode: DiskHealthMonitor.SurfaceScanMode = .quick
+        let arg = args[scanIdx]
+        if arg.hasPrefix("--surface-scan=") {
+            let val = String(arg.dropFirst("--surface-scan=".count)).lowercased()
+            if let m = DiskHealthMonitor.SurfaceScanMode(rawValue: val) {
+                selectedMode = m
+            } else {
+                fputs("Unknown surface scan mode '\(val)'. Valid modes: quick, standard, full\n", stderr)
+                exit(1)
+            }
+        } else if scanIdx + 1 < args.count && !args[scanIdx + 1].hasPrefix("-") {
+            let val = args[scanIdx + 1].lowercased()
+            if let m = DiskHealthMonitor.SurfaceScanMode(rawValue: val) {
+                selectedMode = m
+            } else {
+                fputs("Unknown surface scan mode '\(val)'. Valid modes: quick, standard, full\n", stderr)
+                exit(1)
+            }
+        }
+
+        let isTTY = isatty(STDERR_FILENO) != 0
+        let res = DiskHealthMonitor.shared.runSurfaceReadScan(mode: selectedMode) { prog in
+            guard isTTY && selectedMode != .quick else { return }
+            let pct = Int((prog.fractionCompleted * 100.0).rounded())
+            let etaStr: String
+            if let eta = prog.estimatedRemainingSec, eta.isFinite {
+                etaStr = String(format: "ETA %.0fs", eta)
+            } else {
+                etaStr = "ETA --"
+            }
+            let line = String(
+                format: "\r\u{1B}[KScanning [%@]: %3d%% | %d files | %@ | %.1f MB/s | Errors: %d | %@",
+                selectedMode.shortLabel,
+                pct,
+                prog.filesScanned,
+                formatBytes(prog.bytesScanned),
+                prog.throughputMBps,
+                prog.readErrors,
+                etaStr
+            )
+            fputs(line, stderr)
+            fflush(stderr)
+        }
+        if isTTY && selectedMode != .quick {
+            fputs("\r\u{1B}[K", stderr)
+            fflush(stderr)
+        }
         print("Surface Read Validation: \(res.summary)")
         exit(res.ok ? 0 : 2)
     }
@@ -296,7 +342,7 @@ func isHeadlessCLIMode(args: [String]) -> Bool {
         "--send-report", "--verify", "--verify-volume", "--verify-apfs"
     ]
     for arg in args.dropFirst() {
-        if cliFlags.contains(arg) {
+        if cliFlags.contains(arg) || arg.hasPrefix("--surface-scan") {
             return true
         }
     }

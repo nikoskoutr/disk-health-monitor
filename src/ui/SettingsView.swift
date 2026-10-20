@@ -24,6 +24,9 @@ final class SettingsViewModel: ObservableObject {
     @Published var alertScriptTestResult: String? = nil
     @Published var alertScriptTestSuccess: Bool = false
     @Published var isRunningSurfaceScan: Bool = false
+    @Published var selectedSurfaceScanMode: DiskHealthMonitor.SurfaceScanMode = .quick
+    @Published var surfaceScanProgress: DiskHealthMonitor.SurfaceScanProgress? = nil
+    @Published var surfaceScanCancelToken: DiskHealthMonitor.SurfaceScanCancellationToken? = nil
     @Published var diagnosticsStatusMsg: String? = nil
 
     init() {
@@ -198,15 +201,34 @@ final class SettingsViewModel: ObservableObject {
 
     func runSurfaceScanAction() {
         guard !isRunningSurfaceScan else { return }
+        let mode = selectedSurfaceScanMode
+        let token = DiskHealthMonitor.SurfaceScanCancellationToken()
+        surfaceScanCancelToken = token
+        surfaceScanProgress = nil
         isRunningSurfaceScan = true
-        diagnosticsStatusMsg = "Running non-destructive physical media read scan (F_NOCACHE)..."
+        diagnosticsStatusMsg = "Starting \(mode.displayName) (F_NOCACHE unbuffered media reads)..."
+
         DispatchQueue.global(qos: .userInitiated).async {
-            let res = DiskHealthMonitor.shared.runSurfaceReadScan()
+            let res = DiskHealthMonitor.shared.runSurfaceReadScan(
+                mode: mode,
+                cancellationToken: token
+            ) { prog in
+                DispatchQueue.main.async {
+                    self.surfaceScanProgress = prog
+                }
+            }
             DispatchQueue.main.async {
                 self.isRunningSurfaceScan = false
+                self.surfaceScanCancelToken = nil
+                self.surfaceScanProgress = nil
                 self.diagnosticsStatusMsg = res.summary
             }
         }
+    }
+
+    func cancelSurfaceScanAction() {
+        surfaceScanCancelToken?.cancel()
+        diagnosticsStatusMsg = "Cancelling surface scan..."
     }
 
     func runTelegramTest() {
@@ -1207,22 +1229,92 @@ struct DiagnosticsAndExportTab: View {
                     }
                 }
 
-                SettingsCard(title: "State & Baseline Maintenance", icon: "arrow.counterclockwise.circle.fill", iconColor: .orange) {
-                    SettingsRow(
-                        title: "Physical Surface Read Sample Scan",
-                        subtitle: "Verify physical media blocks bypassing macOS cache (F_NOCACHE) to detect uncorrectable read errors."
-                    ) {
-                        Button(action: {
-                            viewModel.runSurfaceScanAction()
-                        }) {
-                            Text(viewModel.isRunningSurfaceScan ? "Scanning..." : "Run Surface Scan")
-                                .frame(width: 128)
+                SettingsCard(title: "Physical Media Surface Scan", icon: "waveform.path.badge.plus", iconColor: .blue) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Scan Depth & Media Verification")
+                                    .font(.system(size: 13, weight: .semibold))
+                                Text(viewModel.selectedSurfaceScanMode.modeDescription)
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            Spacer()
+                            Picker("", selection: $viewModel.selectedSurfaceScanMode) {
+                                ForEach(DiskHealthMonitor.SurfaceScanMode.allCases) { mode in
+                                    Text(mode.shortLabel).tag(mode)
+                                }
+                            }
+                            .pickerStyle(SegmentedPickerStyle())
+                            .frame(width: 310)
+                            .disabled(viewModel.isRunningSurfaceScan)
                         }
-                        .disabled(viewModel.isRunningSurfaceScan)
+
+                        if viewModel.isRunningSurfaceScan, let prog = viewModel.surfaceScanProgress {
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("⚡ Throughput: \(prog.formattedThroughput)")
+                                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                        .foregroundColor(.primary)
+                                    Spacer()
+                                    Text("Files: \(prog.filesScanned) | \(prog.formattedBytesScanned) / \(prog.formattedTargetBytes) (\(prog.formattedPercent))")
+                                        .font(.system(size: 11, weight: .regular, design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                    if let eta = prog.formattedETA {
+                                        Text("• ETA: \(eta)")
+                                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                            .foregroundColor(.blue)
+                                    }
+                                }
+
+                                ProgressView(value: min(1.0, max(0.0, prog.fractionCompleted)), total: 1.0)
+                                    .progressViewStyle(LinearProgressViewStyle())
+
+                                if !prog.currentFile.isEmpty {
+                                    Text("Reading: \(prog.currentFile)")
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
+                            }
+                            .padding(10)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(Color.blue.opacity(0.07)))
+                        }
+
+                        HStack {
+                            Text("Bypasses unified buffer cache with F_NOCACHE to stream directly from physical media.")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            if viewModel.isRunningSurfaceScan {
+                                Button(action: {
+                                    viewModel.cancelSurfaceScanAction()
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "xmark.circle.fill")
+                                        Text("Stop Scan")
+                                    }
+                                    .foregroundColor(.red)
+                                    .frame(width: 128)
+                                }
+                            } else {
+                                Button(action: {
+                                    viewModel.runSurfaceScanAction()
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "play.fill")
+                                        Text("Run Surface Scan")
+                                    }
+                                    .frame(width: 128)
+                                }
+                            }
+                        }
                     }
+                }
 
-                    Divider()
-
+                SettingsCard(title: "State & Baseline Maintenance", icon: "arrow.counterclockwise.circle.fill", iconColor: .orange) {
                     SettingsRow(
                         title: "Reset Persistent Baselines",
                         subtitle: "Clear recorded peak temperatures, baseline error counters, and alert cooldown timers."

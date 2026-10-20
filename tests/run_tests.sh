@@ -265,14 +265,26 @@ else
 fi
 
 set +e
-"${ROOT_DIR}/disk-health" --surface-scan > "${BUILD_CACHE}/surface_scan_output.txt"
+"${ROOT_DIR}/disk-health" --surface-scan quick > "${BUILD_CACHE}/surface_scan_output.txt"
 SURFACE_EXIT=$?
 set -e
 if [[ ${SURFACE_EXIT} -le 2 ]] && grep -q "Surface Read Validation" "${BUILD_CACHE}/surface_scan_output.txt"; then
-    echo "  [OK] disk-health --surface-scan executed successfully (exit code: ${SURFACE_EXIT})"
+    echo "  [OK] disk-health --surface-scan quick executed successfully (exit code: ${SURFACE_EXIT})"
 else
-    echo "  [FAIL] disk-health --surface-scan failed or crashed with exit code ${SURFACE_EXIT}"
+    echo "  [FAIL] disk-health --surface-scan quick failed or crashed with exit code ${SURFACE_EXIT}"
     cat "${BUILD_CACHE}/surface_scan_output.txt"
+    exit 1
+fi
+
+set +e
+"${ROOT_DIR}/disk-health" --surface-scan=standard > "${BUILD_CACHE}/surface_scan_standard_output.txt"
+SURFACE_STD_EXIT=$?
+set -e
+if [[ ${SURFACE_STD_EXIT} -le 2 ]] && grep -q "Surface Read Validation" "${BUILD_CACHE}/surface_scan_standard_output.txt"; then
+    echo "  [OK] disk-health --surface-scan=standard executed successfully (exit code: ${SURFACE_STD_EXIT})"
+else
+    echo "  [FAIL] disk-health --surface-scan=standard failed or crashed with exit code ${SURFACE_STD_EXIT}"
+    cat "${BUILD_CACHE}/surface_scan_standard_output.txt"
     exit 1
 fi
 
