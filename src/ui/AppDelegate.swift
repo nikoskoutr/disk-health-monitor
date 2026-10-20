@@ -168,6 +168,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         exportDiagItem.target = self
         menu.addItem(exportDiagItem)
 
+        let exportHtmlItem = NSMenuItem(title: "Export HTML Health Report (RMA)...", action: #selector(exportHtmlReportAction), keyEquivalent: "h")
+        exportHtmlItem.target = self
+        menu.addItem(exportHtmlItem)
+
         let settingsItem = NSMenuItem(title: "Settings...", action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
         menu.addItem(settingsItem)
@@ -460,6 +464,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func exportDiagnosticReportAction() {
         if let path = DiagnosticExporter.shared.saveDiagnosticReportToFile() {
+            NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: ConfigManager.shared.logsDir)
+        }
+    }
+
+    @objc private func exportHtmlReportAction() {
+        if let path = DiagnosticExporter.shared.saveDiagnosticReportHTMLToFile() {
             NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: ConfigManager.shared.logsDir)
         }
     }

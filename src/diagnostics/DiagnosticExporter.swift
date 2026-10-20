@@ -78,6 +78,7 @@ final class DiagnosticExporter {
                 "totalBytes": snap.totalBytes,
                 "usedBytes": snap.usedBytes,
                 "freeBytes": snap.freeBytes,
+                "purgeableBytes": snap.purgeableBytes,
                 "usedPercent": snap.usedPercent,
                 "lastVerifyResult": snap.lastVerifyResult
             ],
@@ -176,6 +177,107 @@ final class DiagnosticExporter {
                 return targetPath
             } catch {
                 ConfigManager.shared.log("Failed to write diagnostic report: \(error.localizedDescription)")
+                return nil
+            }
+        }
+        return nil
+    }
+
+    func exportDiagnosticReportHTML(snapshot: DiskHealthSnapshot? = nil) -> String {
+        let snap = snapshot ?? DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: false)
+        let esc = TelegramNotifier.shared.escapeHTML
+        let badgeColor: String = {
+            switch snap.overallSeverity {
+            case .healthy: return "#10b981"
+            case .warning: return "#f59e0b"
+            case .critical: return "#ef4444"
+            }
+        }()
+
+        var issuesRows = ""
+        if snap.issues.isEmpty {
+            issuesRows = "<tr><td colspan='3' style='color:#10b981;font-weight:600;'>✅ All 12 hardware, thermal, and filesystem health checks passed.</td></tr>"
+        } else {
+            for issue in snap.issues {
+                issuesRows += "<tr><td><b>\(esc(issue.severity.rawValue))</b></td><td><code>\(esc(issue.code))</code></td><td><b>\(esc(issue.title))</b>: \(esc(issue.detail))</td></tr>"
+            }
+        }
+
+        return """
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+        <meta charset="UTF-8">
+        <title>Disk Health &amp; RMA Report — \(esc(snap.vendorName)) \(esc(snap.productName))</title>
+        <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #e2e8f0; margin: 24px; }
+          .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; margin-bottom: 18px; }
+          h1, h2 { margin-top: 0; color: #f8fafc; }
+          .badge { display: inline-block; padding: 6px 14px; border-radius: 999px; font-weight: 700; background: \(badgeColor); color: #fff; }
+          table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+          th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #334155; font-size: 13px; }
+          th { color: #94a3b8; width: 32%; }
+          code { background: #0f172a; padding: 2px 6px; border-radius: 4px; color: #38bdf8; }
+          @media print { body { background: #fff; color: #111; } .card { background: #fff; border-color: #ccc; } th { color: #444; } }
+        </style>
+        </head>
+        <body>
+          <div class="card">
+            <h1>Universal Disk Health &amp; RMA Report</h1>
+            <p>Generated: <code>\(esc(snap.formattedTime))</code> • Architecture: <code>\(esc(kAppArchitecture))</code> • Version: <code>v\(esc(kAppVersion))</code></p>
+            <span class="badge">\(esc(snap.overallSeverity.rawValue)) — Score: \(snap.healthScore)/100</span>
+          </div>
+          <div class="card">
+            <h2>1. Hardware &amp; Interconnect Identity</h2>
+            <table>
+              <tr><th>Device Model</th><td>\(esc(snap.vendorName)) \(esc(snap.productName)) (Rev: \(esc(snap.productRevision.isEmpty ? "N/A" : snap.productRevision)))</td></tr>
+              <tr><th>Serial Number</th><td><code>\(esc(snap.serialNumber.isEmpty ? "N/A" : snap.serialNumber))</code></td></tr>
+              <tr><th>BSD Identifier &amp; Bus</th><td><code>\(esc(snap.bsdName.isEmpty ? "offline" : snap.bsdName))</code> • \(esc(snap.interconnectType)) (\(esc(snap.linkSpeedFormatted)))</td></tr>
+              <tr><th>Volume Mount &amp; Capacity</th><td>\(snap.isMounted ? "<code>\(esc(snap.mountPoint))</code> (\(esc(snap.filesystemType)), \(snap.isReadOnly ? "Read-Only" : "R/W")) — \(formatBytes(snap.usedBytes)) used / \(formatBytes(snap.freeBytes)) available (Purgeable: \(formatBytes(snap.purgeableBytes)))" : "UNMOUNTED")</td></tr>
+            </table>
+          </div>
+          <div class="card">
+            <h2>2. NVMe S.M.A.R.T. &amp; Kernel Driver Telemetry</h2>
+            <table>
+              <tr><th>Temperature</th><td>\(snap.smartValid ? "\(snap.temperatureCelsius)°C (Peak: \(snap.peakTemperatureCelsius)°C)" : "N/A")</td></tr>
+              <tr><th>SSD Wear &amp; Available Spare</th><td>\(snap.smartValid ? "\(snap.lifeRemainingPercent)% Life Remaining (Used: \(snap.percentageUsed)%, Available Spare: \(snap.availableSpare)% / Thresh: \(snap.availableSpareThreshold)%)" : "N/A")</td></tr>
+              <tr><th>Lifetime Data Read / Written</th><td>\(snap.smartValid ? String(format: "%.2f TB Written (TBW) / %.2f TB Read", snap.totalTerabytesWritten, snap.totalTerabytesRead) : "N/A")</td></tr>
+              <tr><th>Power Cycles / Hours / Unsafe</th><td>\(snap.smartValid ? "Cycles: \(snap.powerCycles) • POH: \(snap.powerOnHours)h • Unsafe Shutdowns: \(snap.unsafeShutdowns)" : "N/A")</td></tr>
+              <tr><th>Media &amp; Driver I/O Errors</th><td>Media Errors: \(snap.mediaErrors) • Driver Errors: \(snap.errorsRead) R / \(snap.errorsWritten) W • Retries: \(snap.retriesRead) R / \(snap.retriesWritten) W</td></tr>
+              <tr><th>Active Canary &amp; FS Verification</th><td>Canary: \(snap.canaryOk ? String(format: "PASSED (%.2f ms)", snap.canaryLatencyMs) : "FAILED (\(esc(snap.canaryError)))") • Verify: \(esc(snap.lastVerifyResult))</td></tr>
+            </table>
+          </div>
+          <div class="card">
+            <h2>3. Active Health Findings</h2>
+            <table>
+              <tr><th>Severity</th><th>Rule Code</th><th>Description</th></tr>
+              \(issuesRows)
+            </table>
+          </div>
+        </body>
+        </html>
+        """
+    }
+
+    func saveDiagnosticReportHTMLToFile(at path: String? = nil, snapshot: DiskHealthSnapshot? = nil) -> String? {
+        let htmlStr = exportDiagnosticReportHTML(snapshot: snapshot)
+        let targetPath: String
+        if let p = path, !p.isEmpty {
+            targetPath = (p as NSString).standardizingPath
+        } else {
+            let df = DateFormatter()
+            df.locale = Locale(identifier: "en_US_POSIX")
+            df.dateFormat = "yyyyMMdd-HHmmss"
+            let stamp = df.string(from: Date())
+            targetPath = "\(ConfigManager.shared.logsDir)/health_report_\(stamp).html"
+        }
+        if let data = htmlStr.data(using: .utf8) {
+            do {
+                try data.write(to: URL(fileURLWithPath: targetPath), options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: targetPath)
+                return targetPath
+            } catch {
+                ConfigManager.shared.log("Failed to write HTML health report: \(error.localizedDescription)")
                 return nil
             }
         }

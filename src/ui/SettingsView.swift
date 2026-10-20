@@ -224,6 +224,20 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
+    func exportHtmlReportAction() {
+        let panel = NSSavePanel()
+        panel.title = "Export Standalone HTML Health Report"
+        panel.nameFieldStringValue = "disk-health-report.html"
+        panel.allowedContentTypes = [.html]
+        if panel.runModal() == .OK, let url = panel.url {
+            if let savedPath = DiagnosticExporter.shared.saveDiagnosticReportHTMLToFile(at: url.path) {
+                diagnosticsStatusMsg = "Saved HTML report to \((savedPath as NSString).lastPathComponent)"
+            } else {
+                diagnosticsStatusMsg = "Failed to save HTML report."
+            }
+        }
+    }
+
     static func makeLaunchAgentPlistDict(bundleId: String, binaryPath: String, logsDir: String) -> [String: Any] {
         return [
             "Label": bundleId,
@@ -954,14 +968,20 @@ struct DiagnosticsAndExportTab: View {
                     Divider()
 
                     SettingsRow(
-                        title: "Export Full Diagnostic Report",
-                        subtitle: "Generate a complete JSON bundle of hardware S.M.A.R.T., I/O stats, and active health checks."
+                        title: "Export Full Diagnostic Report (JSON / HTML)",
+                        subtitle: "Generate a JSON diagnostic bundle or standalone HTML RMA report."
                     ) {
-                        Button(action: {
-                            viewModel.exportDiagnosticReportAction()
-                        }) {
-                            Text("Export Report...")
-                                .frame(width: 128)
+                        HStack(spacing: 8) {
+                            Button(action: {
+                                viewModel.exportDiagnosticReportAction()
+                            }) {
+                                Text("Export JSON...")
+                            }
+                            Button(action: {
+                                viewModel.exportHtmlReportAction()
+                            }) {
+                                Text("Export HTML...")
+                            }
                         }
                     }
 

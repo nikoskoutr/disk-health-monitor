@@ -84,7 +84,11 @@ struct DashboardMenuView: View {
                         HStack {
                             Text("Used: \(formatBytes(snap.usedBytes))")
                             Spacer()
-                            Text("Free: \(formatBytes(snap.freeBytes)) / \(formatBytes(snap.totalBytes))")
+                            if snap.purgeableBytes > 0 {
+                                Text("Avail: \(formatBytes(snap.freeBytes)) (\(formatBytes(snap.purgeableBytes)) purgeable)")
+                            } else {
+                                Text("Free: \(formatBytes(snap.freeBytes)) / \(formatBytes(snap.totalBytes))")
+                            }
                         }
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)

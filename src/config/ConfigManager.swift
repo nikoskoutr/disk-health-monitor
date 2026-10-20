@@ -21,6 +21,8 @@ struct DiskHealthConfig: Codable, Equatable {
     var enableNativeNotifications: Bool = true
     var telegramBotToken: String = ""
     var telegramChatId: String = ""
+    var webhookUrl: String = ""
+    var alertScriptPath: String = ""
 
     init() {}
 
@@ -43,6 +45,8 @@ struct DiskHealthConfig: Codable, Equatable {
         enableNativeNotifications = try container.decodeIfPresent(Bool.self, forKey: .enableNativeNotifications) ?? defaults.enableNativeNotifications
         telegramBotToken = try container.decodeIfPresent(String.self, forKey: .telegramBotToken) ?? defaults.telegramBotToken
         telegramChatId = try container.decodeIfPresent(String.self, forKey: .telegramChatId) ?? defaults.telegramChatId
+        webhookUrl = try container.decodeIfPresent(String.self, forKey: .webhookUrl) ?? defaults.webhookUrl
+        alertScriptPath = try container.decodeIfPresent(String.self, forKey: .alertScriptPath) ?? defaults.alertScriptPath
     }
 }
 
@@ -61,6 +65,7 @@ final class ConfigManager: ObservableObject {
     private var _config: DiskHealthConfig
     private(set) var dotEnvTelegramToken: String? = nil
     private(set) var dotEnvChatId: String? = nil
+    private(set) var dotEnvWebhookUrl: String? = nil
 
     var config: DiskHealthConfig {
         get {
@@ -155,10 +160,19 @@ final class ConfigManager: ObservableObject {
             initialConfig = decoded
         }
 
-        // 4. Migrate plaintext Telegram Bot Token into SecretStore
+        // 4. Migrate plaintext Telegram Bot Token & Webhook URL into SecretStore
+        var needsResave = false
         if ConfigManager.isRealSecretToken(initialConfig.telegramBotToken) {
             _ = SecretStore.shared.setSecret(initialConfig.telegramBotToken, forKey: "telegramBotToken")
             initialConfig.telegramBotToken = "REDACTED_IN_KEYCHAIN"
+            needsResave = true
+        }
+        if ConfigManager.isRealSecretToken(initialConfig.webhookUrl) {
+            _ = SecretStore.shared.setSecret(initialConfig.webhookUrl, forKey: "webhookUrl")
+            initialConfig.webhookUrl = "REDACTED_IN_KEYCHAIN"
+            needsResave = true
+        }
+        if needsResave {
             ConfigManager.saveSanitizedConfigFile(initialConfig, path: configPath)
         }
 
@@ -166,6 +180,9 @@ final class ConfigManager: ObservableObject {
         let (dotConfig, dotToken, dotChat) = ConfigManager.loadDotEnv(into: initialConfig, configDir: self.configDir)
         self.dotEnvTelegramToken = dotToken
         self.dotEnvChatId = dotChat
+        if ConfigManager.isRealSecretToken(dotConfig.webhookUrl) {
+            self.dotEnvWebhookUrl = dotConfig.webhookUrl
+        }
 
         // 6. Apply Environment variables
         initialConfig = ConfigManager.applyEnvironmentVariables(into: dotConfig)
@@ -224,6 +241,36 @@ final class ConfigManager: ObservableObject {
         return ""
     }
 
+    var resolvedWebhookUrl: String {
+        configLock.lock()
+        defer { configLock.unlock() }
+        if let envUrl = ProcessInfo.processInfo.environment["WEBHOOK_URL"], !envUrl.isEmpty {
+            return envUrl
+        }
+        if let dotUrl = dotEnvWebhookUrl, !dotUrl.isEmpty {
+            return dotUrl
+        }
+        if let secret = SecretStore.shared.getSecret(forKey: "webhookUrl"), !secret.isEmpty {
+            return secret
+        }
+        if ConfigManager.isRealSecretToken(_config.webhookUrl) {
+            return _config.webhookUrl
+        }
+        return ""
+    }
+
+    var resolvedAlertScriptPath: String {
+        configLock.lock()
+        defer { configLock.unlock() }
+        if let envScript = ProcessInfo.processInfo.environment["ALERT_SCRIPT_PATH"], !envScript.isEmpty {
+            return envScript
+        }
+        if !_config.alertScriptPath.isEmpty {
+            return _config.alertScriptPath
+        }
+        return ""
+    }
+
     static func loadDotEnv(into cfg: DiskHealthConfig, configDir: String) -> (DiskHealthConfig, String?, String?) {
         var result = cfg
         var foundToken: String? = nil
@@ -276,6 +323,10 @@ final class ConfigManager: ObservableObject {
                     case "TELEGRAM_CHAT_ID":
                         foundChatId = val
                         result.telegramChatId = val
+                    case "WEBHOOK_URL":
+                        result.webhookUrl = val
+                    case "ALERT_SCRIPT_PATH":
+                        result.alertScriptPath = val
                     case "TEMP_WARNING_CELSIUS":
                         if let v = Int(val) { result.tempWarningCelsius = v }
                     case "TEMP_CRITICAL_CELSIUS":
@@ -315,6 +366,8 @@ final class ConfigManager: ObservableObject {
         if let v = env["ALERT_COOLDOWN_SECONDS"], let val = TimeInterval(v), val >= 0.0 { result.alertCooldownSeconds = val }
         if let v = env["MIN_EXPECTED_USB_SPEED_BPS"], let val = UInt64(v) { result.minExpectedUsbSpeedBps = val }
         if let v = env["TELEGRAM_CHAT_ID"], !v.isEmpty { result.telegramChatId = v }
+        if let v = env["WEBHOOK_URL"], !v.isEmpty { result.webhookUrl = v }
+        if let v = env["ALERT_SCRIPT_PATH"], !v.isEmpty { result.alertScriptPath = v }
         if let v = env["TEMP_WARNING_CELSIUS"], let val = Int(v) { result.tempWarningCelsius = val }
         if let v = env["TEMP_CRITICAL_CELSIUS"], let val = Int(v) { result.tempCriticalCelsius = val }
         if let v = env["DISK_USED_WARNING_PERCENT"], let val = Double(v) { result.diskUsedWarningPercent = val }
@@ -354,6 +407,11 @@ final class ConfigManager: ObservableObject {
             self.dotEnvTelegramToken = nil
             next.telegramBotToken = "REDACTED_IN_KEYCHAIN"
         }
+        if ConfigManager.isRealSecretToken(next.webhookUrl) {
+            _ = SecretStore.shared.setSecret(next.webhookUrl, forKey: "webhookUrl")
+            self.dotEnvWebhookUrl = nil
+            next.webhookUrl = "REDACTED_IN_KEYCHAIN"
+        }
         self._config = next
         saveConfigLocked(next)
     }
@@ -377,6 +435,12 @@ final class ConfigManager: ObservableObject {
             }
             sanitized.telegramBotToken = "REDACTED_IN_KEYCHAIN"
         }
+        if !sanitized.webhookUrl.isEmpty {
+            if ConfigManager.isRealSecretToken(sanitized.webhookUrl) {
+                _ = SecretStore.shared.setSecret(sanitized.webhookUrl, forKey: "webhookUrl")
+            }
+            sanitized.webhookUrl = "REDACTED_IN_KEYCHAIN"
+        }
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -397,10 +461,13 @@ final class ConfigManager: ObservableObject {
         var exported = self._config
         configLock.unlock()
         let token = resolvedTelegramBotToken
+        let webhook = resolvedWebhookUrl
         if includeSecrets {
             exported.telegramBotToken = token
+            exported.webhookUrl = webhook
         } else {
             exported.telegramBotToken = token.isEmpty ? "" : "•••••••• (Protected)"
+            exported.webhookUrl = webhook.isEmpty ? "" : "•••••••• (Protected)"
         }
         if exported.telegramChatId.isEmpty {
             exported.telegramChatId = resolvedTelegramChatId
@@ -420,9 +487,13 @@ final class ConfigManager: ObservableObject {
         }
         updateConfig { cfg in
             let existingToken = cfg.telegramBotToken
+            let existingWebhook = cfg.webhookUrl
             cfg = imported
             if imported.telegramBotToken.isEmpty || imported.telegramBotToken.contains("Protected") || imported.telegramBotToken == "REDACTED_IN_KEYCHAIN" {
                 cfg.telegramBotToken = existingToken
+            }
+            if imported.webhookUrl.isEmpty || imported.webhookUrl.contains("Protected") || imported.webhookUrl == "REDACTED_IN_KEYCHAIN" {
+                cfg.webhookUrl = existingWebhook
             }
         }
         return true

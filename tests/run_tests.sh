@@ -40,6 +40,7 @@ swiftc -O \
     "${ROOT_DIR}/src/config/ConfigManager.swift" \
     "${ROOT_DIR}/src/notifications/MacOSNotifier.swift" \
     "${ROOT_DIR}/src/notifications/TelegramNotifier.swift" \
+    "${ROOT_DIR}/src/notifications/WebhookNotifier.swift" \
     "${ROOT_DIR}/src/diagnostics/DiagnosticExporter.swift" \
     "${ROOT_DIR}/src/engine/DiskHealthMonitor.swift" \
     "${ROOT_DIR}/src/ui/DashboardMenuView.swift" \
@@ -226,6 +227,28 @@ if [[ -f "${TEST_DIAG_PATH}" ]] && grep -q "reportVersion" "${TEST_DIAG_PATH}"; 
     rm -f "${TEST_DIAG_PATH}"
 else
     echo "  [FAIL] disk-health --export-diagnostics failed to produce report"
+    exit 1
+fi
+
+TEST_HTML_PATH="${TEST_SANDBOX_DIR}/logs/test_diag_export.html"
+"${ROOT_DIR}/disk-health" --export-html "${TEST_HTML_PATH}" > /dev/null
+if [[ -f "${TEST_HTML_PATH}" ]] && grep -q "<!DOCTYPE html>" "${TEST_HTML_PATH}"; then
+    echo "  [OK] disk-health --export-html generated valid HTML report"
+    rm -f "${TEST_HTML_PATH}"
+else
+    echo "  [FAIL] disk-health --export-html failed to produce report"
+    exit 1
+fi
+
+set +e
+"${ROOT_DIR}/disk-health" --surface-scan > "${BUILD_CACHE}/surface_scan_output.txt"
+SURFACE_EXIT=$?
+set -e
+if [[ ${SURFACE_EXIT} -le 2 ]] && grep -q "Surface Read Validation" "${BUILD_CACHE}/surface_scan_output.txt"; then
+    echo "  [OK] disk-health --surface-scan executed successfully (exit code: ${SURFACE_EXIT})"
+else
+    echo "  [FAIL] disk-health --surface-scan failed or crashed with exit code ${SURFACE_EXIT}"
+    cat "${BUILD_CACHE}/surface_scan_output.txt"
     exit 1
 fi
 

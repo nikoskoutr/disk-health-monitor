@@ -22,6 +22,8 @@ func printUsage() {
       --export-config       Export current configuration as sanitized JSON (--unmasked for secrets)
       --import-config <file> Import and apply configuration profile from a JSON file
       --export-diagnostics  Generate comprehensive JSON diagnostic report in logs/ (or [path])
+      --export-html         Generate standalone HTML health & RMA report in logs/ (or [path])
+      --surface-scan        Run non-destructive physical media read validation (F_NOCACHE)
       --verify              Run volume filesystem verification (diskutil verifyVolume)
       --send-report         Dispatch on-demand HTML health report to Telegram
       --menubar             Launch the macOS Menu Bar status item application (default)
@@ -115,6 +117,29 @@ func parseCommandLine() {
             fputs("Failed to export diagnostic report.\n", stderr)
             exit(1)
         }
+    }
+
+    if args.contains("--export-html") {
+        var outPath: String? = nil
+        for i in 0..<args.count {
+            if args[i] == "--export-html" && i + 1 < args.count && !args[i + 1].hasPrefix("-") {
+                outPath = args[i + 1]
+                break
+            }
+        }
+        if let savedPath = DiagnosticExporter.shared.saveDiagnosticReportHTMLToFile(at: outPath) {
+            print("HTML health report exported successfully: \(savedPath)")
+            exit(0)
+        } else {
+            fputs("Failed to export HTML health report.\n", stderr)
+            exit(1)
+        }
+    }
+
+    if args.contains("--surface-scan") {
+        let res = DiskHealthMonitor.shared.runSurfaceReadScan()
+        print("Surface Read Validation: \(res.summary)")
+        exit(res.ok ? 0 : 2)
     }
 
     if args.contains("--list-disks") {

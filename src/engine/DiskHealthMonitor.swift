@@ -23,9 +23,31 @@ final class DiskHealthMonitor: ObservableObject {
     private var cachedCanaryError: String = ""
     private var lastWakeTime: TimeInterval = 0
     private(set) var isSystemSleeping: Bool = false
+    private var recentTemperatureSamples: [String: [(timestamp: TimeInterval, tempC: Int)]] = [:]
 
     private init() {
         self.state = DiskHealthMonitor.loadState()
+    }
+
+    static func evaluateThermalSpike(samples: [(timestamp: TimeInterval, tempC: Int)], currentTempC: Int, nowTs: TimeInterval) -> (updatedSamples: [(timestamp: TimeInterval, tempC: Int)], issue: HealthIssue?, scorePenalty: Int) {
+        var window = samples.filter { (nowTs - $0.timestamp) <= 180.0 && $0.timestamp <= nowTs }
+        window.append((timestamp: nowTs, tempC: currentTempC))
+        guard let minSample = window.min(by: { $0.tempC < $1.tempC }) else {
+            return (window, nil, 0)
+        }
+        let delta = currentTempC - minSample.tempC
+        let dt = max(1.0, nowTs - minSample.timestamp)
+        if delta >= 8 && currentTempC >= 45 {
+            let ratePerMin = Double(delta) / (dt / 60.0)
+            let issue = HealthIssue(
+                code: "TEMP_RAPID_RISE",
+                severity: .warning,
+                title: "Rapid Temperature Spike Detected",
+                detail: String(format: "Drive temperature rose +%d°C in %.0fs (+%.1f°C/min to %d°C).", delta, dt, ratePerMin, currentTempC)
+            )
+            return (window, issue, 10)
+        }
+        return (window, nil, 0)
     }
 
     static func isNonCorruptionVerifyFailure(_ result: String) -> Bool {
@@ -235,6 +257,7 @@ final class DiskHealthMonitor: ObservableObject {
         }
         self.state.lastOverallSeverity = HealthSeverity.healthy.rawValue
         self.state.lastAlertTimestampByCode.removeAll()
+        self.recentTemperatureSamples.removeAll()
         saveStateLocked()
         ConfigManager.shared.log("Persistent baselines and health state reset.")
     }
@@ -380,6 +403,7 @@ final class DiskHealthMonitor: ObservableObject {
         var isReadOnly = false
         var totalBytes: UInt64 = 0
         var freeBytes: UInt64 = 0
+        var purgeableBytes: UInt64 = 0
         var usedBytes: UInt64 = 0
         var usedPercent: Double = 0.0
 
@@ -410,7 +434,21 @@ final class DiskHealthMonitor: ObservableObject {
                     isReadOnly = (sfs.f_flags & UInt32(MNT_RDONLY)) != 0
                     let bsize = UInt64(sfs.f_bsize)
                     totalBytes = UInt64(sfs.f_blocks) * bsize
-                    freeBytes = UInt64(sfs.f_bavail) * bsize
+                    let rawFreeBytes = UInt64(sfs.f_bavail) * bsize
+                    var effectiveFreeBytes = rawFreeBytes
+
+                    let mountURL = URL(fileURLWithPath: mountPoint)
+                    if let vals = try? mountURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+                       let importantFree = vals.volumeAvailableCapacityForImportantUsage,
+                       importantFree > 0 {
+                        let importantU64 = UInt64(importantFree)
+                        if importantU64 > rawFreeBytes && importantU64 <= totalBytes {
+                            purgeableBytes = importantU64 - rawFreeBytes
+                            effectiveFreeBytes = importantU64
+                        }
+                    }
+
+                    freeBytes = effectiveFreeBytes
                     usedBytes = totalBytes > freeBytes ? (totalBytes - freeBytes) : 0
                     usedPercent = totalBytes > 0 ? (Double(usedBytes) / Double(totalBytes) * 100.0) : 0.0
                 }
@@ -655,6 +693,19 @@ final class DiskHealthMonitor: ObservableObject {
                 score -= 15
             }
 
+            if !inWakeGrace && tempC > 0 {
+                let (updatedSamples, spikeIssue, spikePenalty) = DiskHealthMonitor.evaluateThermalSpike(
+                    samples: recentTemperatureSamples[driveKey] ?? [],
+                    currentTempC: tempC,
+                    nowTs: nowTs
+                )
+                recentTemperatureSamples[driveKey] = updatedSamples
+                if let spikeIssue = spikeIssue {
+                    issues.append(spikeIssue)
+                    score -= spikePenalty
+                }
+            }
+
             // Rule 10: Available Spare Blocks & Percentage Used
             let spareThresh = Int(hw.availableSpareThreshold)
             let isSpareDepleted = (spareThresh <= 50 && hw.availableSpare <= hw.availableSpareThreshold) || hw.availableSpare < 10
@@ -823,6 +874,7 @@ final class DiskHealthMonitor: ObservableObject {
             isReadOnly: isReadOnly,
             totalBytes: totalBytes,
             freeBytes: freeBytes,
+            purgeableBytes: purgeableBytes,
             usedBytes: usedBytes,
             usedPercent: usedPercent,
             subpathsStatus: subpathsStatus,
@@ -943,6 +995,8 @@ final class DiskHealthMonitor: ObservableObject {
             // Send Telegram alert
             let htmlMsg = TelegramNotifier.shared.formatReportHTML(snapshot: snapshot, title: alertTitle)
             TelegramNotifier.shared.sendMessageAsync(htmlText: htmlMsg, disableNotification: false)
+            WebhookNotifier.shared.sendWebhookAsync(snapshot: snapshot, title: alertTitle, eventType: "health_alert")
+            executeAlertScriptAsync(snapshot: snapshot, title: alertTitle, eventType: "health_alert")
         } else if prevSeverity != .healthy && snapshot.overallSeverity == .healthy {
             // Recovery notification
             let recoveryTitle = "\(snapshot.productName) RECOVERED — HEALTHY"
@@ -963,6 +1017,8 @@ final class DiskHealthMonitor: ObservableObject {
 
             let msg = TelegramNotifier.shared.formatReportHTML(snapshot: snapshot, title: recoveryTitle)
             TelegramNotifier.shared.sendMessageAsync(htmlText: msg, disableNotification: false)
+            WebhookNotifier.shared.sendWebhookAsync(snapshot: snapshot, title: recoveryTitle, eventType: "health_recovered")
+            executeAlertScriptAsync(snapshot: snapshot, title: recoveryTitle, eventType: "health_recovered")
         }
 
         state.lastOverallSeverity = snapshot.overallSeverity.rawValue
@@ -1146,5 +1202,127 @@ final class DiskHealthMonitor: ObservableObject {
             ), 10)
         }
         return (nil, 0)
+    }
+
+    // MARK: - Custom Alert Script Execution Hook
+    private func executeAlertScriptAsync(snapshot: DiskHealthSnapshot, title: String, eventType: String) {
+        let rawScriptPath = ConfigManager.shared.resolvedAlertScriptPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawScriptPath.isEmpty else { return }
+        let expandedPath = (rawScriptPath as NSString).expandingTildeInPath
+        guard FileManager.default.isExecutableFile(atPath: expandedPath) else {
+            ConfigManager.shared.log("Alert script skipped (not executable): \(expandedPath)")
+            return
+        }
+
+        DispatchQueue.global(qos: .utility).async {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: expandedPath)
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+            var env = ProcessInfo.processInfo.environment
+            env["DISK_HEALTH_EVENT"] = eventType
+            env["DISK_HEALTH_TITLE"] = title
+            env["DISK_HEALTH_SEVERITY"] = snapshot.overallSeverity.rawValue
+            env["DISK_HEALTH_SCORE"] = "\(snapshot.healthScore)"
+            env["DISK_HEALTH_DEVICE"] = "\(snapshot.vendorName) \(snapshot.productName)".trimmingCharacters(in: .whitespaces)
+            env["DISK_HEALTH_BSD_NAME"] = snapshot.bsdName
+            env["DISK_HEALTH_MOUNT_POINT"] = snapshot.mountPoint
+            env["DISK_HEALTH_TEMP_C"] = "\(snapshot.temperatureCelsius)"
+            env["DISK_HEALTH_ISSUES"] = snapshot.issues.map { "[\($0.code)] \($0.title)" }.joined(separator: "; ")
+            proc.environment = env
+
+            do {
+                try proc.run()
+                let pid = proc.processIdentifier
+                let timeoutLock = NSLock()
+                var killWorkItem: DispatchWorkItem?
+                let watchdog = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+                watchdog.schedule(deadline: .now() + 15.0)
+                watchdog.setEventHandler {
+                    if proc.isRunning {
+                        proc.terminate()
+                        let escalation = DispatchWorkItem {
+                            if proc.isRunning && pid > 0 {
+                                kill(pid, SIGKILL)
+                            }
+                        }
+                        timeoutLock.lock()
+                        killWorkItem = escalation
+                        timeoutLock.unlock()
+                        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0, execute: escalation)
+                    }
+                }
+                watchdog.resume()
+                proc.waitUntilExit()
+                watchdog.cancel()
+                timeoutLock.lock()
+                killWorkItem?.cancel()
+                timeoutLock.unlock()
+                ConfigManager.shared.log("Alert script executed (\(expandedPath)): exit=\(proc.terminationStatus)")
+            } catch {
+                ConfigManager.shared.log("Alert script failed to launch (\(expandedPath)): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    // MARK: - Non-Destructive Surface Read Sample Probe
+    func runSurfaceReadScan(maxBytesToScan: UInt64 = 64 * 1024 * 1024) -> (ok: Bool, filesScanned: Int, bytesScanned: UInt64, readErrors: Int, elapsedMs: Double, summary: String) {
+        let snap = self.currentSnapshot ?? self.evaluateHealth(forceCanary: false, allowNotifications: false)
+        guard snap.isMounted, !snap.mountPoint.isEmpty else {
+            return (false, 0, 0, 1, 0.0, "Surface scan aborted: Target volume is not mounted.")
+        }
+
+        let scanRoot = snap.mountPoint == "/" ? "/System/Library/CoreServices" : snap.mountPoint
+        let start = DispatchTime.now()
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(
+            at: URL(fileURLWithPath: scanRoot),
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else {
+            return (false, 0, 0, 1, 0.0, "Surface scan failed: Unable to enumerate \(scanRoot).")
+        }
+
+        var filesScanned = 0
+        var bytesScanned: UInt64 = 0
+        var readErrors = 0
+        let bufSize = 256 * 1024
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: bufSize, alignment: 4096)
+        defer { buffer.deallocate() }
+
+        for case let fileURL as URL in enumerator {
+            if bytesScanned >= maxBytesToScan || filesScanned >= 120 { break }
+            guard let vals = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  vals.isRegularFile == true,
+                  let fSize = vals.fileSize, fSize > 0 else { continue }
+
+            let fd = open(fileURL.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            if fd < 0 { continue }
+            _ = fcntl(fd, F_NOCACHE, 1) // Bypass unified buffer cache to force physical media read
+
+            let toRead = min(bufSize, fSize)
+            let n = read(fd, buffer, toRead)
+            if n < 0 && errno == EIO {
+                readErrors += 1
+            } else if n > 0 {
+                bytesScanned += UInt64(n)
+                filesScanned += 1
+            }
+            close(fd)
+        }
+
+        let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000.0
+        if filesScanned == 0 {
+            let summary = "WARNING: Surface scan completed with 0 readable files sampled on '\(scanRoot)' (insufficient regular files or read permissions)."
+            ConfigManager.shared.log("Surface read scan on '\(scanRoot)': \(summary)")
+            return (false, 0, 0, readErrors, elapsedMs, summary)
+        }
+
+        let ok = (readErrors == 0)
+        let summary = ok
+            ? String(format: "PASSED (%d files, %@ read directly from media in %.1f ms, 0 I/O errors)", filesScanned, formatBytes(bytesScanned), elapsedMs)
+            : String(format: "FAILED (%d physical EIO read errors across %d files)", readErrors, filesScanned)
+        ConfigManager.shared.log("Surface read scan on '\(scanRoot)': \(summary)")
+        return (ok, filesScanned, bytesScanned, readErrors, elapsedMs, summary)
     }
 }

@@ -165,6 +165,7 @@ struct DiskHealthSnapshot: Codable {
     let isReadOnly: Bool
     let totalBytes: UInt64
     let freeBytes: UInt64
+    var purgeableBytes: UInt64 = 0
     let usedBytes: UInt64
     let usedPercent: Double
     let subpathsStatus: [String: Bool]

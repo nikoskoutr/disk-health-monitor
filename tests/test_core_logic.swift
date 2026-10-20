@@ -1409,6 +1409,80 @@ struct CoreLogicTestRunner {
         monitor.resetBaselines()
         print("  [OK] Verification cooldown retention, baseline Verified OK preservation, and volume mount filtering verified")
 
+        print("=== Swift Unit Test 32: Advanced Telemetry & Diagnostics Features (COMP-01 to COMP-06) ===")
+        // 32a. COMP-01: APFS Purgeable Space Accounting
+        let testRootSnap = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        assertTrue(testRootSnap.freeBytes > 0, "Root volume freeBytes must be greater than 0")
+        // Verify purgeable space in diagnostic exporter JSON
+        let diagExport = DiagnosticExporter.shared.generateDiagnosticReport(snapshot: testRootSnap)
+        let fsExport = diagExport["filesystem"] as? [String: Any]
+        assertTrue(fsExport?["purgeableBytes"] != nil, "Diagnostic report filesystem section must include purgeableBytes")
+
+        // 32b. COMP-02: Universal Webhook Payload Formatting & URL Redaction
+        let webhookPayload = WebhookNotifier.buildPayload(snapshot: dummySnap, title: "Webhook Test", eventType: "health_alert")
+        assertTrue((webhookPayload["content"] as? String)?.contains("Webhook Test") == true, "Discord/Mattermost content field must be populated")
+        assertTrue((webhookPayload["text"] as? String)?.contains("Webhook Test") == true, "Slack text field must be populated")
+        assertTrue((webhookPayload["message"] as? String)?.contains("Webhook Test") == true, "ntfy message field must be populated")
+        assertTrue(webhookPayload["healthScore"] as? Int == 85, "healthScore must match snapshot")
+        let redactedHook = WebhookNotifier.redactWebhookUrl("Failed POST to https://discord.com/api/webhooks/12345/secret_token", webhookUrl: "https://discord.com/api/webhooks/12345/secret_token")
+        assertTrue(!redactedHook.contains("secret_token"), "Webhook secret path must be redacted")
+        let redactedQueryHook = WebhookNotifier.redactWebhookUrl("Failed POST to https://api.service.com/notify?token=supersecret99", webhookUrl: "https://api.service.com/notify?token=supersecret99")
+        assertTrue(!redactedQueryHook.contains("supersecret99"), "Webhook query string parameters must be redacted")
+
+        // 32c. COMP-03: Standalone HTML Health & RMA Report Generation
+        let htmlReport = DiagnosticExporter.shared.exportDiagnosticReportHTML(snapshot: dummySnap)
+        assertTrue(htmlReport.contains("<!DOCTYPE html>"), "HTML report must be valid HTML5")
+        assertTrue(htmlReport.contains("&lt;Name&gt;"), "HTML report must escape special characters")
+        assertTrue(htmlReport.contains("TEST_HTML"), "HTML report must include active issue codes")
+        if let htmlSaved = DiagnosticExporter.shared.saveDiagnosticReportHTMLToFile(snapshot: dummySnap) {
+            assertTrue(FileManager.default.fileExists(atPath: htmlSaved), "HTML report file must exist on disk")
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: htmlSaved),
+               let perms = attrs[.posixPermissions] as? NSNumber {
+                assertTrue(perms.intValue == 0o600, "HTML report must have 0600 permissions")
+            }
+            try? FileManager.default.removeItem(atPath: htmlSaved)
+        }
+
+        // 32d. COMP-04: Non-Destructive Surface Read Sample Probe
+        let scanRes = monitor.runSurfaceReadScan(maxBytesToScan: 2 * 1024 * 1024)
+        assertTrue(scanRes.ok == true, "Surface read scan on root volume must succeed with 0 EIO errors")
+        assertTrue(scanRes.filesScanned > 0, "Surface read scan must sample at least 1 file")
+        assertTrue(scanRes.bytesScanned > 0, "Surface read scan must read physical bytes")
+
+        // 32e. COMP-05: Custom Alert Script Execution Hook
+        let tempScriptPath = "\(cfgMgr.configDir)/test_alert_hook.sh"
+        let scriptContent = "#!/bin/sh\nexit 0\n"
+        try? scriptContent.write(toFile: tempScriptPath, atomically: true, encoding: .utf8)
+        _ = chmod(tempScriptPath, 0o755)
+        cfgMgr.updateConfig { $0.alertScriptPath = tempScriptPath }
+        assertTrue(cfgMgr.currentConfig.alertScriptPath == tempScriptPath, "alertScriptPath must be configured")
+        assertTrue(cfgMgr.resolvedAlertScriptPath == tempScriptPath, "resolvedAlertScriptPath must return configured script")
+        setenv("ALERT_SCRIPT_PATH", "/usr/local/bin/custom_hook.sh", 1)
+        assertTrue(cfgMgr.resolvedAlertScriptPath == "/usr/local/bin/custom_hook.sh", "resolvedAlertScriptPath must prioritize ALERT_SCRIPT_PATH environment variable")
+        unsetenv("ALERT_SCRIPT_PATH")
+        cfgMgr.updateConfig { $0.alertScriptPath = "" }
+        try? FileManager.default.removeItem(atPath: tempScriptPath)
+
+        // 32f. COMP-06: Rolling Thermal Spike Detection (TEMP_RAPID_RISE)
+        let baseTs: TimeInterval = 10_000.0
+        let initialSamples: [(timestamp: TimeInterval, tempC: Int)] = [(timestamp: baseTs, tempC: 36)]
+        let (samplesAfterSpike, spikeIssue, spikePenalty) = DiskHealthMonitor.evaluateThermalSpike(
+            samples: initialSamples,
+            currentTempC: 46,
+            nowTs: baseTs + 60.0
+        )
+        assertTrue(samplesAfterSpike.count == 2, "Rolling window must retain recent samples within 180s")
+        assertTrue(spikeIssue?.code == "TEMP_RAPID_RISE", "+10°C rise in 60s to 46°C must trigger TEMP_RAPID_RISE")
+        assertTrue(spikePenalty == 10, "TEMP_RAPID_RISE penalty must be 10")
+
+        let (samplesAfterExpiry, _, _) = DiskHealthMonitor.evaluateThermalSpike(
+            samples: samplesAfterSpike,
+            currentTempC: 47,
+            nowTs: baseTs + 250.0
+        )
+        assertTrue(!samplesAfterExpiry.contains(where: { $0.timestamp == baseTs }), "Sample older than 180s must be evicted from rolling window")
+        print("  [OK] Advanced telemetry & diagnostics features (COMP-01 to COMP-06) verified")
+
         print("✅ All Swift Core Logic Unit Tests Passed!")
     }
 }
