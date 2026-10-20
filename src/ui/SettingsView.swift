@@ -20,6 +20,9 @@ final class SettingsViewModel: ObservableObject {
     @Published var isTestingWebhook: Bool = false
     @Published var webhookTestResult: String? = nil
     @Published var webhookTestSuccess: Bool = false
+    @Published var isTestingAlertScript: Bool = false
+    @Published var alertScriptTestResult: String? = nil
+    @Published var alertScriptTestSuccess: Bool = false
     @Published var isRunningSurfaceScan: Bool = false
     @Published var diagnosticsStatusMsg: String? = nil
 
@@ -245,6 +248,19 @@ final class SettingsViewModel: ObservableObject {
         panel.canChooseFiles = true
         if panel.runModal() == .OK, let url = panel.url {
             ConfigManager.shared.updateConfig { $0.alertScriptPath = url.path }
+        }
+    }
+
+    func runAlertScriptTest() {
+        isTestingAlertScript = true
+        alertScriptTestResult = nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            let res = DiskHealthMonitor.shared.testAlertScript()
+            DispatchQueue.main.async {
+                self.isTestingAlertScript = false
+                self.alertScriptTestSuccess = res.ok
+                self.alertScriptTestResult = res.summary
+            }
         }
     }
 
@@ -1036,7 +1052,34 @@ struct NotificationsSettingsTab: View {
                             Button("Browse...") {
                                 viewModel.browseAlertScriptAction()
                             }
+
+                            Button(action: { viewModel.runAlertScriptTest() }) {
+                                if viewModel.isTestingAlertScript {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                } else {
+                                    Text("Test")
+                                }
+                            }
+                            .disabled(viewModel.isTestingAlertScript || configMgr.config.alertScriptPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
+                    }
+
+                    if let scriptRes = viewModel.alertScriptTestResult {
+                        HStack(alignment: .center, spacing: 8) {
+                            Image(systemName: viewModel.alertScriptTestSuccess ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                .foregroundColor(viewModel.alertScriptTestSuccess ? .green : .red)
+                            Text(scriptRes)
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundColor(viewModel.alertScriptTestSuccess ? .primary : .red)
+                                .lineLimit(3)
+                            Spacer()
+                        }
+                        .padding(8)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill((viewModel.alertScriptTestSuccess ? Color.green : Color.red).opacity(0.12))
+                        )
                     }
                 }
             }

@@ -276,6 +276,23 @@ else
     exit 1
 fi
 
+TEST_HOOK_SCRIPT="${TEST_SANDBOX_DIR}/test_hook.sh"
+TEST_HOOK_LOG="${TEST_SANDBOX_DIR}/test_hook_out.txt"
+cat << EOF > "${TEST_HOOK_SCRIPT}"
+#!/bin/sh
+echo "HOOK_OK event=\${DISK_HEALTH_EVENT} device=\${DISK_HEALTH_DEVICE}" > "${TEST_HOOK_LOG}"
+EOF
+chmod +x "${TEST_HOOK_SCRIPT}"
+HOOK_OUT="$(ALERT_SCRIPT_PATH="${TEST_HOOK_SCRIPT}" "${ROOT_DIR}/disk-health" --test-alert-script 2>&1)"
+if echo "${HOOK_OUT}" | grep -q "Alert script executed successfully" && grep -q "HOOK_OK" "${TEST_HOOK_LOG}"; then
+    echo "  [OK] disk-health --test-alert-script executed hook successfully"
+    rm -f "${TEST_HOOK_SCRIPT}" "${TEST_HOOK_LOG}"
+else
+    echo "  [FAIL] disk-health --test-alert-script failed"
+    echo "${HOOK_OUT}"
+    exit 1
+fi
+
 # 5. Verify Project Assets & Directory Standardization
 echo "--- [5/5] Verifying Directory Layout & AppIcon Bundle Assets ---"
 if [[ -d "${ROOT_DIR}/logs" ]]; then

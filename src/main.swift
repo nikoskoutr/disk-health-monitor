@@ -142,6 +142,12 @@ func parseCommandLine() {
         exit(res.ok ? 0 : 2)
     }
 
+    if args.contains("--test-alert-script") {
+        let (ok, summary) = DiskHealthMonitor.shared.testAlertScript()
+        print(summary)
+        exit(ok ? 0 : 1)
+    }
+
     if args.contains("--list-disks") {
         var devices = [DiskHardwareMetrics](repeating: DiskHardwareMetrics(), count: 32)
         let count = DiskListAllDevices(&devices, 32)
@@ -234,6 +240,9 @@ func parseCommandLine() {
             }
         }
         print("============================================================")
+        if notify {
+            DiskHealthMonitor.shared.waitForPendingNotifications(timeout: 3.0)
+        }
         exit(Int32(snap.overallSeverity.rank))
     }
 
@@ -282,7 +291,7 @@ func isHeadlessCLIMode(args: [String]) -> Bool {
         "--version", "-v", "--help", "-h",
         "--export-config", "--import-config",
         "--export-diagnostics", "--export-html",
-        "--surface-scan", "--list-disks", "--json",
+        "--surface-scan", "--test-alert-script", "--list-disks", "--json",
         "--cli", "--status", "--check", "--watch-mounts", "--deep",
         "--send-report", "--verify", "--verify-volume", "--verify-apfs"
     ]

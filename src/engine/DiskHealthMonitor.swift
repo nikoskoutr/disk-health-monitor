@@ -1214,6 +1214,59 @@ final class DiskHealthMonitor: ObservableObject {
     }
 
     // MARK: - Custom Alert Script Execution Hook
+    private let notificationGroup = DispatchGroup()
+
+    func waitForPendingNotifications(timeout: TimeInterval = 3.0) {
+        _ = notificationGroup.wait(timeout: .now() + timeout)
+    }
+
+    func testAlertScript() -> (ok: Bool, summary: String) {
+        let rawScriptPath = ConfigManager.shared.resolvedAlertScriptPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawScriptPath.isEmpty else {
+            return (false, "No alert script configured. Set alertScriptPath in Settings or via ALERT_SCRIPT_PATH environment variable.")
+        }
+        let expandedPath = (rawScriptPath as NSString).expandingTildeInPath
+        guard FileManager.default.isExecutableFile(atPath: expandedPath) else {
+            return (false, "Alert script is not executable: \(expandedPath)")
+        }
+
+        let snap = self.currentSnapshot ?? self.evaluateHealth(forceCanary: false, allowNotifications: false)
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: expandedPath)
+        let pipeOut = Pipe()
+        proc.standardInput = FileHandle.nullDevice
+        proc.standardOutput = pipeOut
+        proc.standardError = pipeOut
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: "TELEGRAM_BOT_TOKEN")
+        env.removeValue(forKey: "WEBHOOK_URL")
+        env["DISK_HEALTH_EVENT"] = "test_alert"
+        env["DISK_HEALTH_TITLE"] = "\(snap.productName) Alert Script Test"
+        env["DISK_HEALTH_SEVERITY"] = snap.overallSeverity.rawValue
+        env["DISK_HEALTH_SCORE"] = "\(snap.healthScore)"
+        env["DISK_HEALTH_DEVICE"] = "\(snap.vendorName) \(snap.productName)".trimmingCharacters(in: .whitespaces)
+        env["DISK_HEALTH_BSD_NAME"] = snap.bsdName
+        env["DISK_HEALTH_MOUNT_POINT"] = snap.mountPoint
+        env["DISK_HEALTH_TEMP_C"] = "\(snap.temperatureCelsius)"
+        env["DISK_HEALTH_ISSUES"] = snap.issues.map { "[\($0.code)] \($0.title)" }.joined(separator: "; ")
+        proc.environment = env
+
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            let outputData = (try? pipeOut.fileHandleForReading.readToEnd()) ?? Data()
+            let outputStr = String(data: outputData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let outSuffix = outputStr.isEmpty ? "" : "\n\(outputStr)"
+            if proc.terminationStatus == 0 {
+                return (true, "✅ Alert script executed successfully (exit code 0).\(outSuffix)")
+            } else {
+                return (false, "❌ Alert script failed with exit code \(proc.terminationStatus).\(outSuffix)")
+            }
+        } catch {
+            return (false, "❌ Failed to execute alert script: \(error.localizedDescription)")
+        }
+    }
+
     private func executeAlertScriptAsync(snapshot: DiskHealthSnapshot, title: String, eventType: String) {
         let rawScriptPath = ConfigManager.shared.resolvedAlertScriptPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rawScriptPath.isEmpty else { return }
@@ -1223,7 +1276,9 @@ final class DiskHealthMonitor: ObservableObject {
             return
         }
 
+        notificationGroup.enter()
         DispatchQueue.global(qos: .utility).async {
+            defer { self.notificationGroup.leave() }
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: expandedPath)
             proc.standardInput = FileHandle.nullDevice
