@@ -177,11 +177,11 @@ final class ConfigManager: ObservableObject {
         }
 
         // 5. Apply .env configuration (runtime overrides without mutating persisted secrets)
-        let (dotConfig, dotToken, dotChat) = ConfigManager.loadDotEnv(into: initialConfig, configDir: self.configDir)
+        let (dotConfig, dotToken, dotChat, dotWebhook) = ConfigManager.loadDotEnvWithWebhook(into: initialConfig, configDir: self.configDir)
         self.dotEnvTelegramToken = dotToken
         self.dotEnvChatId = dotChat
-        if ConfigManager.isRealSecretToken(dotConfig.webhookUrl) {
-            self.dotEnvWebhookUrl = dotConfig.webhookUrl
+        if let dotWebhook = dotWebhook, ConfigManager.isRealSecretToken(dotWebhook) {
+            self.dotEnvWebhookUrl = dotWebhook
         }
 
         // 6. Apply Environment variables
@@ -272,9 +272,15 @@ final class ConfigManager: ObservableObject {
     }
 
     static func loadDotEnv(into cfg: DiskHealthConfig, configDir: String) -> (DiskHealthConfig, String?, String?) {
+        let (res, tok, chat, _) = loadDotEnvWithWebhook(into: cfg, configDir: configDir)
+        return (res, tok, chat)
+    }
+
+    static func loadDotEnvWithWebhook(into cfg: DiskHealthConfig, configDir: String) -> (DiskHealthConfig, String?, String?, String?) {
         var result = cfg
         var foundToken: String? = nil
         var foundChatId: String? = nil
+        var foundWebhook: String? = nil
         let currentDir = FileManager.default.currentDirectoryPath
         let bundleDir = Bundle.main.bundleURL.deletingLastPathComponent().path
 
@@ -324,6 +330,7 @@ final class ConfigManager: ObservableObject {
                         foundChatId = val
                         result.telegramChatId = val
                     case "WEBHOOK_URL":
+                        foundWebhook = val
                         result.webhookUrl = val
                     case "ALERT_SCRIPT_PATH":
                         result.alertScriptPath = val
@@ -346,7 +353,7 @@ final class ConfigManager: ObservableObject {
             }
             break // Stop after first valid .env file is loaded
         }
-        return (result, foundToken, foundChatId)
+        return (result, foundToken, foundChatId, foundWebhook)
     }
 
     static func applyEnvironmentVariables(into cfg: DiskHealthConfig, env: [String: String] = ProcessInfo.processInfo.environment) -> DiskHealthConfig {

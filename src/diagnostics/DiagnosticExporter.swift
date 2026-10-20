@@ -41,13 +41,15 @@ final class DiagnosticExporter {
         var recentLogLines: [String] = []
         if let logContent = try? String(contentsOfFile: ConfigManager.shared.logFilePath, encoding: .utf8) {
             let token = ConfigManager.shared.resolvedTelegramBotToken
-            let sanitized = TelegramNotifier.redactToken(logContent, token: token)
+            let webhook = ConfigManager.shared.resolvedWebhookUrl
+            let sanitizedToken = TelegramNotifier.redactToken(logContent, token: token)
+            let sanitized = WebhookNotifier.redactWebhookUrl(sanitizedToken, webhookUrl: webhook)
             let allLines = sanitized.components(separatedBy: .newlines).filter { !$0.isEmpty }
             recentLogLines = Array(allLines.suffix(100))
         }
 
         let report: [String: Any] = [
-            "reportVersion": "2.1.0",
+            "reportVersion": kAppVersion,
             "timestamp": isoTimestampFormatter.string(from: Date()),
             "system": [
                 "osVersion": osVersion,
@@ -140,7 +142,9 @@ final class DiagnosticExporter {
                 "enableActiveCanary": cfg.enableActiveCanary,
                 "enableNativeNotifications": cfg.enableNativeNotifications,
                 "telegramBotToken": ConfigManager.shared.resolvedTelegramBotToken.isEmpty ? "None" : "•••••••• (Protected)",
-                "telegramChatId": ConfigManager.shared.resolvedTelegramChatId.isEmpty ? "None" : ConfigManager.shared.resolvedTelegramChatId
+                "telegramChatId": ConfigManager.shared.resolvedTelegramChatId.isEmpty ? "None" : ConfigManager.shared.resolvedTelegramChatId,
+                "webhookUrl": ConfigManager.shared.resolvedWebhookUrl.isEmpty ? "None" : "•••••••• (Protected)",
+                "alertScriptPath": ConfigManager.shared.resolvedAlertScriptPath.isEmpty ? "None" : ConfigManager.shared.resolvedAlertScriptPath
             ],
             "recentLogLines": recentLogLines
         ]

@@ -661,7 +661,7 @@ struct CoreLogicTestRunner {
         assertTrue(!kAppArchitecture.isEmpty, "kAppArchitecture must not be empty")
         assertTrue(!kAppArchShort.isEmpty, "kAppArchShort must not be empty")
         assertTrue(kAppArchShort == "arm64" || kAppArchShort == "x86_64", "kAppArchShort must be either arm64 or x86_64")
-        assertTrue(kAppVersion == "2.1.0", "kAppVersion must match 2.1.0")
+        assertTrue(kAppVersion == "2.2.0", "kAppVersion must match 2.2.0")
 
         let diag = DiagnosticExporter.shared.generateDiagnosticReport()
         guard let sys = diag["system"] as? [String: Any] else {
@@ -1481,6 +1481,22 @@ struct CoreLogicTestRunner {
             nowTs: baseTs + 250.0
         )
         assertTrue(!samplesAfterExpiry.contains(where: { $0.timestamp == baseTs }), "Sample older than 180s must be evicted from rolling window")
+
+        // Verify sub-second duplicate sample suppression
+        let (samplesDedup, _, _) = DiskHealthMonitor.evaluateThermalSpike(
+            samples: samplesAfterExpiry,
+            currentTempC: 47,
+            nowTs: baseTs + 250.5
+        )
+        assertTrue(samplesDedup.count == samplesAfterExpiry.count, "Sub-second identical temperature samples must be deduplicated")
+
+        // Verify DiagnosticExporter redacts webhook URLs from recentLogLines
+        let testHookSecret = "https://discord.com/api/webhooks/99999/super_secret_hook_token"
+        setenv("WEBHOOK_URL", testHookSecret, 1)
+        ConfigManager.shared.log("Simulated webhook failure for \(testHookSecret)")
+        let hookDiagJSON = DiagnosticExporter.shared.exportDiagnosticReportJSON(snapshot: testRootSnap)
+        assertTrue(!hookDiagJSON.contains("super_secret_hook_token"), "Diagnostic JSON must redact webhook secret tokens from recentLogLines")
+        unsetenv("WEBHOOK_URL")
         print("  [OK] Advanced telemetry & diagnostics features (COMP-01 to COMP-06) verified")
 
         print("✅ All Swift Core Logic Unit Tests Passed!")

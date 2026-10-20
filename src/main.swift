@@ -257,6 +257,14 @@ func parseCommandLine() {
     }
 
     // Default: Run macOS Menu Bar GUI App
+    // Always ignore SIGHUP in GUI mode so closing a parent terminal never kills the Menu Bar agent.
+    signal(SIGHUP, SIG_IGN)
+
+    // If launched interactively from a controlling terminal (e.g. user ran ./disk-health or double-clicked
+    // the CLI binary in Finder), detach cleanly into a background session so the terminal does not stay blocked
+    // and closing the terminal never terminates the Menu Bar app.
+    detachFromControllingTerminalIfNeeded()
+
     if !SingleInstanceLock.shared.tryAcquire() {
         ConfigManager.shared.log("Another Menu Bar instance of Disk Health Monitor is already running; exiting duplicate instance cleanly.")
         exit(0)
@@ -268,37 +276,145 @@ func parseCommandLine() {
     app.run()
 }
 
+func isHeadlessCLIMode(args: [String]) -> Bool {
+    let cliFlags: Set<String> = [
+        "--version", "-v", "--help", "-h",
+        "--export-config", "--import-config",
+        "--export-diagnostics", "--export-html",
+        "--surface-scan", "--list-disks", "--json",
+        "--cli", "--status", "--check", "--watch-mounts", "--deep",
+        "--send-report", "--verify", "--verify-volume", "--verify-apfs"
+    ]
+    for arg in args.dropFirst() {
+        if cliFlags.contains(arg) {
+            return true
+        }
+    }
+    return false
+}
+
+func resolveAppBundleExecutableURL() -> (bundleURL: URL, executableURL: URL)? {
+    let rawArg0 = CommandLine.arguments.first ?? ""
+    var candidateExecURL: URL? = nil
+
+    if !rawArg0.isEmpty {
+        if rawArg0.hasPrefix("/") {
+            candidateExecURL = URL(fileURLWithPath: rawArg0)
+        } else {
+            let cwd = FileManager.default.currentDirectoryPath
+            candidateExecURL = URL(fileURLWithPath: cwd).appendingPathComponent(rawArg0)
+        }
+    }
+    if let cand = candidateExecURL, !FileManager.default.fileExists(atPath: cand.path) {
+        candidateExecURL = Bundle.main.executableURL
+    }
+
+    guard let execURL = candidateExecURL else { return nil }
+    let resolvedExec = execURL.resolvingSymlinksInPath().standardizedFileURL
+    let path = resolvedExec.path
+    if let range = path.range(of: ".app/Contents/MacOS/") {
+        let bundlePath = String(path[..<range.upperBound]).replacingOccurrences(of: "/Contents/MacOS/", with: "")
+        let bundleURL = URL(fileURLWithPath: bundlePath)
+        if FileManager.default.isExecutableFile(atPath: path) {
+            return (bundleURL, resolvedExec)
+        }
+    }
+    return nil
+}
+
+func detachFromControllingTerminalIfNeeded() {
+    let env = ProcessInfo.processInfo.environment
+    // Do not detach if already detached, or if managed by launchd, or in test sandbox
+    if env["DISK_HEALTH_DETACHED"] == "1" || env["DISK_HEALTH_NO_DETACH"] == "1" {
+        return
+    }
+    if env["DISK_HEALTH_CONFIG_DIR"] != nil {
+        return
+    }
+    let hasTTY = (isatty(STDIN_FILENO) == 1 || isatty(STDOUT_FILENO) == 1 || isatty(STDERR_FILENO) == 1)
+    guard hasTTY else { return }
+
+    if let (bundleURL, execURL) = resolveAppBundleExecutableURL() {
+        // Spawn a completely independent background process detached from this terminal session
+        var childEnv = env
+        childEnv["DISK_HEALTH_DETACHED"] = "1"
+        childEnv["DISK_HEALTH_REEXEC"] = "1"
+
+        let proc = Process()
+        if FileManager.default.isExecutableFile(atPath: "/usr/bin/open") {
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+            var openArgs = ["-g", "-a", bundleURL.path]
+            let extraArgs = Array(CommandLine.arguments.dropFirst())
+            if !extraArgs.isEmpty {
+                openArgs.append("--args")
+                openArgs.append(contentsOf: extraArgs)
+            }
+            proc.arguments = openArgs
+        } else {
+            proc.executableURL = execURL
+            proc.arguments = Array(CommandLine.arguments.dropFirst())
+        }
+        proc.environment = childEnv
+        proc.standardInput = FileHandle.nullDevice
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            exit(0)
+        } catch {
+            // Fallback to in-process setsid() + /dev/null redirection below
+        }
+    }
+
+    _ = setsid()
+    let devNull = open("/dev/null", O_RDWR)
+    if devNull >= 0 {
+        dup2(devNull, STDIN_FILENO)
+        dup2(devNull, STDOUT_FILENO)
+        dup2(devNull, STDERR_FILENO)
+        if devNull > STDERR_FILENO {
+            close(devNull)
+        }
+    }
+}
+
 func ensureRunningFromAppBundleIfAvailable() {
     guard Bundle.main.bundleIdentifier == nil else { return }
     guard ProcessInfo.processInfo.environment["DISK_HEALTH_REEXEC"] == nil else { return }
+    guard let (bundleURL, execURL) = resolveAppBundleExecutableURL() else { return }
 
-    let rawArg0 = CommandLine.arguments.first ?? ""
-    guard !rawArg0.isEmpty else { return }
+    let resolvedPath = execURL.path
+    let isHeadless = isHeadlessCLIMode(args: CommandLine.arguments)
+    let hasTTY = (isatty(STDIN_FILENO) == 1 || isatty(STDOUT_FILENO) == 1)
 
-    var execURL: URL
-    if rawArg0.hasPrefix("/") {
-        execURL = URL(fileURLWithPath: rawArg0)
-    } else {
-        let cwd = FileManager.default.currentDirectoryPath
-        execURL = URL(fileURLWithPath: cwd).appendingPathComponent(rawArg0)
-    }
-    if !FileManager.default.fileExists(atPath: execURL.path), let bundleExecURL = Bundle.main.executableURL {
-        execURL = bundleExecURL
-    }
-
-    let resolvedPath = execURL.resolvingSymlinksInPath().standardizedFileURL.path
-    if resolvedPath != execURL.standardizedFileURL.path &&
-       resolvedPath.contains(".app/Contents/MacOS/") &&
-       FileManager.default.isExecutableFile(atPath: resolvedPath) {
-        setenv("DISK_HEALTH_REEXEC", "1", 1)
-        var cArgs: [UnsafeMutablePointer<CChar>?] = CommandLine.arguments.enumerated().map { idx, arg in
-            strdup(idx == 0 ? resolvedPath : arg)
+    // If launching GUI Menu Bar mode from a terminal / Finder CLI double-click, hand off to LaunchServices
+    // and exit the terminal parent immediately so no terminal window stays open or linked via SIGHUP.
+    if !isHeadless && hasTTY && ProcessInfo.processInfo.environment["DISK_HEALTH_CONFIG_DIR"] == nil {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        var openArgs = ["-a", bundleURL.path]
+        let extraArgs = Array(CommandLine.arguments.dropFirst())
+        if !extraArgs.isEmpty {
+            openArgs.append("--args")
+            openArgs.append(contentsOf: extraArgs)
         }
-        cArgs.append(nil)
-        execv(resolvedPath, &cArgs)
-        for ptr in cArgs {
-            if let ptr = ptr { free(ptr) }
+        proc.arguments = openArgs
+        proc.standardInput = FileHandle.nullDevice
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        if (try? proc.run()) != nil {
+            exit(0)
         }
+    }
+
+    setenv("DISK_HEALTH_REEXEC", "1", 1)
+    var cArgs: [UnsafeMutablePointer<CChar>?] = CommandLine.arguments.enumerated().map { idx, arg in
+        strdup(idx == 0 ? resolvedPath : arg)
+    }
+    cArgs.append(nil)
+    execv(resolvedPath, &cArgs)
+    for ptr in cArgs {
+        if let ptr = ptr { free(ptr) }
     }
 }
 

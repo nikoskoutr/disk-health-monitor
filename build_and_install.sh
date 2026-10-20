@@ -145,9 +145,9 @@ cat << EOF > "${CONTENTS_DIR}/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.1.0</string>
+    <string>2.2.0</string>
     <key>CFBundleVersion</key>
-    <string>3</string>
+    <string>4</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>
@@ -160,8 +160,11 @@ cat << EOF > "${CONTENTS_DIR}/Info.plist"
 </plist>
 EOF
 
+printf "APPL????" > "${CONTENTS_DIR}/PkgInfo"
+
 # Ad-hoc code sign the bundle so macOS LaunchServices/Gatekeeper trusts it cleanly
 codesign --force --deep --sign - "${APP_BUNDLE}" 2>/dev/null || true
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "${APP_BUNDLE}" 2>/dev/null || true
 
 # 5. Create local CLI wrapper symlink (build output, ignored by git)
 ln -sf "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" "${SCRIPT_DIR}/disk-health"

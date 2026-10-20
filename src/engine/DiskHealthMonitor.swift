@@ -31,7 +31,11 @@ final class DiskHealthMonitor: ObservableObject {
 
     static func evaluateThermalSpike(samples: [(timestamp: TimeInterval, tempC: Int)], currentTempC: Int, nowTs: TimeInterval) -> (updatedSamples: [(timestamp: TimeInterval, tempC: Int)], issue: HealthIssue?, scorePenalty: Int) {
         var window = samples.filter { (nowTs - $0.timestamp) <= 180.0 && $0.timestamp <= nowTs }
-        window.append((timestamp: nowTs, tempC: currentTempC))
+        if let last = window.last, (nowTs - last.timestamp) < 2.0 && last.tempC == currentTempC {
+            // Avoid unbounded sample growth when evaluateHealth is invoked multiple times per second
+        } else {
+            window.append((timestamp: nowTs, tempC: currentTempC))
+        }
         guard let minSample = window.min(by: { $0.tempC < $1.tempC }) else {
             return (window, nil, 0)
         }
@@ -1217,9 +1221,12 @@ final class DiskHealthMonitor: ObservableObject {
         DispatchQueue.global(qos: .utility).async {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: expandedPath)
+            proc.standardInput = FileHandle.nullDevice
             proc.standardOutput = FileHandle.nullDevice
             proc.standardError = FileHandle.nullDevice
             var env = ProcessInfo.processInfo.environment
+            env.removeValue(forKey: "TELEGRAM_BOT_TOKEN")
+            env.removeValue(forKey: "WEBHOOK_URL")
             env["DISK_HEALTH_EVENT"] = eventType
             env["DISK_HEALTH_TITLE"] = title
             env["DISK_HEALTH_SEVERITY"] = snapshot.overallSeverity.rawValue
@@ -1302,8 +1309,11 @@ final class DiskHealthMonitor: ObservableObject {
 
             let toRead = min(bufSize, fSize)
             let n = read(fd, buffer, toRead)
-            if n < 0 && errno == EIO {
-                readErrors += 1
+            if n < 0 {
+                let err = errno
+                if err == EIO || err == ENXIO || err == ETIMEDOUT {
+                    readErrors += 1
+                }
             } else if n > 0 {
                 bytesScanned += UInt64(n)
                 filesScanned += 1
@@ -1321,7 +1331,7 @@ final class DiskHealthMonitor: ObservableObject {
         let ok = (readErrors == 0)
         let summary = ok
             ? String(format: "PASSED (%d files, %@ read directly from media in %.1f ms, 0 I/O errors)", filesScanned, formatBytes(bytesScanned), elapsedMs)
-            : String(format: "FAILED (%d physical EIO read errors across %d files)", readErrors, filesScanned)
+            : String(format: "FAILED (%d physical read errors across %d files)", readErrors, filesScanned)
         ConfigManager.shared.log("Surface read scan on '\(scanRoot)': \(summary)")
         return (ok, filesScanned, bytesScanned, readErrors, elapsedMs, summary)
     }

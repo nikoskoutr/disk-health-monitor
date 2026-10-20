@@ -12,13 +12,17 @@ final class SettingsViewModel: ObservableObject {
     @Published var isUpdatingLaunchAgent: Bool = false
     @Published var botToken: String = ""
     @Published var showToken: Bool = false
+    @Published var webhookUrl: String = ""
+    @Published var showWebhookUrl: Bool = false
     @Published var isTestingTelegram: Bool = false
     @Published var testResult: String? = nil
     @Published var testSuccess: Bool = false
+    @Published var isRunningSurfaceScan: Bool = false
     @Published var diagnosticsStatusMsg: String? = nil
 
     init() {
         self.botToken = ConfigManager.shared.resolvedTelegramBotToken
+        self.webhookUrl = ConfigManager.shared.resolvedWebhookUrl
         refreshDiskList()
         checkLaunchAgent()
     }
@@ -162,6 +166,43 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
+    private var webhookSaveWorkItem: DispatchWorkItem?
+
+    func updateWebhookUrl(_ newValue: String) {
+        self.webhookUrl = newValue
+        webhookSaveWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.commitWebhookUrlNow(newValue)
+        }
+        webhookSaveWorkItem = work
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    func commitWebhookUrlNow(_ val: String) {
+        webhookSaveWorkItem?.cancel()
+        let trimmed = val.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            _ = SecretStore.shared.deleteSecret(forKey: "webhookUrl")
+            ConfigManager.shared.updateConfig { $0.webhookUrl = "" }
+        } else {
+            _ = SecretStore.shared.setSecret(trimmed, forKey: "webhookUrl")
+            ConfigManager.shared.updateConfig { $0.webhookUrl = "REDACTED_IN_KEYCHAIN" }
+        }
+    }
+
+    func runSurfaceScanAction() {
+        guard !isRunningSurfaceScan else { return }
+        isRunningSurfaceScan = true
+        diagnosticsStatusMsg = "Running non-destructive physical media read scan (F_NOCACHE)..."
+        DispatchQueue.global(qos: .userInitiated).async {
+            let res = DiskHealthMonitor.shared.runSurfaceReadScan()
+            DispatchQueue.main.async {
+                self.isRunningSurfaceScan = false
+                self.diagnosticsStatusMsg = res.summary
+            }
+        }
+    }
+
     func runTelegramTest() {
         commitBotTokenNow(botToken)
         isTestingTelegram = true
@@ -203,6 +244,7 @@ final class SettingsViewModel: ObservableObject {
         if panel.runModal() == .OK, let url = panel.url {
             if ConfigManager.shared.importConfigFile(at: url) {
                 self.botToken = ConfigManager.shared.resolvedTelegramBotToken
+                self.webhookUrl = ConfigManager.shared.resolvedWebhookUrl
                 diagnosticsStatusMsg = "Imported configuration from \(url.lastPathComponent)"
             } else {
                 diagnosticsStatusMsg = "Failed to decode configuration file."
@@ -877,14 +919,74 @@ struct NotificationsSettingsTab: View {
                         )
                     }
                 }
+
+                SettingsCard(title: "Webhook & Custom Script Automation", icon: "network", iconColor: .purple) {
+                    HStack(alignment: .center, spacing: 14) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Webhook Endpoint URL")
+                                .font(.system(size: 13, weight: .medium))
+                            Text("Discord, Slack, ntfy, or JSON")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                        }
+                        .frame(width: 175, alignment: .leading)
+
+                        HStack(spacing: 6) {
+                            if viewModel.showWebhookUrl {
+                                TextField("https://discord.com/api/webhooks/...", text: Binding(
+                                    get: { viewModel.webhookUrl },
+                                    set: { val in viewModel.updateWebhookUrl(val) }
+                                ))
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 12, design: .monospaced))
+                            } else {
+                                SecureField("https://...", text: Binding(
+                                    get: { viewModel.webhookUrl },
+                                    set: { val in viewModel.updateWebhookUrl(val) }
+                                ))
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 12, design: .monospaced))
+                            }
+
+                            Button(action: { viewModel.showWebhookUrl.toggle() }) {
+                                Image(systemName: viewModel.showWebhookUrl ? "eye.slash.fill" : "eye.fill")
+                                    .foregroundColor(.secondary)
+                                    .frame(width: 22, height: 22)
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+
+                    Divider()
+
+                    HStack(alignment: .center, spacing: 14) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Alert Hook Script Path")
+                                .font(.system(size: 13, weight: .medium))
+                            Text("Executed on alert / recovery")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                        }
+                        .frame(width: 175, alignment: .leading)
+
+                        TextField("/usr/local/bin/on-disk-alert.sh", text: Binding(
+                            get: { configMgr.config.alertScriptPath },
+                            set: { val in configMgr.updateConfig { $0.alertScriptPath = val } }
+                        ))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12, design: .monospaced))
+                    }
+                }
             }
             .padding(8)
         }
         .onAppear {
             viewModel.botToken = configMgr.resolvedTelegramBotToken
+            viewModel.webhookUrl = configMgr.resolvedWebhookUrl
         }
         .onDisappear {
             viewModel.commitBotTokenNow(viewModel.botToken)
+            viewModel.commitWebhookUrlNow(viewModel.webhookUrl)
         }
     }
 }
@@ -1002,6 +1104,21 @@ struct DiagnosticsAndExportTab: View {
 
                 SettingsCard(title: "State & Baseline Maintenance", icon: "arrow.counterclockwise.circle.fill", iconColor: .orange) {
                     SettingsRow(
+                        title: "Physical Surface Read Sample Scan",
+                        subtitle: "Verify physical media blocks bypassing macOS cache (F_NOCACHE) to detect uncorrectable read errors."
+                    ) {
+                        Button(action: {
+                            viewModel.runSurfaceScanAction()
+                        }) {
+                            Text(viewModel.isRunningSurfaceScan ? "Scanning..." : "Run Surface Scan")
+                                .frame(width: 128)
+                        }
+                        .disabled(viewModel.isRunningSurfaceScan)
+                    }
+
+                    Divider()
+
+                    SettingsRow(
                         title: "Reset Persistent Baselines",
                         subtitle: "Clear recorded peak temperatures, baseline error counters, and alert cooldown timers."
                     ) {
@@ -1056,6 +1173,7 @@ final class SettingsWindowController: NSWindowController {
         SettingsWindowController.sharedVM.refreshDiskList()
         SettingsWindowController.sharedVM.checkLaunchAgent()
         SettingsWindowController.sharedVM.botToken = ConfigManager.shared.resolvedTelegramBotToken
+        SettingsWindowController.sharedVM.webhookUrl = ConfigManager.shared.resolvedWebhookUrl
         guard let window = self.window else { return }
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
