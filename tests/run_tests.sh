@@ -172,7 +172,7 @@ SYMLINK_TARGET="${TEST_SANDBOX_DIR}/symlink_target.txt"
 SYMLINK_LOCK="${DISK_HEALTH_CONFIG_DIR}/menubar.lock"
 echo "CRITICAL_SYSTEM_DATA" > "${SYMLINK_TARGET}"
 ln -sf "${SYMLINK_TARGET}" "${SYMLINK_LOCK}"
-"${ROOT_DIR}/disk-health" --menubar > /dev/null 2>&1 || true
+DISK_HEALTH_NO_DETACH=1 "${ROOT_DIR}/disk-health" --menubar > /dev/null 2>&1 || true
 if [[ "$(cat "${SYMLINK_TARGET}")" == "CRITICAL_SYSTEM_DATA" ]]; then
     echo "  [OK] SingleInstanceLock O_NOFOLLOW symlink protection verified"
 else
@@ -180,6 +180,30 @@ else
     exit 1
 fi
 rm -f "${SYMLINK_LOCK}" "${SYMLINK_TARGET}"
+
+# Verify POSIX_SPAWN_SETSID Terminal detachment: parent must exit 0 immediately without blocking
+DETACH_LOCK="${DISK_HEALTH_CONFIG_DIR}/menubar.lock"
+# Pre-hold the single instance lock in a subshell so the detached child exits cleanly without opening a GUI status bar item during tests
+/usr/bin/python3 -c '
+import fcntl, os, subprocess, sys, time
+lock_path = sys.argv[1]
+bin_path = sys.argv[2]
+fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+env = dict(os.environ)
+env["TERM_PROGRAM"] = "Apple_Terminal"
+env["DISK_HEALTH_FORCE_DETACH_TEST"] = "1"
+t0 = time.time()
+res = subprocess.run([bin_path, "--menubar"], env=env, timeout=3.0)
+dt = time.time() - t0
+assert res.returncode == 0, f"Expected returncode 0, got {res.returncode}"
+assert dt < 2.0, f"Parent did not detach immediately (took {dt:.2f}s)"
+time.sleep(0.2)
+fcntl.flock(fd, fcntl.LOCK_UN)
+os.close(fd)
+' "${DETACH_LOCK}" "${ROOT_DIR}/disk-health"
+rm -f "${DETACH_LOCK}"
+echo "  [OK] POSIX_SPAWN_SETSID Terminal detachment verified (parent exits 0 immediately)"
 
 # 4. Test Export & Import Configuration & Diagnostics
 echo "--- [4/5] Testing Config & Diagnostic Exporters ---"

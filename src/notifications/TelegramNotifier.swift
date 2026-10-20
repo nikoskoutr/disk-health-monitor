@@ -153,12 +153,14 @@ final class TelegramNotifier {
         let mountState = snapshot.isMounted
             ? "✅ Mounted (<code>\(escapeHTML(snapshot.mountPoint))</code>, \(snapshot.isReadOnly ? "⚠️ READ-ONLY" : "R/W"))"
             : "❌ <b>UNMOUNTED / OFFLINE</b>"
+        let purgeableNote = snapshot.purgeableBytes > 0 ? " [Purgeable: \(formatBytes(snapshot.purgeableBytes))]" : ""
         let capacityLine = snapshot.isMounted
-            ? String(format: "%@ used / %@ free (%.1f%% of %@)",
+            ? String(format: "%@ used / %@ free (%.1f%% of %@)%@",
                      formatBytes(snapshot.usedBytes),
                      formatBytes(snapshot.freeBytes),
                      snapshot.usedPercent,
-                     formatBytes(snapshot.totalBytes))
+                     formatBytes(snapshot.totalBytes),
+                     purgeableNote)
             : "N/A"
         let smartTemp = snapshot.smartValid ? "\(snapshot.temperatureCelsius)°C (Peak: \(snapshot.peakTemperatureCelsius)°C)" : "N/A"
         let smartLife = snapshot.smartValid ? "\(snapshot.lifeRemainingPercent)% remaining (Spare: \(snapshot.availableSpare)%)" : "N/A"

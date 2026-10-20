@@ -206,8 +206,9 @@ func parseCommandLine() {
         print("  Serial Number  : \(snap.serialNumber.isEmpty ? "N/A" : snap.serialNumber)")
         print("  Mount Status   : \(snap.isMounted ? "Mounted at \(snap.mountPoint) (\(snap.isReadOnly ? "READ-ONLY" : "R/W")) [\(snap.filesystemType)]" : "UNMOUNTED")")
         if snap.isMounted {
-            print(String(format: "  Capacity       : %@ used / %@ free (%.1f%% of %@)",
-                         formatBytes(snap.usedBytes), formatBytes(snap.freeBytes), snap.usedPercent, formatBytes(snap.totalBytes)))
+            let purgeableSuffix = snap.purgeableBytes > 0 ? " [Purgeable: \(formatBytes(snap.purgeableBytes))]" : ""
+            print(String(format: "  Capacity       : %@ used / %@ free (%.1f%% of %@)%@",
+                         formatBytes(snap.usedBytes), formatBytes(snap.freeBytes), snap.usedPercent, formatBytes(snap.totalBytes), purgeableSuffix))
         }
         if snap.smartValid {
             let cfg = ConfigManager.shared.currentConfig
@@ -322,47 +323,87 @@ func resolveAppBundleExecutableURL() -> (bundleURL: URL, executableURL: URL)? {
     return nil
 }
 
+func spawnDetachedSessionProcess(executablePath: String, arguments: [String], environment: [String: String]) -> Bool {
+    var fileActions: posix_spawn_file_actions_t? = nil
+    var attr: posix_spawnattr_t? = nil
+    guard posix_spawn_file_actions_init(&fileActions) == 0 else { return false }
+    defer { posix_spawn_file_actions_destroy(&fileActions) }
+    guard posix_spawnattr_init(&attr) == 0 else { return false }
+    defer { posix_spawnattr_destroy(&attr) }
+
+    // Create a brand-new POSIX session (setsid) in the child so it has no controlling terminal
+    // and cannot receive SIGHUP/SIGTERM when the parent Terminal window is closed or killed.
+    _ = posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSID))
+
+    _ = posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
+    _ = posix_spawn_file_actions_addopen(&fileActions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)
+    _ = posix_spawn_file_actions_addopen(&fileActions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
+
+    var argvStrings = [executablePath]
+    if arguments.count > 1 {
+        argvStrings.append(contentsOf: arguments.dropFirst())
+    }
+    var cArgs: [UnsafeMutablePointer<CChar>?] = argvStrings.map { strdup($0) }
+    cArgs.append(nil)
+    defer {
+        for ptr in cArgs {
+            if let ptr = ptr { free(ptr) }
+        }
+    }
+
+    var envStrings: [String] = []
+    for (k, v) in environment {
+        envStrings.append("\(k)=\(v)")
+    }
+    var cEnv: [UnsafeMutablePointer<CChar>?] = envStrings.map { strdup($0) }
+    cEnv.append(nil)
+    defer {
+        for ptr in cEnv {
+            if let ptr = ptr { free(ptr) }
+        }
+    }
+
+    var childPid: pid_t = 0
+    let spawnRes = executablePath.withCString { execCStr in
+        posix_spawn(&childPid, execCStr, &fileActions, &attr, &cArgs, &cEnv)
+    }
+    return (spawnRes == 0 && childPid > 0)
+}
+
 func detachFromControllingTerminalIfNeeded() {
     let env = ProcessInfo.processInfo.environment
-    // Do not detach if already detached, or if managed by launchd, or in test sandbox
+    // Do not detach if already detached, or if explicitly disabled, or in test sandbox
     if env["DISK_HEALTH_DETACHED"] == "1" || env["DISK_HEALTH_NO_DETACH"] == "1" {
         return
     }
-    if env["DISK_HEALTH_CONFIG_DIR"] != nil {
+    if env["DISK_HEALTH_CONFIG_DIR"] != nil && env["DISK_HEALTH_FORCE_DETACH_TEST"] != "1" {
         return
     }
-    let hasTTY = (isatty(STDIN_FILENO) == 1 || isatty(STDOUT_FILENO) == 1 || isatty(STDERR_FILENO) == 1)
-    guard hasTTY else { return }
 
-    if let (bundleURL, execURL) = resolveAppBundleExecutableURL() {
-        // Spawn a completely independent background process detached from this terminal session
+    let hasTTY = (isatty(STDIN_FILENO) == 1 || isatty(STDOUT_FILENO) == 1 || isatty(STDERR_FILENO) == 1)
+    let hasTermEnv = (env["TERM_PROGRAM"] != nil || env["TERM"] != nil || env["SSH_TTY"] != nil)
+    guard hasTTY || hasTermEnv else { return }
+
+    let targetExecPath: String
+    if let (_, execURL) = resolveAppBundleExecutableURL() {
+        targetExecPath = execURL.path
+    } else if let bundleExec = Bundle.main.executableURL?.resolvingSymlinksInPath().path {
+        targetExecPath = bundleExec
+    } else {
+        targetExecPath = CommandLine.arguments.first ?? ""
+    }
+
+    if !targetExecPath.isEmpty && FileManager.default.isExecutableFile(atPath: targetExecPath) {
         var childEnv = env
         childEnv["DISK_HEALTH_DETACHED"] = "1"
         childEnv["DISK_HEALTH_REEXEC"] = "1"
+        childEnv.removeValue(forKey: "TERM")
+        childEnv.removeValue(forKey: "TERM_PROGRAM")
+        childEnv.removeValue(forKey: "TERM_PROGRAM_VERSION")
+        childEnv.removeValue(forKey: "TERM_SESSION_ID")
 
-        let proc = Process()
-        if FileManager.default.isExecutableFile(atPath: "/usr/bin/open") {
-            proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            var openArgs = ["-g", "-a", bundleURL.path]
-            let extraArgs = Array(CommandLine.arguments.dropFirst())
-            if !extraArgs.isEmpty {
-                openArgs.append("--args")
-                openArgs.append(contentsOf: extraArgs)
-            }
-            proc.arguments = openArgs
-        } else {
-            proc.executableURL = execURL
-            proc.arguments = Array(CommandLine.arguments.dropFirst())
-        }
-        proc.environment = childEnv
-        proc.standardInput = FileHandle.nullDevice
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
-        do {
-            try proc.run()
-            exit(0)
-        } catch {
-            // Fallback to in-process setsid() + /dev/null redirection below
+        if spawnDetachedSessionProcess(executablePath: targetExecPath, arguments: CommandLine.arguments, environment: childEnv) {
+            _exit(0)
         }
     }
 
@@ -379,42 +420,46 @@ func detachFromControllingTerminalIfNeeded() {
 }
 
 func ensureRunningFromAppBundleIfAvailable() {
-    guard Bundle.main.bundleIdentifier == nil else { return }
-    guard ProcessInfo.processInfo.environment["DISK_HEALTH_REEXEC"] == nil else { return }
-    guard let (bundleURL, execURL) = resolveAppBundleExecutableURL() else { return }
+    let env = ProcessInfo.processInfo.environment
+    guard env["DISK_HEALTH_REEXEC"] == nil else { return }
+    guard let (_, execURL) = resolveAppBundleExecutableURL() else { return }
 
     let resolvedPath = execURL.path
+    let rawArg0 = CommandLine.arguments.first ?? ""
+    let arg0Standardized = URL(fileURLWithPath: rawArg0.hasPrefix("/") ? rawArg0 : "\(FileManager.default.currentDirectoryPath)/\(rawArg0)").standardizedFileURL.path
+    let isInvokedViaSymlinkOrNonBundlePath = (arg0Standardized != resolvedPath)
+
     let isHeadless = isHeadlessCLIMode(args: CommandLine.arguments)
-    let hasTTY = (isatty(STDIN_FILENO) == 1 || isatty(STDOUT_FILENO) == 1)
+    let hasTTY = (isatty(STDIN_FILENO) == 1 || isatty(STDOUT_FILENO) == 1 || isatty(STDERR_FILENO) == 1)
+    let hasTermEnv = (env["TERM_PROGRAM"] != nil || env["TERM"] != nil)
 
-    // If launching GUI Menu Bar mode from a terminal / Finder CLI double-click, hand off to LaunchServices
-    // and exit the terminal parent immediately so no terminal window stays open or linked via SIGHUP.
-    if !isHeadless && hasTTY && ProcessInfo.processInfo.environment["DISK_HEALTH_CONFIG_DIR"] == nil {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        var openArgs = ["-a", bundleURL.path]
-        let extraArgs = Array(CommandLine.arguments.dropFirst())
-        if !extraArgs.isEmpty {
-            openArgs.append("--args")
-            openArgs.append(contentsOf: extraArgs)
-        }
-        proc.arguments = openArgs
-        proc.standardInput = FileHandle.nullDevice
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
-        if (try? proc.run()) != nil {
-            exit(0)
+    // If launching GUI Menu Bar mode from a terminal or via the disk-health symlink,
+    // immediately spawn a detached session process (POSIX_SPAWN_SETSID) and exit the parent.
+    if !isHeadless && (hasTTY || hasTermEnv || isInvokedViaSymlinkOrNonBundlePath) &&
+       (env["DISK_HEALTH_CONFIG_DIR"] == nil || env["DISK_HEALTH_FORCE_DETACH_TEST"] == "1") {
+        var childEnv = env
+        childEnv["DISK_HEALTH_DETACHED"] = "1"
+        childEnv["DISK_HEALTH_REEXEC"] = "1"
+        childEnv.removeValue(forKey: "TERM")
+        childEnv.removeValue(forKey: "TERM_PROGRAM")
+        childEnv.removeValue(forKey: "TERM_PROGRAM_VERSION")
+        childEnv.removeValue(forKey: "TERM_SESSION_ID")
+
+        if spawnDetachedSessionProcess(executablePath: resolvedPath, arguments: CommandLine.arguments, environment: childEnv) {
+            _exit(0)
         }
     }
 
-    setenv("DISK_HEALTH_REEXEC", "1", 1)
-    var cArgs: [UnsafeMutablePointer<CChar>?] = CommandLine.arguments.enumerated().map { idx, arg in
-        strdup(idx == 0 ? resolvedPath : arg)
-    }
-    cArgs.append(nil)
-    execv(resolvedPath, &cArgs)
-    for ptr in cArgs {
-        if let ptr = ptr { free(ptr) }
+    if Bundle.main.bundleIdentifier == nil || isInvokedViaSymlinkOrNonBundlePath {
+        setenv("DISK_HEALTH_REEXEC", "1", 1)
+        var cArgs: [UnsafeMutablePointer<CChar>?] = CommandLine.arguments.enumerated().map { idx, arg in
+            strdup(idx == 0 ? resolvedPath : arg)
+        }
+        cArgs.append(nil)
+        execv(resolvedPath, &cArgs)
+        for ptr in cArgs {
+            if let ptr = ptr { free(ptr) }
+        }
     }
 }
 

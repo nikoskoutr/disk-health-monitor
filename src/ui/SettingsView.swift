@@ -17,6 +17,9 @@ final class SettingsViewModel: ObservableObject {
     @Published var isTestingTelegram: Bool = false
     @Published var testResult: String? = nil
     @Published var testSuccess: Bool = false
+    @Published var isTestingWebhook: Bool = false
+    @Published var webhookTestResult: String? = nil
+    @Published var webhookTestSuccess: Bool = false
     @Published var isRunningSurfaceScan: Bool = false
     @Published var diagnosticsStatusMsg: String? = nil
 
@@ -216,6 +219,32 @@ final class SettingsViewModel: ObservableObject {
                 self.testSuccess = success
                 self.testResult = message
             }
+        }
+    }
+
+    func runWebhookTest() {
+        commitWebhookUrlNow(webhookUrl)
+        isTestingWebhook = true
+        webhookTestResult = nil
+        let targetUrl = webhookUrl
+
+        WebhookNotifier.shared.sendTestWebhook(webhookUrl: targetUrl) { success, message in
+            DispatchQueue.main.async {
+                self.isTestingWebhook = false
+                self.webhookTestSuccess = success
+                self.webhookTestResult = message
+            }
+        }
+    }
+
+    func browseAlertScriptAction() {
+        let panel = NSOpenPanel()
+        panel.title = "Select Executable Alert Script"
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        if panel.runModal() == .OK, let url = panel.url {
+            ConfigManager.shared.updateConfig { $0.alertScriptPath = url.path }
         }
     }
 
@@ -954,7 +983,34 @@ struct NotificationsSettingsTab: View {
                                     .frame(width: 22, height: 22)
                             }
                             .buttonStyle(.borderless)
+
+                            Button(action: { viewModel.runWebhookTest() }) {
+                                if viewModel.isTestingWebhook {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                } else {
+                                    Text("Test")
+                                }
+                            }
+                            .disabled(viewModel.isTestingWebhook || viewModel.webhookUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
+                    }
+
+                    if let hookRes = viewModel.webhookTestResult {
+                        HStack(alignment: .center, spacing: 8) {
+                            Image(systemName: viewModel.webhookTestSuccess ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                .foregroundColor(viewModel.webhookTestSuccess ? .green : .red)
+                            Text(hookRes)
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundColor(viewModel.webhookTestSuccess ? .primary : .red)
+                                .lineLimit(2)
+                            Spacer()
+                        }
+                        .padding(8)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill((viewModel.webhookTestSuccess ? Color.green : Color.red).opacity(0.12))
+                        )
                     }
 
                     Divider()
@@ -969,12 +1025,18 @@ struct NotificationsSettingsTab: View {
                         }
                         .frame(width: 175, alignment: .leading)
 
-                        TextField("/usr/local/bin/on-disk-alert.sh", text: Binding(
-                            get: { configMgr.config.alertScriptPath },
-                            set: { val in configMgr.updateConfig { $0.alertScriptPath = val } }
-                        ))
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 12, design: .monospaced))
+                        HStack(spacing: 6) {
+                            TextField("/usr/local/bin/on-disk-alert.sh", text: Binding(
+                                get: { configMgr.config.alertScriptPath },
+                                set: { val in configMgr.updateConfig { $0.alertScriptPath = val } }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 12, design: .monospaced))
+
+                            Button("Browse...") {
+                                viewModel.browseAlertScriptAction()
+                            }
+                        }
                     }
                 }
             }

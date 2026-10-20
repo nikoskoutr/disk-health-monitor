@@ -145,11 +145,13 @@ cat << EOF > "${CONTENTS_DIR}/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.2.0</string>
+    <string>2.2.1</string>
     <key>CFBundleVersion</key>
-    <string>4</string>
+    <string>5</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
@@ -162,9 +164,22 @@ EOF
 
 printf "APPL????" > "${CONTENTS_DIR}/PkgInfo"
 
-# Ad-hoc code sign the bundle so macOS LaunchServices/Gatekeeper trusts it cleanly
+# Strip any quarantine attributes and ad-hoc code sign the bundle so macOS LaunchServices trusts it cleanly
+xattr -cr "${APP_BUNDLE}" 2>/dev/null || true
 codesign --force --deep --sign - "${APP_BUNDLE}" 2>/dev/null || true
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "${APP_BUNDLE}" 2>/dev/null || true
+
+# If a copy of DiskHealthMonitor.app exists in /Applications or ~/Applications, keep it in sync so Spotlight/Launchpad never launches a stale build
+for DEST_APP_DIR in "/Applications" "${HOME}/Applications"; do
+    if [[ -d "${DEST_APP_DIR}/${APP_NAME}.app" ]] && [[ -w "${DEST_APP_DIR}" ]]; then
+        rm -rf "${DEST_APP_DIR}/${APP_NAME}.app"
+        cp -R "${APP_BUNDLE}" "${DEST_APP_DIR}/${APP_NAME}.app"
+        xattr -cr "${DEST_APP_DIR}/${APP_NAME}.app" 2>/dev/null || true
+        codesign --force --deep --sign - "${DEST_APP_DIR}/${APP_NAME}.app" 2>/dev/null || true
+        /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "${DEST_APP_DIR}/${APP_NAME}.app" 2>/dev/null || true
+        echo "🔄 Synced updated ${APP_NAME}.app to ${DEST_APP_DIR}/${APP_NAME}.app"
+    fi
+done
 
 # 5. Create local CLI wrapper symlink (build output, ignored by git)
 ln -sf "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" "${SCRIPT_DIR}/disk-health"

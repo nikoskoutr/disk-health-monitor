@@ -661,7 +661,7 @@ struct CoreLogicTestRunner {
         assertTrue(!kAppArchitecture.isEmpty, "kAppArchitecture must not be empty")
         assertTrue(!kAppArchShort.isEmpty, "kAppArchShort must not be empty")
         assertTrue(kAppArchShort == "arm64" || kAppArchShort == "x86_64", "kAppArchShort must be either arm64 or x86_64")
-        assertTrue(kAppVersion == "2.2.0", "kAppVersion must match 2.2.0")
+        assertTrue(kAppVersion == "2.2.1", "kAppVersion must match 2.2.1")
 
         let diag = DiagnosticExporter.shared.generateDiagnosticReport()
         guard let sys = diag["system"] as? [String: Any] else {
@@ -1497,6 +1497,12 @@ struct CoreLogicTestRunner {
         let hookDiagJSON = DiagnosticExporter.shared.exportDiagnosticReportJSON(snapshot: testRootSnap)
         assertTrue(!hookDiagJSON.contains("super_secret_hook_token"), "Diagnostic JSON must redact webhook secret tokens from recentLogLines")
         unsetenv("WEBHOOK_URL")
+
+        // Verify TelegramNotifier includes Purgeable space note when purgeableBytes > 0
+        var snapWithPurgeable = dummySnap
+        snapWithPurgeable.purgeableBytes = 5_000_000_000
+        let tgHtmlWithPurgeable = TelegramNotifier.shared.formatReportHTML(snapshot: snapWithPurgeable, title: "Purgeable Check")
+        assertTrue(tgHtmlWithPurgeable.contains("Purgeable: 5.0 GB"), "Telegram HTML report must display purgeable space when > 0")
         print("  [OK] Advanced telemetry & diagnostics features (COMP-01 to COMP-06) verified")
 
         print("✅ All Swift Core Logic Unit Tests Passed!")

@@ -132,4 +132,44 @@ final class WebhookNotifier {
         }
         task.resume()
     }
+
+    func sendTestWebhook(webhookUrl: String, completion: @escaping (Bool, String) -> Void) {
+        let trimmed = webhookUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              (scheme == "https" || scheme == "http") else {
+            completion(false, "Please enter a valid HTTP/HTTPS Webhook URL.")
+            return
+        }
+
+        let snap = DiskHealthMonitor.shared.currentSnapshot ?? DiskHealthMonitor.shared.evaluateHealth(forceCanary: false, allowNotifications: false)
+        let payload = WebhookNotifier.buildPayload(snapshot: snap, title: "Disk Health Monitor Webhook Test", eventType: "test_alert")
+        guard let body = try? JSONSerialization.data(withJSONObject: payload) else {
+            completion(false, "Failed to serialize webhook JSON payload.")
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+
+        let task = session.dataTask(with: request) { data, response, error in
+            if let error = error {
+                let safeErr = WebhookNotifier.redactWebhookUrl(error.localizedDescription, webhookUrl: trimmed)
+                completion(false, safeErr)
+                return
+            }
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if (200...299).contains(statusCode) {
+                completion(true, "Webhook test payload delivered (HTTP \(statusCode))!")
+            } else {
+                let rawResp = data.flatMap { String(data: $0, encoding: .utf8) } ?? "HTTP \(statusCode)"
+                let safeResp = WebhookNotifier.redactWebhookUrl(rawResp, webhookUrl: trimmed)
+                completion(false, "HTTP \(statusCode): \(safeResp)")
+            }
+        }
+        task.resume()
+    }
 }

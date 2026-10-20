@@ -115,6 +115,11 @@ final class DiskHealthMonitor: ObservableObject {
                         migrated = true
                     }
                 }
+                if d.lastVerifyResult == "Not run yet" && d.lastVerifyTimestamp > 0 {
+                    d.lastVerifyTimestamp = 0
+                    decoded.drives[k] = d
+                    migrated = true
+                }
             }
             if decoded.lastAlertTimestampByCode.removeValue(forKey: "VOLUME_VERIFY_FAILED") != nil {
                 migrated = true
