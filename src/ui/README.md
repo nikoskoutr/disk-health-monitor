@@ -37,7 +37,7 @@ Renders the visual telemetry popover card in the status bar menu:
 ---
 
 ### 3. [`SettingsView.swift`](SettingsView.swift)
-Implements the 5-tab native macOS Preferences window (`⌘,`, 680×650 pt):
+Implements the 5-tab native macOS Preferences window (`⌘,`, 700×650 pt):
 
 1. **General Tab**:
    - Drive selector (mounted volumes, physical BSD devices, or automatic detection).

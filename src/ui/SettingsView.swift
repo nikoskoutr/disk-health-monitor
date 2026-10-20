@@ -520,21 +520,23 @@ struct SettingsView: View {
     var body: some View {
         VStack(spacing: 0) {
             // Custom Native-Style Toolbar Tab Switcher (avoids macOS NSTabView label squishing)
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 ForEach(tabs, id: \.tag) { tab in
                     let isSelected = (viewModel.selectedTab == tab.tag)
                     Button(action: {
                         viewModel.selectedTab = tab.tag
                     }) {
-                        HStack(spacing: 6) {
+                        HStack(spacing: 5) {
                             Image(systemName: tab.icon)
-                                .font(.system(size: 12.5, weight: .semibold))
+                                .font(.system(size: 12, weight: .semibold))
                             Text(tab.title)
-                                .font(.system(size: 12.5, weight: isSelected ? .semibold : .medium))
+                                .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
                         }
                         .foregroundColor(isSelected ? .white : .primary)
                         .padding(.vertical, 7)
-                        .padding(.horizontal, 14)
+                        .padding(.horizontal, 8)
                         .frame(maxWidth: .infinity)
                         .background(
                             RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -544,7 +546,7 @@ struct SettingsView: View {
                     .buttonStyle(.plain)
                 }
             }
-            .padding(.horizontal, 20)
+            .padding(.horizontal, 16)
             .padding(.top, 14)
             .padding(.bottom, 10)
 
@@ -569,7 +571,7 @@ struct SettingsView: View {
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
-        .frame(width: 680, height: 650)
+        .frame(width: 700, height: 650)
     }
 }
 
@@ -1576,7 +1578,8 @@ final class SettingsWindowController: NSWindowController {
         let window = NSWindow(contentViewController: hostingController)
         window.title = "Disk Health Monitor Settings"
         window.styleMask = [.titled, .closable, .miniaturizable]
-        window.setContentSize(NSSize(width: 680, height: 650))
+        window.setContentSize(NSSize(width: 700, height: 650))
+        window.minSize = NSSize(width: 700, height: 650)
         window.center()
         window.isReleasedWhenClosed = false
         self.init(window: window)
