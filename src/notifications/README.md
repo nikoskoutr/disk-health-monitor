@@ -1,23 +1,31 @@
 # Notification Dispatchers (`src/notifications/`)
 
-This directory contains the notification dispatchers responsible for delivering real-time disk health alerts and recovery notifications through native macOS Notification Center and the Telegram Bot API.
+This directory contains alert dispatchers delivering real-time disk health notifications and recovery alerts across desktop and remote channels.
 
 ---
 
 ## Files
 
 ### 1. [`MacOSNotifier.swift`](MacOSNotifier.swift)
-Delivers native desktop notifications on macOS:
-- **Native Bundle Engine (`UNUserNotificationCenter`)**:
-  - `main.swift` automatically resolves symlink invocations (`./disk-health`) into `DiskHealthMonitor.app/Contents/MacOS/DiskHealthMonitor` so the process always runs with its native `CFBundleIdentifier` (`io.github.disk-health-monitor`).
-  - Requests `.alert`, `.sound`, and `.badge` authorization and dispatches `UNMutableNotificationContent` notifications with per-drive deduplication identifiers (`disk-health-alert-<driveKey>`) when enabled in `DiskHealthConfig`.
-  - Never invokes AppleScript or Script Editor, preventing third-party script popup attribution.
+Delivers native macOS alerts via **UserNotifications (`UNUserNotificationCenter`)**:
+- Uses the application bundle identifier (`io.github.disk-health-monitor`). Symlink invocations automatically resolve into the parent `.app` bundle.
+- Requests `.alert`, `.sound`, and `.badge` permissions.
+- Deduplicates active notifications per drive using unique identifiers (`disk-health-alert-<driveKey>`), preventing Notification Center clutter.
+- Never invokes `osascript` or Script Editor, guaranteeing clean native notifications.
 
 ### 2. [`TelegramNotifier.swift`](TelegramNotifier.swift)
-Delivers formatted HTML alerts to a Telegram chat or channel via `https://api.telegram.org/bot<token>/sendMessage`:
-- **Shared Ephemeral Session**: Uses a dedicated single `URLSession` with 15-second request/resource timeouts to prevent socket and thread leaks across long-running menu bar sessions.
-- **HTML Escaping (`escapeHTML`)**: Escapes `&`, `<`, and `>` in all dynamic drive names, mount paths, and issue descriptions so special characters never break Telegram's `parse_mode: "HTML"` parser.
-- **Rich Alert Formatting (`sendAlert`)**:
-  - Includes severity emoji (`🚨` Critical, `⚠️` Warning, `✅` Healthy/Recovered), drive identity, serial number, connection speed, temperature, free space, SMART status, and detailed issue bullets.
-- **Live Verification (`sendTestMessage`)**:
-  - Invoked by the **"Send Test Telegram Message"** button in the Settings (`Cmd+,`) window (`Notifications` tab) to verify bot token and chat ID connectivity asynchronously without blocking the UI thread.
+Sends formatted HTML alerts to a Telegram chat or channel:
+- **Shared Ephemeral Session**: Single `URLSession` with 15-second timeouts preventing socket leaks.
+- **HTML Escaping**: Escapes `&`, `<`, and `>` across all dynamic volume paths, device names, and error strings.
+- **Rich Formatting**: Includes severity badges (`🚨`, `⚠️`, `✅`), drive identity, transport speed, temperature, free space, and active issues.
+- **Credential Protection**: Redacts bot tokens from all network failure logs.
+
+### 3. [`WebhookNotifier.swift`](WebhookNotifier.swift)
+Delivers alerts to multi-platform webhook endpoints:
+- **Broad Compatibility**: Formats payloads dynamically for **Discord**, **Slack**, **Mattermost**, **Home Assistant**, or generic JSON endpoints.
+- **Sanitized Logging**: Automatically masks webhook URLs and credentials in runtime logs.
+- **Non-Blocking**: Asynchronous dispatch with 15-second request timeouts and connectivity testing from the Settings UI.
+
+### 4. Audio Beeps & Script Hooks
+- **Audible Alerts**: When `enableCriticalSoundAlert` is enabled, triggers an immediate system audio beep (`NSSound.beep()`) upon entering a critical health state.
+- **Custom Shell Hook**: When `alertScriptPath` is configured, executes an external shell script or binary asynchronously with a 15-second watchdog timer, passing issue parameters via environment variables.

@@ -1,6 +1,6 @@
 # Health Evaluation Engine (`src/engine/`)
 
-This directory contains the core hardware and filesystem evaluation engine (`DiskHealthMonitor`) that orchestrates telemetry collection, active canary write testing, volume verification (`diskutil verifyVolume`), the 12-rule health evaluation pipeline, per-drive state persistence, and alert cooldown management.
+This directory contains the central monitoring engine (`DiskHealthMonitor`) that orchestrates hardware telemetry collection, active canary write probes, multi-tier surface read scans, deep filesystem verification, the 12-rule health evaluation pipeline, and stateful alert cooldowns.
 
 ---
 
@@ -8,40 +8,47 @@ This directory contains the core hardware and filesystem evaluation engine (`Dis
 
 ### [`DiskHealthMonitor.swift`](DiskHealthMonitor.swift)
 
-#### 1. Concurrency & Synchronization
-- Synchronizes all engine operations, snapshot reads, per-drive state mutations, and baseline resets with an internal `engineLock` (`NSRecursiveLock`).
-- Serializes state file persistence (`logs/state.json`) and snapshot publishing (`logs/latest_status.json`) safely across concurrent background timer iterations and main UI updates.
+#### 1. Concurrency & Sleep/Wake Lifecycle
+- All state reads, telemetry evaluations, baseline updates, and file updates are synchronized via an internal `engineLock` (`NSRecursiveLock`).
+- Observes `NSWorkspace.willSleepNotification` and `didWakeNotification`: pauses background evaluation during sleep and applies an 8-second dark-wake settle grace period on wake before querying external storage buses.
 
-#### 2. Active Canary I/O Probe (`runCanaryCheck` / `performSingleCanaryPass`)
-- For mounted writable volumes, writes a unique verification payload to `<mountPath>/.disk_health_canary_<uid>` with POSIX flags `O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC` and permissions `0600`, with a 50ms settle retry pass on transient external bus hiccups.
-- Forces an `fsync()` to ensure data reaches physical media, reads the payload back to verify byte integrity, safely removes the temporary file, and records round-trip latency (`canaryLatencyMs`).
-- When evaluating the sealed macOS APFS system root (`/`), targets the writable user data volume backing path at `/System/Volumes/Data/private/tmp`.
+#### 2. Active Canary I/O Probe
+- On mounted writable volumes, writes a unique probe payload to `<mountPath>/.disk_health_canary_<uid>` with POSIX flags `O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC` and permissions `0600`.
+- Forces an `fsync(2)` to reach physical media, verifies data integrity on read-back, unlinks the probe, and measures round-trip latency (`canaryLatencyMs`).
+- Features a 50 ms settle retry on transient external bus hiccups and directs probes to `/System/Volumes/Data/private/tmp` when monitoring the sealed APFS root (`/`).
 
-#### 3. Deep Filesystem Verification (`runVolumeVerification`)
-- When invoked with `--deep` (or **"Verify Volume"** in the UI / digest dispatches), executes `/usr/sbin/diskutil verifyVolume <target>`.
-- Atomically captures target path and `driveKey` under `engineLock` before dispatching to prevent cross-drive attribution races.
-- Features a 180-second watchdog timer with `NSLock`-synchronized timeout handling, non-blocking pipe drainage via `readToEnd()`, cancellable `DispatchWorkItem` escalation, and clean two-stage process termination (`SIGTERM` followed by `SIGKILL` escalation).
-- Distinguishes genuine filesystem corruption from non-root permission limitations (`Insufficient privileges (-69863)`) or busy mounts (`-69888`), marking operational skips as `Skipped` without triggering false-positive `VOLUME_VERIFY_FAILED` critical alerts.
+#### 3. Multi-Tier Physical Surface Scanner (`runSurfaceReadScan`)
+Performs non-destructive direct media read verification with unbuffered I/O:
+- **`F_NOCACHE` Bypass**: Issues `fcntl(fd, F_NOCACHE, 1)` on each opened file to bypass the macOS Unified Buffer Cache, forcing physical media read operations.
+- **Three Operational Modes**:
+  - `quick`: Top 200 files (rapid media confidence check).
+  - `standard`: Up to 2,000 files or 10 GB total read volume.
+  - `full`: Exhaustive filesystem tree walk.
+- **Progress Telemetry**: Reports real-time throughput ($\text{MB/s}$), scanned byte/file counts, read errors, ETA, and supports cancellation via `SurfaceScanCancellationToken`.
 
-#### 4. The 12 Health Evaluation Rules (`evaluateHealth`)
+#### 4. Filesystem Verification & Scheduling
+- Executes `/usr/sbin/diskutil verifyVolume <target>` with a 180-second watchdog timer, non-blocking pipe drainage, and two-stage process termination (`SIGTERM` followed by `SIGKILL`).
+- Distinguishes genuine corruption from unprivileged execution (`-69863`) or busy unmount states (`-69888`), preventing false-positive alerts.
+- Supports periodic scheduling via `scheduledVerifyIntervalHours` (e.g., every 6h, 12h, 24h, 48h, or weekly).
 
-| # | Rule Category | Trigger Condition | Severity | Issue Code |
+#### 5. 12-Rule Evaluation Pipeline (`evaluateHealth`)
+
+| # | Rule Category | Trigger Condition | Severity | Issue Codes |
 | :--- | :--- | :--- | :--- | :--- |
-| **1** | **Mount Availability & Subpaths** | Target volume unmounted, BSD device missing, or required subpaths absent | `CRITICAL` | `HW_DISCONNECTED`, `VOLUME_UNMOUNTED`, `REQUIRED_PATH_MISSING` |
-| **2** | **Hardware SMART Status** | NVMe Critical Warning bitmask `!= 0` | `CRITICAL` | `SMART_CRITICAL_WARNING` |
-| **3** | **NVMe Available Spare** | Available spare `<= threshold` / `< 10%` (`CRITICAL`) or `< 25%` (`WARNING`) | `WARNING` / `CRITICAL` | `SPARE_CRITICAL`, `SPARE_WARNING` |
-| **4** | **NVMe Wear Level** | `percentageUsed >= 80%` (`WARNING`) or `>= 95%` (`CRITICAL`) | `WARNING` / `CRITICAL` | `WEAR_WARNING`, `WEAR_CRITICAL` |
-| **5** | **Drive Temperature** | `temperatureCelsius >= tempWarningCelsius` or `>= tempCriticalCelsius` | `WARNING` / `CRITICAL` | `TEMP_WARNING`, `TEMP_CRITICAL` |
-| **6** | **Host Thermal State** | `ProcessInfo.processInfo.thermalState == .critical` | `WARNING` | `HOST_THERMAL_CRITICAL` |
-| **7** | **Media & Kernel I/O Errors** | Non-zero delta in `mediaErrors`, error log entries, or driver read/write errors/retries | `WARNING` / `CRITICAL` | `MEDIA_ERRORS`, `ERROR_LOG_INCREASED`, `IO_DRIVER_ERRORS`, `IO_DRIVER_RETRIES` |
-| **8** | **I/O Latency Spikes** | Driver read/write latency exceeds threshold (`> 50 ms` warn, `> 200 ms` crit) for `>= 100` operations | `WARNING` / `CRITICAL` | `IO_LATENCY_WARNING`, `IO_LATENCY_CRITICAL` |
-| **9** | **Bus Speed Negotiation** | External drive negotiated below `minExpectedUsbSpeedBps` | `WARNING` | `USB_LINK_DEGRADED` |
-| **10** | **Unsafe Shutdowns** | `unsafeShutdowns` counter incremented relative to persisted baseline | `WARNING` | `NEW_UNSAFE_SHUTDOWN` |
-| **11** | **Disk Free Space** | Used `%` above ceiling or free GB below configured floor | `WARNING` / `CRITICAL` | `DISK_SPACE_WARNING`, `DISK_SPACE_CRITICAL` |
-| **12** | **Canary & Verification** | Filesystem mounted read-only, canary probe failed, canary latency `> 300 ms`, or `verifyVolume` failed | `WARNING` / `CRITICAL` | `VOLUME_READONLY`, `CANARY_IO_FAILED`, `CANARY_HIGH_LATENCY`, `VOLUME_VERIFY_FAILED` |
+| **1** | **Mount & Subpaths** | Volume unmounted, device missing, or required subpaths absent | `CRITICAL` | `HW_DISCONNECTED`, `VOLUME_UNMOUNTED`, `REQUIRED_PATH_MISSING` |
+| **2** | **Hardware S.M.A.R.T.** | Critical Warning bitmask `!= 0` | `CRITICAL` | `SMART_CRITICAL_WARNING` |
+| **3** | **Available Spare** | Spare `< 25%` (`WARNING`) or `<= threshold` / `< 10%` (`CRITICAL`) | `WARNING` / `CRITICAL` | `SPARE_WARNING`, `SPARE_CRITICAL` |
+| **4** | **SSD Wear Level** | Wear `>= 80%` (`WARNING`) or `>= 95%` (`CRITICAL`) | `WARNING` / `CRITICAL` | `WEAR_WARNING`, `WEAR_CRITICAL` |
+| **5** | **Drive Temperature** | Temp `>= warning` or `>= critical`; rapid spike detected | `WARNING` / `CRITICAL` | `TEMP_WARNING`, `TEMP_CRITICAL`, `TEMP_RAPID_RISE` |
+| **6** | **Host Thermal State** | Host system thermal state in `.critical` | `WARNING` | `HOST_THERMAL_CRITICAL` |
+| **7** | **Media & Kernel Errors** | Delta in media errors, error logs, or driver errors/retries | `WARNING` / `CRITICAL` | `MEDIA_ERRORS`, `ERROR_LOG_INCREASED`, `IO_DRIVER_ERRORS`, `IO_DRIVER_RETRIES` |
+| **8** | **I/O Latency Spikes** | Driver read/write latency exceeds threshold (`> 50 ms` warn, `> 200 ms` crit) | `WARNING` / `CRITICAL` | `IO_LATENCY_WARNING`, `IO_LATENCY_CRITICAL` |
+| **9** | **Bus Link Speed** | External connection negotiated below expected speed | `WARNING` | `USB_LINK_DEGRADED` |
+| **10** | **Unsafe Shutdowns** | Counter incremented relative to persisted baseline | `WARNING` | `NEW_UNSAFE_SHUTDOWN` |
+| **11** | **Capacity & Free Space** | Used `%` above ceiling or free space below floor | `WARNING` / `CRITICAL` | `DISK_SPACE_WARNING`, `DISK_SPACE_CRITICAL` |
+| **12** | **Canary & Verification** | Volume read-only, canary write failure, or `verifyVolume` error | `WARNING` / `CRITICAL` | `VOLUME_READONLY`, `CANARY_IO_FAILED`, `CANARY_HIGH_LATENCY`, `VOLUME_VERIFY_FAILED` |
 
-#### 5. Stateful Alert Cooldowns (`processAlertsAndDigestLocked`)
-- Compares current issues against per-drive state in `logs/state.json` (`lastAlertTimestampByCode`, scoped as `"<driveKey>:<issueCode>"`).
-- Suppresses duplicate notifications for the same issue code within `alertCooldownSeconds`.
-- Preserves active cooldowns across drive switches without wiping state.
-- Automatically dispatches recovery notifications (`RECOVERED — HEALTHY`) when a drive transitions from `WARNING` or `CRITICAL` back to `HEALTHY`, clearing scoped cooldowns for that drive.
+#### 6. Stateful Cooldowns & Recovery
+- Maintains scoped alert timestamps (`"<driveKey>:<issueCode>"`) in `logs/state.json`.
+- Suppresses repetitive alerts within `alertCooldownSeconds`.
+- Dispatches a recovery notification (`RECOVERED — HEALTHY`) when all issues resolve, resetting alert cooldowns for that drive.

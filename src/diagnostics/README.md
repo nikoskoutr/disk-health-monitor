@@ -1,6 +1,6 @@
-# Diagnostic Report Exporter (`src/diagnostics/`)
+# Diagnostic & Report Exporters (`src/diagnostics/`)
 
-This directory provides a self-contained diagnostic bundle generator that captures system context, all detected storage devices, the latest health telemetry snapshot, sanitized user configuration, and recent log entries into a single portable JSON file.
+This directory generates comprehensive, portable system context snapshots and customer-facing reports for troubleshooting, hardware diagnostics, and warranty RMA claims.
 
 ---
 
@@ -8,26 +8,21 @@ This directory provides a self-contained diagnostic bundle generator that captur
 
 ### [`DiagnosticExporter.swift`](DiagnosticExporter.swift)
 
-#### 1. Diagnostic Report Structure
-The JSON dictionary produced by `DiagnosticExporter.shared.generateDiagnosticReport()` and serialized by `exportDiagnosticReportJSON()`:
-- **`reportVersion`**: Semantic report schema version (`"2.1.0"`).
-- **`timestamp`**: ISO-8601 UTC timestamp of the export.
-- **`system`**: Operating system version, hostname, app version, and architecture (`arm64` or `x86_64`).
-- **`target`**: Active monitored `volumePath` and `deviceQuery`.
-- **`detectedDevices`**: Array of all block storage devices enumerated via `DiskListAllDevices()` and mount points resolved via `DiskFindMountForBlockDevice()`.
-- **`hardware`**: Hardware metadata for the target disk (vendor, product, BSD name, interconnect, bus speed).
-- **`filesystem`**: Filesystem metrics (mount point, capacity, free space, used percentage, read-only status, verification result).
-- **`smart`**: NVMe SMART attributes (temperature, spare, wear level, TBW, power cycles, unsafe shutdowns, media errors).
-- **`driverStats`**: Kernel storage driver statistics (read/write latencies, errors, retries, throughput).
-- **`canary`**: Active I/O canary probe status and round-trip latency.
-- **`evaluation`**: Overall health severity, score (0–100), and list of detected issues.
-- **`configuration`**: Active monitoring parameters with sensitive secrets securely masked (`•••••••• (Protected)`).
-- **`recentLogLines`**: Up to the last 100 lines of `logs/health.log` for troubleshooting historical events.
+#### 1. JSON Diagnostic Bundle
+Serialized via `exportDiagnosticReportJSON()` or `--export-diagnostics [path]`:
+- **`system`**: macOS kernel release, host name, binary version, and target architecture (`arm64` / `x86_64`).
+- **`detectedDevices`**: Full topology list of attached block storage devices (`DiskListAllDevices`) and resolved mount points (`DiskFindMountForBlockDevice`).
+- **`hardware` & `smart`**: Target drive metadata, raw NVMe registers, wear percentage, available spare, and POH.
+- **`filesystem` & `driverStats`**: Capacity, APFS purgeable space, read/write latencies, errors, and throughput.
+- **`evaluation`**: Health severity, score (`0`–`100`), and array of detected issues with codes.
+- **`configuration`**: Sanitized active parameters with credentials securely masked (`•••••••• (Protected)`).
+- **`recentLogLines`**: Last 100 entries of `logs/health.log` with tokens redacted.
 
-#### 2. Usage
-- **From the UI**: Click **Export Diagnostics** in the menu bar dashboard or inside the **Diagnostics** tab of the Settings window (`Cmd+,`).
-- **From the CLI**:
-  ```bash
-  ./disk-health --export-diagnostics ~/Desktop/disk_diagnostics.json
-  ```
-- Exported files are written atomically and restricted to POSIX `0600` (`rw-------`) permissions.
+#### 2. Standalone HTML Health & RMA Report
+Exported via `exportDiagnosticReportHTML()`, `--export-html [path]`, menu item (`⌘H`), or Settings UI:
+- **Zero-Dependency Styling**: Fully self-contained responsive CSS with dark/light mode compatibility.
+- **Hardware Summary & RMA Readiness**: Clear color-coded overall severity banner, drive serial number, model, bus speed, and operational counters formatted for hardware RMA submissions.
+- **Raw S.M.A.R.T. & Driver Statistics**: Visual tabular presentation of controller temperatures, wear levels, spare health, I/O errors, and canary latency.
+
+#### 3. Security & POSIX Permissions
+All exported files (`.json` and `.html`) are written atomically with POSIX `0600` (`rw-------`) permissions to ensure local user privacy.

@@ -1,6 +1,6 @@
-# Domain Models & Formatters (`src/models/`)
+# Domain Models & Telemetry Schema (`src/models/`)
 
-This directory defines the strongly typed, `Codable` Swift data models that represent drive telemetry snapshots, health anomalies, per-drive persistent state, and thread-safe POSIX date formatters.
+This directory defines the strongly typed, `Codable` Swift data structures representing drive telemetry snapshots, health anomalies, SSD wear and endurance projections, per-drive state persistence, and thread-safe date formatters.
 
 ---
 
@@ -8,38 +8,31 @@ This directory defines the strongly typed, `Codable` Swift data models that repr
 
 ### [`HealthModels.swift`](HealthModels.swift)
 
-1. **`HealthSeverity` (`String`, `Codable`)**:
-   - Represents the three operational health tiers:
-     - `.healthy` (`"HEALTHY"`, rank `0`): All hardware, filesystem, and driver checks passed.
-     - `.warning` (`"WARNING"`, rank `1`): Non-destructive degradation detected (e.g., elevated temperature, downgraded USB bus speed, high wear, or low free space).
-     - `.critical` (`"CRITICAL"`, rank `2`): Immediate risk of data loss or hardware failure (e.g., SMART failure, media errors, driver I/O errors, read-only volume, or canary write failure).
+#### 1. Core Health Enums & Issues
+- **`HealthSeverity`**: Operational tiers: `.healthy` (rank 0), `.warning` (rank 1), `.critical` (rank 2).
+- **`HealthIssue`**: Encapsulates an anomaly with machine-readable `code` (e.g., `TEMP_WARNING`, `SPARE_CRITICAL`, `CANARY_IO_FAILED`), human-readable `title`, detailed telemetry `detail`, and `severity`.
 
-2. **`HealthIssue` (`Codable`, `Identifiable`)**:
-   - Encapsulates a single detected anomaly with:
-     - `severity`: `HealthSeverity`
-     - `code`: Machine-readable rule identifier (e.g., `"TEMP_WARNING"`, `"USB_LINK_DEGRADED"`, `"WEAR_WARNING"`, `"CANARY_IO_FAILED"`, `"IO_LATENCY_CRITICAL"`, `"HOST_THERMAL_CRITICAL"`).
-     - `title`: Concise human-readable summary.
-     - `detail`: Actionable explanation with measured telemetry and configured thresholds.
+#### 2. `DiskHealthSnapshot`
+Point-in-time telemetry snapshot serialized to `logs/latest_status.json` and returned via `--json`:
+- **System**: `timestamp`, `formattedTime`, `formattedShortTime`, `overallSeverity`, `healthScore`, `issues`.
+- **Filesystem & Capacity**: `mountPoint`, `filesystemType`, `totalBytes`, `freeBytes`, `purgeableBytes` (opportunistic APFS capacity), `usedBytes`, `usedPercent`, `isReadOnly`, `subpathsStatus`.
+- **Hardware & Bus**: `vendorName`, `productName`, `bsdName`, `serialNumber`, `interconnectType`, `protocolType`, `isInternal`, `linkSpeedBps`, `linkSpeedFormatted`.
+- **NVMe S.M.A.R.T.**: `smartValid`, `criticalWarning`, `temperatureCelsius`, `temperatureKelvin`, `peakTemperatureCelsius`, `availableSpare`, `availableSpareThreshold`, `percentageUsed`, `lifeRemainingPercent`, `dataUnitsRead`, `dataUnitsWritten`, `totalTerabytesRead`, `totalTerabytesWritten`, `powerCycles`, `powerOnHours`, `unsafeShutdowns`, `mediaErrors`, `errorInfoLogEntries`.
+- **Storage Driver Stats**: `statsValid`, `sessionBytesRead`, `sessionBytesWritten`, `operationsRead`, `operationsWritten`, `errorsRead`, `errorsWritten`, `avgReadLatencyMs`, `avgWriteLatencyMs`, `readThroughputMBps`, `writeThroughputMBps`.
+- **Active Canary & Verification**: `canaryOk`, `canaryLatencyMs`, `lastVerifyResult`, `lastVerifyOk`.
 
-3. **`DiskHealthSnapshot` (`Codable`)**:
-   - Complete point-in-time record of a health evaluation run, serialized to `logs/latest_status.json` and printed via `--json`:
-     - System metadata (`timestamp`, `formattedTime`, `formattedShortTime`, `healthScore`, `overallSeverity`, `issues`).
-     - Volume & filesystem metrics (`isMounted`, `mountPoint`, `filesystemType`, `isReadOnly`, `totalBytes`, `freeBytes`, `usedBytes`, `usedPercent`, `subpathsStatus`, `canaryOk`, `canaryLatencyMs`).
-     - Hardware & bus metrics (`hardwareFound`, `vendorName`, `productName`, `productRevision`, `bsdName`, `serialNumber`, `usbSerialNumber`, `interconnectType`, `protocolType`, `isInternal`, `isRemovable`, `linkSpeedBps`, `linkSpeedFormatted`).
-     - NVMe SMART metrics (`smartValid`, `criticalWarning`, `temperatureCelsius`, `peakTemperatureCelsius`, `availableSpare`, `availableSpareThreshold`, `percentageUsed`, `lifeRemainingPercent`, `totalTerabytesRead`, `totalTerabytesWritten`, `powerCycles`, `powerOnHours`, `unsafeShutdowns`, `mediaErrors`, `errorInfoLogEntries`).
-     - Storage driver statistics (`statsValid`, `sessionBytesRead`, `sessionBytesWritten`, `operationsRead`, `operationsWritten`, `errorsRead`, `errorsWritten`, `retriesRead`, `retriesWritten`, `avgReadLatencyMs`, `avgWriteLatencyMs`, `readThroughputMBps`, `writeThroughputMBps`).
-     - Volume verification state (`lastVerifyResult`, `lastVerifyOk`).
+#### 3. Computed SSD Endurance & Lifespan Projections
+- **`dailyTerabytesWritten`**: Calculates daily write burn rate:
+  $$\text{Burn Rate} = \frac{\text{Total TBW}}{\max(1, \text{POH} / 24)} \quad (\text{TB/day})$$
+- **`estimatedRemainingLifeFormatted`**: Projects operational longevity from accumulated wear percentage and Power-On Hours (e.g., `"> 10 Years (0% Wear)"`, `"~4.2 Years remaining"`, or `"Depleted"`).
 
-4. **`DriveBaselineState` & `DiskPersistentState` (`Codable`)**:
-   - Stored at `logs/state.json` to maintain isolated historical state scoped by physical drive identifier (`serialNumber` or `bsdName`):
-     - `monitoredTarget`: Active monitored target path, query, or `"auto"`.
-     - `drives`: Map of drive key to `DriveBaselineState`, isolating baselines for unsafe shutdowns, media errors, error log entries, driver I/O errors/retries, peak temperature, and volume verification status.
-     - `lastAlertTimestampByCode`: Map of scoped alert key (`"<driveKey>:<issueCode>"`) to timestamp of last notification dispatch, enforcing per-issue `alertCooldownSeconds`.
-     - `lastOverallSeverity`: Last evaluated severity string (`"HEALTHY"`, `"WARNING"`, `"CRITICAL"`).
-     - `dailySummaryEnabled` & `lastDailySummaryDate`: Controls scheduled daily summary Telegram dispatches (`YYYY-MM-DD`).
+#### 4. Persistent State Scoping (`DiskPersistentState` & `DriveBaselineState`)
+Stored at `logs/state.json`:
+- **`DriveBaselineState`**: Scoped by drive key (`serialNumber` or `bsdName`), tracking baseline counters for unsafe shutdowns, media errors, driver errors/retries, peak temperature, and per-drive `lastOverallSeverity`.
+- **`DiskPersistentState`**: Manages global settings, active target, and scoped alert cooldowns (`lastAlertTimestampByCode`).
 
-5. **Thread-Safe Date Formatters (`SynchronizedDateFormatter`)**:
-   - Thread-safe date formatting wrappers using `NSLock` and `en_US_POSIX` locale to prevent concurrent mutation crashes and avoid 12-hour/24-hour locale formatting anomalies:
-     - `isoTimestampFormatter`: `yyyy-MM-dd HH:mm:ss` timestamp format.
-     - `shortTimeFormatter`: `HH:mm:ss` timestamp format.
-     - `shortMonthDateFormatter`: `MMM d, HH:mm` timestamp format.
+#### 5. Thread-Safe Date Formatters (`SynchronizedDateFormatter`)
+Wraps `DateFormatter` with an internal `NSLock` and `en_US_POSIX` locale to prevent concurrent mutation crashes and formatting drift across locale boundaries:
+- `isoTimestampFormatter`: `yyyy-MM-dd HH:mm:ss`
+- `shortTimeFormatter`: `HH:mm:ss`
+- `shortMonthDateFormatter`: `MMM d, HH:mm`

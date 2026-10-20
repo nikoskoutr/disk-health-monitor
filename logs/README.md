@@ -1,19 +1,20 @@
 # Runtime Logs & State Directory (`logs/`)
 
-This directory is the default runtime workspace where **Universal Disk Health Monitor** writes operational logs, the latest health telemetry snapshot, and cross-session state deltas.
+This directory is the default runtime directory where **Universal Disk Health Monitor** maintains operational logs, telemetry snapshots, and persistent baselines.
 
 > [!NOTE]
-> All runtime files generated inside `logs/` (`*.log`, `state.json`, `latest_status.json`, `diagnostic_*.json`) are listed in [`.gitignore`](../.gitignore) so personal drive serial numbers, hostnames, and runtime telemetry are never committed to Git.
+> All files in `logs/` (`*.log`, `*.json`, `*.lock`) are excluded via [`.gitignore`](../.gitignore) to ensure drive serial numbers, system identifiers, and telemetry snapshots are never committed to version control.
 
 ---
 
-## Runtime Files Generated in `logs/`
+## Runtime File Directory
 
-| File | Created By | Purpose |
+| File | Generating Component | Purpose & Format |
 | :--- | :--- | :--- |
-| `health.log` | [`ConfigManager`](../src/config/ConfigManager.swift) | Append-only ISO-8601 operational log recording check results, detected anomalies, configuration changes, and notification deliveries |
-| `latest_status.json` | [`DiskHealthMonitor`](../src/engine/DiskHealthMonitor.swift) | Pretty-printed JSON serialization of the most recent [`DiskHealthSnapshot`](../src/models/HealthModels.swift) |
-| `state.json` | [`DiskHealthMonitor`](../src/engine/DiskHealthMonitor.swift) | Persistent [`DiskPersistentState`](../src/models/HealthModels.swift) tracking previous severity, per-issue alert cooldown epochs (`lastAlertEpochByCode`), and cumulative error/shutdown counters for delta detection |
-| `launchd.out.log` / `launchd.err.log` | `launchd` | Standard output and standard error streams captured when background LaunchAgents are installed via `./build_and_install.sh --install-service` |
-| `mount-watch.out.log` / `mount-watch.err.log` | `launchd` | Output streams for the `/Volumes` mount-watcher LaunchAgent |
-| `menubar.out.log` / `menubar.err.log` | `launchd` | Output streams for the persistent menu bar LaunchAgent |
+| `health.log` | `ConfigManager` | Append-only ISO-8601 operational log. Automatically rotated to `health.log.1` when exceeding 5 MB (`0600` permissions) |
+| `latest_status.json` | `DiskHealthMonitor` | Pretty-printed JSON snapshot of the most recent `DiskHealthSnapshot` evaluation (`0600` permissions) |
+| `state.json` | `DiskHealthMonitor` | Cross-session `DiskPersistentState` tracking historical error baselines, unsafe shutdowns, and scoped alert cooldowns (`0600` permissions) |
+| `menubar.lock` | `SingleInstanceLock` | Non-blocking POSIX `flock` file containing the PID of the active menu bar process (`0600` permissions) |
+| `launchd.out.log` / `.err.log` | `launchd` | Standard output and error streams for the periodic check daemon |
+| `mount-watch.out.log` / `.err.log` | `launchd` | Standard output and error streams for the `/Volumes` mount watcher |
+| `menubar.out.log` / `.err.log` | `launchd` | Standard output and error streams for the persistent menu bar daemon |

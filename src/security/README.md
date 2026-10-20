@@ -1,35 +1,30 @@
-# Credential & Secret Management (`src/security/`)
+# Security & Process Mutual Exclusion (`src/security/`)
 
-This directory implements secure credential storage for sensitive tokens (such as the Telegram Bot API token) so that secrets are never stored in plain text inside `config.json` or leaked in diagnostic exports.
+This directory implements secure credential management for sensitive tokens and POSIX-level process mutual exclusion for the menu bar agent.
 
 ---
 
 ## Files
 
-### [`SecretStore.swift`](SecretStore.swift)
-
-`SecretStore` provides a thread-safe unified key-value interface (`setSecret(_:forKey:)`, `getSecret(forKey:)`, `deleteSecret(forKey:)`) protected by an internal `NSRecursiveLock` and backed by a two-tier storage strategy:
+### 1. [`SecretStore.swift`](SecretStore.swift)
+Provides a thread-safe unified key-value interface (`setSecret`, `getSecret`, `deleteSecret`) backed by an `NSRecursiveLock` and a two-tier storage architecture:
 
 1. **Primary Tier — macOS Keychain (`Security.framework`)**:
-   - Uses `SecItemAdd`, `SecItemCopyMatching`, `SecItemUpdate`, and `SecItemDelete` with `kSecClassGenericPassword`.
-   - Service identifier: `io.github.disk-health-monitor`.
-   - Accessibility policy: `kSecAttrAccessibleAfterFirstUnlock` so background `launchd` agents can read notification credentials after the system boots and unlocks once.
+   - Manages generic password items (`kSecClassGenericPassword`) under service `io.github.disk-health-monitor`.
+   - Uses `kSecAttrAccessibleAfterFirstUnlock` accessibility policy, allowing background `launchd` daemons to read credentials after initial login.
+2. **Fallback Tier — Restricted `0600` File (`.secrets.json`)**:
+   - In headless SSH sessions or CI environments where the macOS Keychain is locked or unavailable (`errSecInteractionNotAllowed`), credentials fall back to `~/.config/disk-health-monitor/.secrets.json`.
+   - File permissions are strictly enforced to POSIX `0600` (`rw-------`, owner-only).
+   - Deleting a secret purges it from both the Keychain and fallback store simultaneously.
 
-2. **Fallback Tier — Restricted `0600` Secret File (`.secrets.json`)**:
-   - In headless SSH sessions or sandboxed test environments where Keychain interaction may return an OSStatus error, `SecretStore` automatically falls back to storing the key-value pair in `~/.config/disk-health-monitor/.secrets.json`.
-   - Enforces strict POSIX `0600` (`rw-------`, owner-only) file permissions via `FileManager.setAttributes([.posixPermissions: 0o600])` immediately upon creation and update.
-   - Whenever a secret is deleted or cleared, it is purged from both the macOS Keychain and the `.secrets.json` fallback file.
+---
 
-3. **Concurrency Synchronization**:
-   - All Keychain and fallback file mutations and property accesses (`configDir`) are synchronized using an `NSRecursiveLock` to eliminate race conditions between background queues, Settings UI keystroke debouncers, and notification workers.
-
-### [`SingleInstanceLock.swift`](SingleInstanceLock.swift)
-
-`SingleInstanceLock` guarantees single-instance execution for the Menu Bar application:
-- **POSIX `flock` Mutual Exclusion**:
+### 2. [`SingleInstanceLock.swift`](SingleInstanceLock.swift)
+Guarantees single-instance execution for the menu bar daemon without restricting concurrent CLI operations:
+- **POSIX Non-Blocking `flock`**:
   - Opens `~/.config/disk-health-monitor/menubar.lock` with atomic flags `O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC` and permissions `0600`.
-  - Acquires an exclusive non-blocking lock (`flock(fd, LOCK_EX | LOCK_NB)`). If another instance already holds the lock, immediately returns `false` without blocking.
+  - Attempts an exclusive non-blocking lock (`flock(fd, LOCK_EX | LOCK_NB)`). If held by an existing instance, the new GUI process exits cleanly with status 0.
 - **PID Registration**:
-  - Truncates the lock file and writes the current process ID (`getpid()`) followed by an immediate `fsync()` for diagnostic visibility in `launchctl` and terminal investigations.
-- **Safe Release**:
-  - Automatically unlocks (`LOCK_UN`) and closes file descriptor on application termination (`applicationWillTerminate`) or explicit lock release.
+  - Writes the current process ID (`getpid()`) to the lock file followed by `fsync(2)` for diagnostic tracking in `launchctl` and Activity Monitor.
+- **Headless Invocations Unrestricted**:
+  - Standalone CLI commands (`--status`, `--json`, `--check`, `--surface-scan`, `--export-*`) execute without acquiring this lock, enabling parallel automation.

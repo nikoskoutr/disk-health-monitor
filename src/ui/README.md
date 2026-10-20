@@ -1,51 +1,60 @@
-# Menu Bar Controller & SwiftUI Views (`src/ui/`)
+# Menu Bar Controller & User Interface (`src/ui/`)
 
-This directory contains the native macOS user interface layer built with AppKit (`NSStatusItem`, `NSMenu`, `NSWindow`) and SwiftUI (`DashboardMenuView`, `SettingsView`).
+This directory implements the native macOS user interface using AppKit (`NSStatusItem`, `NSMenu`, `NSWindow`) and SwiftUI (`DashboardMenuView`, `SettingsView`).
 
 ---
 
 ## Files
 
 ### 1. [`AppDelegate.swift`](AppDelegate.swift)
-Manages the application lifecycle, menu bar status item, background refresh timer, and Settings window:
-- **Menu Bar Status Item (`NSStatusBar`)**:
-  - Dynamically updates the menu bar SF Symbol icon based on the latest health state (`externaldrive.fill.badge.checkmark` for healthy, `externaldrive.trianglebadge.exclamationmark` for warning, or `externaldrive.fill.badge.xmark` for critical).
-- **Embedded SwiftUI Dashboard (`NSHostingView`)**:
-  - Hosts `DashboardMenuView` (385 pt wide) at the top of the status bar menu alongside native `NSMenuItem` shortcuts:
-    - **Select Monitored Disk** (dynamically populated from `DiskListAllDevices()` and `getfsstat()`)
-    - **Run Deep Health & Canary Check Now** (`Cmd+R`)
-    - **Verify Volume File System (`diskutil`)...** (`Cmd+V`)
-    - **Send Status Report to Telegram Now** (`Cmd+T`)
-    - **Daily Telegram Health Digest (09:00)**
-    - **Export Diagnostic Report (JSON)...** (`Cmd+E`)
-    - **Settings...** (`Cmd+,`)
-    - **Open Volume in Finder** (`Cmd+O`)
-    - **View Health Monitor Log** (`Cmd+L`)
-- **Standard Edit Menu (`setupMainMenuForShortcuts`)**:
-  - Installs a standard macOS `Edit` menu (`Undo`, `Redo`, `Cut`, `Copy`, `Paste`, `Select All`) so keyboard shortcuts (`Cmd+C`, `Cmd+V`, `Cmd+A`) work natively inside the Settings window's text and password fields.
-- **Observer Registration**:
-  - Subscribes to `ConfigManager.shared.objectWillChange` on `RunLoop.main` to dynamically reschedule the polling timer whenever `pollIntervalSeconds` changes, and observes `NSWorkspace` mount/unmount and sleep/wake notifications.
+Coordinates the application lifecycle, menu bar status item, and system observers:
+- **Status Item**: Updates the menu bar SF Symbol dynamically based on health state (`externaldrive.fill.badge.checkmark` for healthy, `externaldrive.trianglebadge.exclamationmark` for warning, `externaldrive.fill.badge.xmark` for critical).
+- **Embedded Dashboard**: Embeds `DashboardMenuView` (385 pt) at the top of the menu bar dropdown alongside quick actions:
+  - **Hardware S.M.A.R.T. Inspector** (`⌘I`)
+  - **Run Deep Health & Canary Check Now** (`⌘R`)
+  - **Generate Standalone HTML Report...** (`⌘H`)
+  - **Verify Volume File System (`diskutil`)...** (`⌘V`)
+  - **Export Diagnostic Report (JSON)...** (`⌘E`)
+  - **Send Status Report to Telegram Now** (`⌘T`)
+  - **Settings...** (`⌘,`)
+  - **Select Monitored Disk** (dynamically populated from `DiskListAllDevices`)
+- **System Observers**: Listens for sleep/wake events, filtered volume mount notifications (ignoring system recovery/snapshot mounts), and dynamic polling timer updates.
+- **Standard Edit Menu**: Installs native Edit menu shortcuts (`⌘C`, `⌘V`, `⌘A`) for all text fields inside the Settings window.
+
+---
 
 ### 2. [`DashboardMenuView.swift`](DashboardMenuView.swift)
-Renders the visual telemetry popover card inside the menu bar dropdown:
-- **Header Banner**: Displays drive product name, BSD unit (`diskX`), transport speed, and a color-coded `HEALTHY` / `WARNING` / `CRITICAL` badge.
-- **2×2 Telemetry Grid**:
-  - **Storage Capacity**: Free vs. total space with a color-coded usage progress bar.
-  - **Temperature**: Current drive temperature in `°C` with a thermal progress bar scaled against `tempCriticalCelsius`.
-  - **SSD Lifespan**: Remaining lifespan percentage (`100 - percentageUsed`) and available spare percentage (`availableSparePercent`).
-  - **Power & Health**: SMART status badge, power-on hours (`POH`), power cycles, and unsafe shutdown count.
-- **Session I/O & Lifetime Totals**:
-  - Displays cumulative session read/write throughput, average canary latency (`ms`), kernel I/O error count, and lifetime NVMe Terabytes Read/Written (`TBR` / `TBW`).
-- **Active Issues Banner & Telemetry Footer**:
-  - Lists all active health anomalies with severity badges and displays power cycle counts, unsafe shutdowns, media errors, filesystem verification status, and last update timestamp.
+Renders the visual telemetry popover card in the status bar menu:
+- **Header**: Drive product name, BSD identifier (`diskX`), transport speed, and health severity badge.
+- **Telemetry Grid**:
+  - **Capacity**: Free vs. total space, nominal usage bar, and APFS purgeable space accounting.
+  - **Thermal**: Current drive temperature with a color-coded gauge scaled against `tempCriticalCelsius`.
+  - **SSD Wear & Lifespan**: Remaining lifespan percentage (`100 - percentageUsed`) and available spare health.
+  - **Power & Health**: S.M.A.R.T. readiness, Power-On Hours (POH), power cycles, and unsafe shutdowns.
+- **Live I/O & Canary**: Active read/write throughput ($\text{MB/s}$), cumulative lifetime TBW, canary latency ($\text{ms}$), and driver error tallies.
+- **Issues Banner**: Real-time listing of active health anomalies with severity badges.
+
+---
 
 ### 3. [`SettingsView.swift`](SettingsView.swift)
-Implements the 4-tab macOS Preferences window (`Cmd+,`, 630×590 pt):
-- **General Tab**:
-  - Interactive drive picker listing all mounted disks plus custom volume/device fields and a **Config File** export button.
-- **Thresholds Tab**:
-  - Interactive sliders and steppers for Warning/Critical temperatures (`°C`), Warning/Critical free disk space (`%`), Canary Write Latency Warning (`ms`), and Alert Cooldown (`minutes`), with live validation (`Warning < Critical`) and a **Reset to Defaults** button.
-- **Notifications Tab**:
-  - Toggles native macOS Notification Center alerts, provides a `SecureField` (with show/hide toggle) for the Keychain-backed Telegram Bot Token, a Chat ID field, and a live **"Send Test Telegram Message"** button.
-- **Diagnostics Tab**:
-  - Displays config and log file paths with **Reveal in Finder** buttons and one-click exporters for sanitized config JSON and full diagnostic bundles.
+Implements the 5-tab native macOS Preferences window (`⌘,`, 680×650 pt):
+
+1. **General Tab**:
+   - Drive selector (mounted volumes, physical BSD devices, or automatic detection).
+   - LaunchAgent background service toggle with clean `launchctl` state synchronization.
+   - Polling frequency slider (`10s` to `3600s`).
+2. **Thresholds Tab**:
+   - Temperature warning/critical thresholds (°C).
+   - Capacity usage ceiling (%) and minimum free space floors (GB).
+   - Minimum expected USB bus speed selector and alert cooldown duration.
+3. **Notifications Tab**:
+   - Native Notification Center toggle and audible critical audio beeps.
+   - Telegram Bot API configuration with `SecureField` token entry and live test message dispatcher.
+   - Universal Webhook URL (Discord, Slack, Mattermost, Home Assistant) with live test button.
+   - Custom alert shell script hook path with validation runner.
+4. **S.M.A.R.T. Tab (`⌘I`)**:
+   - Dedicated hardware inspector displaying all raw NVMe registers, normalized attributes, composite temperatures, critical warning bits, daily write burn rate ($\text{TB/day}$), and projected remaining lifespan.
+5. **Diagnostics Tab**:
+   - **Multi-Tier Surface Scan**: Selectable modes (`quick`, `standard`, `full`) with live progress, file counts, throughput ($\text{MB/s}$), and cancel support.
+   - **Volume Verification**: Manual `diskutil verifyVolume` execution and periodic scheduling interval picker (Off, 6h, 12h, 24h, 48h, 7 days).
+   - **Profiles & Reports**: One-click actions to Export HTML Report (`⌘H`), Export Diagnostic JSON, Export Sanitized Config, and Import Config Profile.

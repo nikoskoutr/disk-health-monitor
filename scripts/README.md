@@ -1,18 +1,21 @@
-# Build & Asset Generation Scripts (`scripts/`)
+# Build & Asset Utilities (`scripts/`)
 
-This directory contains standalone helper scripts executed during the build pipeline (`./build_and_install.sh`).
+This directory contains standalone build utilities used during asset compilation and application packaging.
 
 ---
 
 ## Files
 
 ### [`generate_app_icon.swift`](generate_app_icon.swift)
-A self-contained Swift script that programmatically renders the application's macOS icon (`assets/AppIcon.png` and `assets/AppIcon.icns`) using native **CoreGraphics** and **AppKit** vector drawing APIs—requiring no external design assets or third-party image libraries.
+A standalone Swift script that programmatically renders the application's macOS branding assets (`assets/AppIcon.png` and `assets/AppIcon.icns`) using native **CoreGraphics** and **AppKit** vector graphics APIs—with zero third-party dependencies.
 
-#### What It Renders:
-1. **macOS Squircle Background**: Draws a 1024×1024 rounded-rectangle squircle (`cornerRadius = 225`) with a deep slate-blue radial/linear gradient (`#121A2E` to `#0A2E3D`) and a subtle cyan inner border glow.
-2. **Drive Enclosure Chassis**: Renders a brushed metallic SSD/NVMe drive body with dual LED activity indicators (emerald green & cyan).
-3. **Live Pulse / Telemetry Waveform**: Draws a glowing emerald-cyan ECG/telemetry waveform across the center of the drive, symbolizing active real-time SMART and I/O monitoring.
+#### Visual Elements Rendered:
+1. **macOS Squircle Base**: 1024×1024 rounded rectangle (`cornerRadius = 225`) with a slate-to-deep-navy linear gradient (`#121A2E` to `#0A2E3D`) and a subtle cyan inner border glow.
+2. **Metallic Storage Enclosure**: Detailed brushed-finish SSD/NVMe drive chassis with dual LED activity indicators.
+3. **Live Telemetry Waveform**: Emerald-cyan ECG/telemetry pulse line across the center of the drive, symbolizing active S.M.A.R.T. monitoring and physical media integrity.
 
-#### Multi-Resolution `.icns` Conversion:
-After rendering the master 1024×1024 PNG (`assets/AppIcon.png`), `build_and_install.sh` generates a complete `.iconset` directory (`16x16` through `512x512@2x`) using `/usr/bin/sips` and compiles it into `assets/AppIcon.icns` via `/usr/bin/iconutil`.
+#### Multi-Resolution Asset Compilation:
+When invoked during `./build_and_install.sh`:
+1. Renders the master 1024×1024 PNG (`assets/AppIcon.png`).
+2. Scales individual resolutions (`16×16` through `512×512@2x`) into an `.iconset` folder via `/usr/bin/sips`.
+3. Packages the icon set into `assets/AppIcon.icns` via `/usr/bin/iconutil`.
