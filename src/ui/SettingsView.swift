@@ -27,6 +27,9 @@ final class SettingsViewModel: ObservableObject {
     @Published var selectedSurfaceScanMode: DiskHealthMonitor.SurfaceScanMode = .quick
     @Published var surfaceScanProgress: DiskHealthMonitor.SurfaceScanProgress? = nil
     @Published var surfaceScanCancelToken: DiskHealthMonitor.SurfaceScanCancellationToken? = nil
+    @Published var lastSurfaceScanSummary: String? = nil
+    @Published var lastSurfaceScanOk: Bool = true
+    @Published var isVerifyingVolumeInSettings: Bool = false
     @Published var diagnosticsStatusMsg: String? = nil
 
     init() {
@@ -204,9 +207,8 @@ final class SettingsViewModel: ObservableObject {
         let mode = selectedSurfaceScanMode
         let token = DiskHealthMonitor.SurfaceScanCancellationToken()
         surfaceScanCancelToken = token
-        surfaceScanProgress = nil
         isRunningSurfaceScan = true
-        diagnosticsStatusMsg = "Starting \(mode.displayName) (F_NOCACHE unbuffered media reads)..."
+        lastSurfaceScanSummary = nil
 
         DispatchQueue.global(qos: .userInitiated).async {
             let res = DiskHealthMonitor.shared.runSurfaceReadScan(
@@ -220,15 +222,27 @@ final class SettingsViewModel: ObservableObject {
             DispatchQueue.main.async {
                 self.isRunningSurfaceScan = false
                 self.surfaceScanCancelToken = nil
-                self.surfaceScanProgress = nil
-                self.diagnosticsStatusMsg = res.summary
+                self.lastSurfaceScanOk = res.ok
+                self.lastSurfaceScanSummary = res.summary
             }
         }
     }
 
     func cancelSurfaceScanAction() {
         surfaceScanCancelToken?.cancel()
-        diagnosticsStatusMsg = "Cancelling surface scan..."
+        lastSurfaceScanSummary = "Cancelling surface scan..."
+    }
+
+    func runVolumeVerificationAction() {
+        guard !isVerifyingVolumeInSettings && !DiskHealthMonitor.shared.isVerifyingVolume else { return }
+        isVerifyingVolumeInSettings = true
+        diagnosticsStatusMsg = "Running diskutil verifyVolume on active target..."
+        DiskHealthMonitor.shared.runVolumeVerification(sendTelegram: false) { ok, summary in
+            DispatchQueue.main.async {
+                self.isVerifyingVolumeInSettings = false
+                self.diagnosticsStatusMsg = "Volume Verification: \(summary)"
+            }
+        }
     }
 
     func runTelegramTest() {
@@ -493,12 +507,14 @@ struct SettingsSliderRow: View {
 struct SettingsView: View {
     @ObservedObject var configMgr = ConfigManager.shared
     @ObservedObject var viewModel: SettingsViewModel
+    @ObservedObject var monitor = DiskHealthMonitor.shared
 
     private let tabs: [(tag: Int, title: String, icon: String)] = [
         (0, "General", "gearshape.fill"),
         (1, "Thresholds", "slider.horizontal.3"),
         (2, "Notifications", "bell.badge.fill"),
-        (3, "Diagnostics", "wrench.and.screwdriver.fill")
+        (3, "S.M.A.R.T.", "cpu.fill"),
+        (4, "Diagnostics", "wrench.and.screwdriver.fill")
     ]
 
     var body: some View {
@@ -543,15 +559,17 @@ struct SettingsView: View {
                     ThresholdsSettingsTab(configMgr: configMgr)
                 case 2:
                     NotificationsSettingsTab(configMgr: configMgr, viewModel: viewModel)
+                case 3:
+                    SmartInspectorTab(monitor: monitor)
                 default:
-                    DiagnosticsAndExportTab(configMgr: configMgr, viewModel: viewModel)
+                    DiagnosticsAndExportTab(configMgr: configMgr, viewModel: viewModel, monitor: monitor)
                 }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
-        .frame(width: 630, height: 590)
+        .frame(width: 680, height: 650)
     }
 }
 
@@ -620,6 +638,25 @@ struct GeneralSettingsTab: View {
                         ))
                         .labelsHidden()
                         .toggleStyle(.switch)
+                    }
+
+                    Divider()
+
+                    SettingsRow(
+                        title: "Scheduled Background Volume Verification",
+                        subtitle: "Automatically run non-destructive diskutil verifyVolume checks in the background."
+                    ) {
+                        Picker("", selection: Binding(
+                            get: { configMgr.config.scheduledVerifyIntervalHours },
+                            set: { val in configMgr.updateConfig { $0.scheduledVerifyIntervalHours = val } }
+                        )) {
+                            Text("Manual Only (Disabled)").tag(0)
+                            Text("Every 24 Hours (Daily)").tag(24)
+                            Text("Every 7 Days (Weekly)").tag(168)
+                            Text("Every 30 Days (Monthly)").tag(720)
+                        }
+                        .labelsHidden()
+                        .frame(width: 210)
                     }
                 }
 
@@ -875,6 +912,20 @@ struct NotificationsSettingsTab: View {
                         .labelsHidden()
                         .toggleStyle(.switch)
                     }
+
+                    Divider()
+
+                    SettingsRow(
+                        title: "Audible System Beep on Critical Faults",
+                        subtitle: "Play a native macOS alert sound immediately when a Critical hardware or thermal fault occurs."
+                    ) {
+                        Toggle("", isOn: Binding(
+                            get: { configMgr.config.enableCriticalSoundAlert },
+                            set: { val in configMgr.updateConfig { $0.enableCriticalSoundAlert = val } }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                    }
                 }
 
                 SettingsCard(title: "Telegram Bot Integration", icon: "paperplane.fill", iconColor: .blue) {
@@ -1118,9 +1169,137 @@ struct NotificationsSettingsTab: View {
     }
 }
 
+struct SmartInspectorTab: View {
+    @ObservedObject var monitor: DiskHealthMonitor
+
+    var body: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            if let snap = monitor.currentSnapshot {
+                VStack(alignment: .leading, spacing: 14) {
+                    SettingsCard(title: "Physical Controller & Endurance Summary", icon: "cpu.fill", iconColor: .blue) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("\(snap.vendorName) \(snap.productName)")
+                                    .font(.system(size: 14, weight: .bold))
+                                Text("BSD: \(snap.bsdName.isEmpty ? "offline" : snap.bsdName) • Bus: \(snap.interconnectType) (\(snap.linkSpeedFormatted)) • Rev: \(snap.productRevision.isEmpty ? "N/A" : snap.productRevision)")
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                                Text("Serial: \(snap.serialNumber.isEmpty ? "N/A" : snap.serialNumber)")
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            Button(action: {
+                                DispatchQueue.global(qos: .userInitiated).async {
+                                    _ = DiskHealthMonitor.shared.evaluateHealth(forceCanary: false, allowNotifications: false)
+                                }
+                            }) {
+                                Label("Refresh SMART", systemImage: "arrow.clockwise")
+                            }
+                        }
+
+                        Divider()
+
+                        HStack(spacing: 12) {
+                            inspectorStatPill(title: "ESTIMATED SSD LIFE", value: snap.estimatedRemainingLifeFormatted, color: .blue)
+                            inspectorStatPill(title: "DAILY WRITE BURN", value: snap.smartValid ? String(format: "%.2f GB/day", snap.dailyTerabytesWritten * 1000.0) : "N/A", color: .purple)
+                            inspectorStatPill(title: "HEALTH SCORE", value: "\(snap.healthScore) / 100 (\(snap.overallSeverity.rawValue))", color: snap.overallSeverity == .healthy ? .green : (snap.overallSeverity == .warning ? .orange : .red))
+                        }
+                    }
+
+                    SettingsCard(title: "Raw NVMe / S.M.A.R.T. Attributes", icon: "list.bullet.rectangle.portrait.fill", iconColor: .teal) {
+                        if snap.smartValid {
+                            VStack(spacing: 6) {
+                                smartAttributeRow(id: "01", name: "Critical Warning Byte", raw: String(format: "0x%02X", snap.criticalWarning), status: snap.criticalWarning == 0 ? "OK" : "ALERT", isGood: snap.criticalWarning == 0)
+                                smartAttributeRow(id: "02", name: "Composite Temperature", raw: "\(snap.temperatureCelsius) °C (\(snap.temperatureKelvin) K) • Peak: \(snap.peakTemperatureCelsius) °C", status: "\(snap.temperatureCelsius)°C", isGood: snap.temperatureCelsius < ConfigManager.shared.currentConfig.tempWarningCelsius)
+                                smartAttributeRow(id: "03", name: "Available Spare Capacity", raw: "\(snap.availableSpare)% (Threshold: \(snap.availableSpareThreshold)%)", status: "\(snap.availableSpare)%", isGood: snap.availableSpare > snap.availableSpareThreshold)
+                                smartAttributeRow(id: "04", name: "Percentage Used (Wear Indicator)", raw: "\(snap.percentageUsed)% Used (\(snap.lifeRemainingPercent)% Remaining)", status: "\(snap.lifeRemainingPercent)% Left", isGood: snap.percentageUsed < 80)
+                                smartAttributeRow(id: "05", name: "Data Units Read (512B x 1000)", raw: String(format: "%llu units (%.2f TB)", snap.dataUnitsRead, snap.totalTerabytesRead), status: "Info", isGood: true)
+                                smartAttributeRow(id: "06", name: "Data Units Written (TBW)", raw: String(format: "%llu units (%.2f TB)", snap.dataUnitsWritten, snap.totalTerabytesWritten), status: "Info", isGood: true)
+                                smartAttributeRow(id: "07", name: "Host Read Commands", raw: "\(snap.hostReadCommands)", status: "Info", isGood: true)
+                                smartAttributeRow(id: "08", name: "Host Write Commands", raw: "\(snap.hostWriteCommands)", status: "Info", isGood: true)
+                                smartAttributeRow(id: "09", name: "Controller Busy Time", raw: "\(snap.controllerBusyTime) min", status: "Info", isGood: true)
+                                smartAttributeRow(id: "0A", name: "Power Cycles", raw: "\(snap.powerCycles) cycles", status: "Info", isGood: true)
+                                smartAttributeRow(id: "0B", name: "Power-On Hours (POH)", raw: "\(snap.powerOnHours) hours (\(snap.powerOnHours / 24) days)", status: "Info", isGood: true)
+                                smartAttributeRow(id: "0C", name: "Unsafe Shutdowns", raw: "\(snap.unsafeShutdowns) events", status: snap.unsafeShutdowns == 0 ? "0" : "\(snap.unsafeShutdowns)", isGood: true)
+                                smartAttributeRow(id: "0D", name: "Media & Data Integrity Errors", raw: "\(snap.mediaErrors) errors", status: snap.mediaErrors == 0 ? "0 Errors" : "FAIL", isGood: snap.mediaErrors == 0)
+                                smartAttributeRow(id: "0E", name: "Error Information Log Entries", raw: "\(snap.errorInfoLogEntries) entries", status: "\(snap.errorInfoLogEntries)", isGood: snap.errorInfoLogEntries == 0)
+                            }
+                        } else {
+                            Text("Hardware S.M.A.R.T. telemetry is not supported on this bus/bridge (\(snap.interconnectType)). Kernel I/O statistics and active filesystem probes remain active.")
+                                .font(.system(size: 12))
+                                .foregroundColor(.secondary)
+                                .padding(.vertical, 6)
+                        }
+                    }
+
+                    SettingsCard(title: "IOBlockStorageDriver Kernel Telemetry", icon: "waveform.path.ecg", iconColor: .orange) {
+                        if snap.statsValid {
+                            VStack(spacing: 6) {
+                                smartAttributeRow(id: "IO-1", name: "Session Bytes Read / Written", raw: "\(formatBytes(snap.sessionBytesRead)) Read / \(formatBytes(snap.sessionBytesWritten)) Written", status: "Active", isGood: true)
+                                smartAttributeRow(id: "IO-2", name: "Session Read / Write Operations", raw: "\(snap.operationsRead) R / \(snap.operationsWritten) W ops", status: "Active", isGood: true)
+                                smartAttributeRow(id: "IO-3", name: "Average Driver I/O Latency", raw: String(format: "%.2f ms Read / %.2f ms Write", snap.avgReadLatencyMs, snap.avgWriteLatencyMs), status: max(snap.avgReadLatencyMs, snap.avgWriteLatencyMs) < 50.0 ? "Nominal" : "Elevated", isGood: max(snap.avgReadLatencyMs, snap.avgWriteLatencyMs) < 50.0)
+                                smartAttributeRow(id: "IO-4", name: "Kernel Driver Read / Write Errors", raw: "\(snap.errorsRead) Read / \(snap.errorsWritten) Write", status: (snap.errorsRead + snap.errorsWritten) == 0 ? "0 Errors" : "ALERT", isGood: (snap.errorsRead + snap.errorsWritten) == 0)
+                                smartAttributeRow(id: "IO-5", name: "Kernel Driver Read / Write Retries", raw: "\(snap.retriesRead) Read / \(snap.retriesWritten) Write", status: "\(snap.retriesRead + snap.retriesWritten)", isGood: (snap.retriesRead + snap.retriesWritten) == 0)
+                            }
+                        } else {
+                            Text("Kernel block storage driver statistics unavailable for this device.")
+                                .font(.system(size: 12))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                .padding(8)
+            } else {
+                Text("Evaluating hardware telemetry...")
+                    .padding()
+            }
+        }
+    }
+
+    private func inspectorStatPill(title: String, value: String, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.system(size: 9.5, weight: .bold))
+                .foregroundColor(.secondary)
+            Text(value)
+                .font(.system(size: 12.5, weight: .bold, design: .rounded))
+                .foregroundColor(color)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8).fill(color.opacity(0.10)))
+    }
+
+    private func smartAttributeRow(id: String, name: String, raw: String, status: String, isGood: Bool) -> some View {
+        HStack(spacing: 10) {
+            Text(id)
+                .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                .foregroundColor(.secondary)
+                .frame(width: 34, alignment: .leading)
+            Text(name)
+                .font(.system(size: 12, weight: .medium))
+                .frame(width: 220, alignment: .leading)
+            Text(raw)
+                .font(.system(size: 11.5, design: .monospaced))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+            Spacer()
+            Text(status)
+                .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                .foregroundColor(isGood ? .green : .red)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(RoundedRectangle(cornerRadius: 4).fill((isGood ? Color.green : Color.red).opacity(0.14)))
+        }
+        .padding(.vertical, 2)
+    }
+}
+
 struct DiagnosticsAndExportTab: View {
     @ObservedObject var configMgr: ConfigManager
     @ObservedObject var viewModel: SettingsViewModel
+    @ObservedObject var monitor: DiskHealthMonitor
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
@@ -1231,47 +1410,77 @@ struct DiagnosticsAndExportTab: View {
 
                 SettingsCard(title: "Physical Media Surface Scan", icon: "waveform.path.badge.plus", iconColor: .blue) {
                     VStack(alignment: .leading, spacing: 10) {
-                        HStack {
+                        HStack(alignment: .center) {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("Scan Depth & Media Verification")
+                                Text("Non-Destructive Surface Read Scanner (F_NOCACHE)")
                                     .font(.system(size: 13, weight: .semibold))
-                                Text(viewModel.selectedSurfaceScanMode.modeDescription)
+                                Text("Bypasses unified buffer cache to verify physical flash/media blocks for latent EIO read errors.")
                                     .font(.system(size: 11))
                                     .foregroundColor(.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
                             }
                             Spacer()
+                            if viewModel.isRunningSurfaceScan {
+                                Button(action: {
+                                    viewModel.cancelSurfaceScanAction()
+                                }) {
+                                    HStack(spacing: 5) {
+                                        Image(systemName: "xmark.circle.fill")
+                                        Text("Stop Scan")
+                                    }
+                                    .foregroundColor(.red)
+                                    .frame(width: 132)
+                                }
+                            } else {
+                                Button(action: {
+                                    viewModel.runSurfaceScanAction()
+                                }) {
+                                    HStack(spacing: 5) {
+                                        Image(systemName: "play.fill")
+                                        Text("Run Surface Scan")
+                                    }
+                                    .frame(width: 132)
+                                }
+                            }
+                        }
+
+                        VStack(alignment: .leading, spacing: 6) {
                             Picker("", selection: $viewModel.selectedSurfaceScanMode) {
                                 ForEach(DiskHealthMonitor.SurfaceScanMode.allCases) { mode in
-                                    Text(mode.shortLabel).tag(mode)
+                                    Text(mode.displayName).tag(mode)
                                 }
                             }
                             .pickerStyle(SegmentedPickerStyle())
-                            .frame(width: 310)
+                            .labelsHidden()
+                            .frame(maxWidth: .infinity)
                             .disabled(viewModel.isRunningSurfaceScan)
+
+                            Text(viewModel.selectedSurfaceScanMode.modeDescription)
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
 
-                        if viewModel.isRunningSurfaceScan, let prog = viewModel.surfaceScanProgress {
+                        if let prog = viewModel.surfaceScanProgress {
                             VStack(alignment: .leading, spacing: 6) {
                                 HStack {
-                                    Text("⚡ Throughput: \(prog.formattedThroughput)")
+                                    Text(viewModel.isRunningSurfaceScan ? "⚡ Live: \(prog.formattedThroughput)" : "⚡ Avg: \(prog.formattedThroughput)")
                                         .font(.system(size: 11, weight: .semibold, design: .monospaced))
                                         .foregroundColor(.primary)
                                     Spacer()
                                     Text("Files: \(prog.filesScanned) | \(prog.formattedBytesScanned) / \(prog.formattedTargetBytes) (\(prog.formattedPercent))")
                                         .font(.system(size: 11, weight: .regular, design: .monospaced))
                                         .foregroundColor(.secondary)
-                                    if let eta = prog.formattedETA {
+                                    if viewModel.isRunningSurfaceScan, let eta = prog.formattedETA {
                                         Text("• ETA: \(eta)")
                                             .font(.system(size: 11, weight: .medium, design: .monospaced))
                                             .foregroundColor(.blue)
                                     }
                                 }
 
-                                ProgressView(value: min(1.0, max(0.0, prog.fractionCompleted)), total: 1.0)
+                                ProgressView(value: viewModel.isRunningSurfaceScan ? min(1.0, max(0.0, prog.fractionCompleted)) : 1.0, total: 1.0)
                                     .progressViewStyle(LinearProgressViewStyle())
 
-                                if !prog.currentFile.isEmpty {
+                                if viewModel.isRunningSurfaceScan && !prog.currentFile.isEmpty {
                                     Text("Reading: \(prog.currentFile)")
                                         .font(.system(size: 10, design: .monospaced))
                                         .foregroundColor(.secondary)
@@ -1283,34 +1492,43 @@ struct DiagnosticsAndExportTab: View {
                             .background(RoundedRectangle(cornerRadius: 6).fill(Color.blue.opacity(0.07)))
                         }
 
-                        HStack {
-                            Text("Bypasses unified buffer cache with F_NOCACHE to stream directly from physical media.")
-                                .font(.system(size: 11))
-                                .foregroundColor(.secondary)
-                            Spacer()
-                            if viewModel.isRunningSurfaceScan {
-                                Button(action: {
-                                    viewModel.cancelSurfaceScanAction()
-                                }) {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: "xmark.circle.fill")
-                                        Text("Stop Scan")
-                                    }
-                                    .foregroundColor(.red)
-                                    .frame(width: 128)
-                                }
-                            } else {
-                                Button(action: {
-                                    viewModel.runSurfaceScanAction()
-                                }) {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: "play.fill")
-                                        Text("Run Surface Scan")
-                                    }
-                                    .frame(width: 128)
+                        if let summary = viewModel.lastSurfaceScanSummary {
+                            HStack(alignment: .center, spacing: 8) {
+                                Image(systemName: viewModel.lastSurfaceScanOk ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                                    .foregroundColor(viewModel.lastSurfaceScanOk ? .green : .red)
+                                Text(summary)
+                                    .font(.system(size: 11.5, weight: .medium))
+                                    .foregroundColor(.primary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Spacer()
+                            }
+                            .padding(8)
+                            .background(RoundedRectangle(cornerRadius: 6).fill((viewModel.lastSurfaceScanOk ? Color.green : Color.red).opacity(0.12)))
+                        }
+                    }
+                }
+
+                SettingsCard(title: "File System Integrity Verification", icon: "checkmark.shield.fill", iconColor: .teal) {
+                    SettingsRow(
+                        title: "Verify Volume File System (diskutil verifyVolume)",
+                        subtitle: "Last Status: \(monitor.currentSnapshot?.lastVerifyResult ?? "Not run yet")"
+                    ) {
+                        Button(action: {
+                            viewModel.runVolumeVerificationAction()
+                        }) {
+                            HStack(spacing: 6) {
+                                if viewModel.isVerifyingVolumeInSettings || monitor.isVerifyingVolume {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("Verifying...")
+                                } else {
+                                    Image(systemName: "checkmark.shield")
+                                    Text("Verify Volume")
                                 }
                             }
+                            .frame(width: 128)
                         }
+                        .disabled(viewModel.isVerifyingVolumeInSettings || monitor.isVerifyingVolume)
                     }
                 }
 
@@ -1358,7 +1576,7 @@ final class SettingsWindowController: NSWindowController {
         let window = NSWindow(contentViewController: hostingController)
         window.title = "Disk Health Monitor Settings"
         window.styleMask = [.titled, .closable, .miniaturizable]
-        window.setContentSize(NSSize(width: 630, height: 590))
+        window.setContentSize(NSSize(width: 680, height: 650))
         window.center()
         window.isReleasedWhenClosed = false
         self.init(window: window)
@@ -1366,7 +1584,10 @@ final class SettingsWindowController: NSWindowController {
 
     private static let sharedVM = SettingsViewModel()
 
-    func showSettings() {
+    func showSettings(tab: Int? = nil) {
+        if let tab = tab {
+            SettingsWindowController.sharedVM.selectedTab = tab
+        }
         SettingsWindowController.sharedVM.refreshDiskList()
         SettingsWindowController.sharedVM.checkLaunchAgent()
         SettingsWindowController.sharedVM.botToken = ConfigManager.shared.resolvedTelegramBotToken

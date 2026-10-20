@@ -1526,6 +1526,98 @@ struct CoreLogicTestRunner {
         assertTrue(tgHtmlWithPurgeable.contains("Purgeable: 5.0 GB"), "Telegram HTML report must display purgeable space when > 0")
         print("  [OK] Advanced telemetry & diagnostics features (COMP-01 to COMP-06) verified")
 
+        print("=== Swift Unit Test 33: SSD Endurance Projection, Raw SMART Fields & Scanner UI State Retention (MANDATE-V12) ===")
+        let enduranceSnap = dummySnap
+        assertTrue(enduranceSnap.estimatedRemainingLifeFormatted == "N/A", "Non-SMART drive must report N/A endurance")
+        assertTrue(enduranceSnap.dailyTerabytesWritten == 0.0, "Non-SMART drive must report 0.0 daily TBW")
+
+        var smartSnapZeroWear = normalSnap
+        smartSnapZeroWear = DiskHealthSnapshot(
+            timestamp: normalSnap.timestamp,
+            formattedTime: normalSnap.formattedTime,
+            formattedShortTime: normalSnap.formattedShortTime,
+            overallSeverity: .healthy,
+            healthScore: 100,
+            issues: [],
+            hardwareFound: true,
+            vendorName: "Apple",
+            productName: "SSD",
+            productRevision: "1.0",
+            bsdName: "disk0",
+            serialNumber: "SN1",
+            usbSerialNumber: "SN1",
+            interconnectType: "PCI-Express",
+            protocolType: "NVMe",
+            isInternal: true,
+            isRemovable: false,
+            linkSpeedBps: 0,
+            linkSpeedFormatted: "PCI-Express",
+            isMounted: true,
+            mountPoint: "/",
+            filesystemType: "apfs",
+            isReadOnly: false,
+            totalBytes: 1000,
+            freeBytes: 500,
+            purgeableBytes: 0,
+            usedBytes: 500,
+            usedPercent: 50.0,
+            subpathsStatus: [:],
+            canaryOk: true,
+            canaryLatencyMs: 1.0,
+            canaryError: "",
+            smartValid: true,
+            criticalWarning: 0,
+            temperatureCelsius: 35,
+            temperatureKelvin: 308,
+            peakTemperatureCelsius: 40,
+            availableSpare: 100,
+            availableSpareThreshold: 10,
+            percentageUsed: 5,
+            lifeRemainingPercent: 95,
+            dataUnitsRead: 100_000,
+            dataUnitsWritten: 200_000,
+            totalTerabytesRead: 5.0,
+            totalTerabytesWritten: 10.0,
+            hostReadCommands: 5000,
+            hostWriteCommands: 6000,
+            controllerBusyTime: 120,
+            powerCycles: 50,
+            powerOnHours: 2400,
+            unsafeShutdowns: 0,
+            mediaErrors: 0,
+            errorInfoLogEntries: 0,
+            statsValid: true,
+            sessionBytesRead: 0,
+            sessionBytesWritten: 0,
+            operationsRead: 0,
+            operationsWritten: 0,
+            errorsRead: 0,
+            errorsWritten: 0,
+            retriesRead: 0,
+            retriesWritten: 0,
+            avgReadLatencyMs: 0.5,
+            avgWriteLatencyMs: 0.5,
+            readThroughputMBps: 0.0,
+            writeThroughputMBps: 0.0,
+            lastVerifyResult: "Verified OK",
+            lastVerifyOk: true
+        )
+        // 2400 hours = 100 days; 10.0 TBW / 100 days = 0.1 TB/day; 5% used in 100 days -> 20 days/% -> 95% * 20 = 1900 days (~5.2 Years)
+        assertTrue(abs(smartSnapZeroWear.dailyTerabytesWritten - 0.1) < 0.001, "Expected 0.1 TB/day burn rate")
+        assertTrue(smartSnapZeroWear.estimatedRemainingLifeFormatted.contains("Years"), "Expected ~5.2 Years remaining life, got \(smartSnapZeroWear.estimatedRemainingLifeFormatted)")
+        assertTrue(smartSnapZeroWear.temperatureKelvin == 308, "temperatureKelvin must be preserved")
+        assertTrue(smartSnapZeroWear.hostReadCommands == 5000 && smartSnapZeroWear.hostWriteCommands == 6000, "Host read/write commands must be preserved")
+
+        // Verify new ConfigManager keys
+        let envV12: [String: String] = [
+            "ENABLE_CRITICAL_SOUND_ALERT": "true",
+            "SCHEDULED_VERIFY_INTERVAL_HOURS": "168"
+        ]
+        let parsedV12 = ConfigManager.applyEnvironmentVariables(into: DiskHealthConfig(), env: envV12)
+        assertTrue(parsedV12.enableCriticalSoundAlert == true, "ENABLE_CRITICAL_SOUND_ALERT must parse to true")
+        assertTrue(parsedV12.scheduledVerifyIntervalHours == 168, "SCHEDULED_VERIFY_INTERVAL_HOURS must parse to 168")
+        print("  [OK] SSD endurance projection, raw NVMe SMART fields, and V12 configuration verified")
+
         print("✅ All Swift Core Logic Unit Tests Passed!")
     }
 }

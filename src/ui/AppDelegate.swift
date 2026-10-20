@@ -153,6 +153,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         verifyItem.target = self
         menu.addItem(verifyItem)
 
+        let smartInspectorItem = NSMenuItem(title: "Inspect Raw S.M.A.R.T. & Hardware Counters...", action: #selector(openSmartInspector), keyEquivalent: "i")
+        smartInspectorItem.target = self
+        menu.addItem(smartInspectorItem)
+
         let telegramReportItem = NSMenuItem(title: "Send Status Report to Telegram Now", action: #selector(sendTelegramReportNow), keyEquivalent: "t")
         telegramReportItem.target = self
         menu.addItem(telegramReportItem)
@@ -460,6 +464,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func openSettings() {
         statusItem.menu?.cancelTracking()
         SettingsWindowController.shared.showSettings()
+    }
+
+    @objc func openSmartInspector() {
+        statusItem.menu?.cancelTracking()
+        SettingsWindowController.shared.showSettings(tab: 3)
     }
 
     @objc private func exportDiagnosticReportAction() {

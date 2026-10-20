@@ -19,6 +19,8 @@ struct DiskHealthConfig: Codable, Equatable {
     var minFreeSpaceWarningGB: Double = 30.0
     var minExpectedUsbSpeedBps: UInt64 = 5_000_000_000
     var enableNativeNotifications: Bool = true
+    var enableCriticalSoundAlert: Bool = false
+    var scheduledVerifyIntervalHours: Int = 0
     var telegramBotToken: String = ""
     var telegramChatId: String = ""
     var webhookUrl: String = ""
@@ -43,6 +45,8 @@ struct DiskHealthConfig: Codable, Equatable {
         minFreeSpaceWarningGB = try container.decodeIfPresent(Double.self, forKey: .minFreeSpaceWarningGB) ?? defaults.minFreeSpaceWarningGB
         minExpectedUsbSpeedBps = try container.decodeIfPresent(UInt64.self, forKey: .minExpectedUsbSpeedBps) ?? defaults.minExpectedUsbSpeedBps
         enableNativeNotifications = try container.decodeIfPresent(Bool.self, forKey: .enableNativeNotifications) ?? defaults.enableNativeNotifications
+        enableCriticalSoundAlert = try container.decodeIfPresent(Bool.self, forKey: .enableCriticalSoundAlert) ?? defaults.enableCriticalSoundAlert
+        scheduledVerifyIntervalHours = try container.decodeIfPresent(Int.self, forKey: .scheduledVerifyIntervalHours) ?? defaults.scheduledVerifyIntervalHours
         telegramBotToken = try container.decodeIfPresent(String.self, forKey: .telegramBotToken) ?? defaults.telegramBotToken
         telegramChatId = try container.decodeIfPresent(String.self, forKey: .telegramChatId) ?? defaults.telegramChatId
         webhookUrl = try container.decodeIfPresent(String.self, forKey: .webhookUrl) ?? defaults.webhookUrl
@@ -318,6 +322,10 @@ final class ConfigManager: ObservableObject {
                         result.enableActiveCanary = (val.lowercased() == "true" || val == "1" || val.lowercased() == "yes")
                     case "ENABLE_NATIVE_NOTIFICATIONS":
                         result.enableNativeNotifications = (val.lowercased() == "true" || val == "1" || val.lowercased() == "yes")
+                    case "ENABLE_CRITICAL_SOUND_ALERT":
+                        result.enableCriticalSoundAlert = (val.lowercased() == "true" || val == "1" || val.lowercased() == "yes")
+                    case "SCHEDULED_VERIFY_INTERVAL_HOURS":
+                        if let v = Int(val), v >= 0 { result.scheduledVerifyIntervalHours = v }
                     case "POLL_INTERVAL_SECONDS":
                         if let v = TimeInterval(val), v >= 5.0 { result.pollIntervalSeconds = v }
                     case "ALERT_COOLDOWN_SECONDS":
@@ -368,6 +376,12 @@ final class ConfigManager: ObservableObject {
         }
         if let v = env["ENABLE_NATIVE_NOTIFICATIONS"], !v.isEmpty {
             result.enableNativeNotifications = (v.lowercased() == "true" || v == "1" || v.lowercased() == "yes")
+        }
+        if let v = env["ENABLE_CRITICAL_SOUND_ALERT"], !v.isEmpty {
+            result.enableCriticalSoundAlert = (v.lowercased() == "true" || v == "1" || v.lowercased() == "yes")
+        }
+        if let v = env["SCHEDULED_VERIFY_INTERVAL_HOURS"], let val = Int(v), val >= 0 {
+            result.scheduledVerifyIntervalHours = val
         }
         if let v = env["POLL_INTERVAL_SECONDS"], let val = TimeInterval(v), val >= 5.0 { result.pollIntervalSeconds = val }
         if let v = env["ALERT_COOLDOWN_SECONDS"], let val = TimeInterval(v), val >= 0.0 { result.alertCooldownSeconds = val }

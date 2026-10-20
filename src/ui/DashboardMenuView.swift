@@ -110,7 +110,7 @@ struct DashboardMenuView: View {
                         icon: "bolt.heart.fill",
                         title: "SSD LIFESPAN",
                         value: snap.smartValid ? "\(snap.lifeRemainingPercent)% Left" : "N/A",
-                        subtitle: snap.smartValid ? "Spare: \(snap.availableSpare)% • Used: \(snap.percentageUsed)%" : "No SMART",
+                        subtitle: snap.smartValid ? "Est: \(snap.estimatedRemainingLifeFormatted) • Spare: \(snap.availableSpare)%" : "No SMART",
                         tint: .blue,
                         progress: snap.smartValid ? min(1.0, max(0.0, Double(snap.lifeRemainingPercent) / 100.0)) : nil,
                         progressColor: snap.lifeRemainingPercent < 20 ? .red : (snap.lifeRemainingPercent < 50 ? .orange : .blue)
@@ -122,7 +122,7 @@ struct DashboardMenuView: View {
                         icon: "internaldrive.fill",
                         title: "LIFETIME TBW / READ",
                         value: snap.smartValid ? String(format: "%.2f TBW", snap.totalTerabytesWritten) : "N/A",
-                        subtitle: snap.smartValid ? String(format: "%.2f TB Read • %lluh POH", snap.totalTerabytesRead, snap.powerOnHours) : "No SMART",
+                        subtitle: snap.smartValid ? String(format: "%.2f TB R • %.1f GB/d • %lluh", snap.totalTerabytesRead, snap.dailyTerabytesWritten * 1000.0, snap.powerOnHours) : "No SMART",
                         tint: .purple
                     )
                     metricTile(

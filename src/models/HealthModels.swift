@@ -179,13 +179,19 @@ struct DiskHealthSnapshot: Codable {
     let smartValid: Bool
     let criticalWarning: UInt8
     let temperatureCelsius: Int
+    var temperatureKelvin: Int = 0
     let peakTemperatureCelsius: Int
     let availableSpare: UInt8
     let availableSpareThreshold: UInt8
     let percentageUsed: UInt8
     let lifeRemainingPercent: Int
+    var dataUnitsRead: UInt64 = 0
+    var dataUnitsWritten: UInt64 = 0
     let totalTerabytesRead: Double
     let totalTerabytesWritten: Double
+    var hostReadCommands: UInt64 = 0
+    var hostWriteCommands: UInt64 = 0
+    var controllerBusyTime: UInt64 = 0
     let powerCycles: UInt64
     let powerOnHours: UInt64
     let unsafeShutdowns: UInt64
@@ -210,6 +216,38 @@ struct DiskHealthSnapshot: Codable {
     // Volume Verification
     let lastVerifyResult: String
     let lastVerifyOk: Bool
+
+    // Computed SSD Endurance & Wear-Rate Projections
+    var dailyTerabytesWritten: Double {
+        guard smartValid, powerOnHours > 0, totalTerabytesWritten > 0 else { return 0.0 }
+        let activeDays = max(1.0, Double(powerOnHours) / 24.0)
+        return totalTerabytesWritten / activeDays
+    }
+
+    var estimatedRemainingLifeFormatted: String {
+        guard smartValid else { return "N/A" }
+        if percentageUsed >= 100 {
+            return "Depleted (< 1% left)"
+        }
+        guard powerOnHours >= 24 else {
+            return "Calibrating (< 24h POH)"
+        }
+        let activeDays = Double(powerOnHours) / 24.0
+        if percentageUsed == 0 {
+            return "> 10 Years (0% Wear)"
+        }
+        let daysPerPercent = activeDays / Double(percentageUsed)
+        let remainingDays = daysPerPercent * Double(max(0, 100 - Int(percentageUsed)))
+        if remainingDays >= 3650 {
+            return "> 10 Years"
+        } else if remainingDays >= 365 {
+            return String(format: "~%.1f Years", remainingDays / 365.25)
+        } else if remainingDays >= 30 {
+            return String(format: "~%.0f Months", remainingDays / 30.44)
+        } else {
+            return String(format: "~%.0f Days", max(1.0, remainingDays))
+        }
+    }
 }
 
 // MARK: - Helpers & Formatting

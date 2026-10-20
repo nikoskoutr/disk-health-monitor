@@ -1,6 +1,7 @@
 import Foundation
 import Darwin
 import Combine
+import AppKit
 
 // MARK: - Core Health Monitor Engine
 
@@ -893,13 +894,19 @@ final class DiskHealthMonitor: ObservableObject {
             smartValid: hw.smartValid,
             criticalWarning: hw.criticalWarning,
             temperatureCelsius: tempC,
+            temperatureKelvin: Int(hw.temperatureKelvin),
             peakTemperatureCelsius: driveState.peakTemperatureCelsius,
             availableSpare: hw.availableSpare,
             availableSpareThreshold: hw.availableSpareThreshold,
             percentageUsed: hw.percentageUsed,
             lifeRemainingPercent: lifeRemaining,
+            dataUnitsRead: hw.dataUnitsRead,
+            dataUnitsWritten: hw.dataUnitsWritten,
             totalTerabytesRead: tbRead,
             totalTerabytesWritten: tbWritten,
+            hostReadCommands: hw.hostReadCommands,
+            hostWriteCommands: hw.hostWriteCommands,
+            controllerBusyTime: hw.controllerBusyTime,
             powerCycles: hw.powerCycles,
             powerOnHours: hw.powerOnHours,
             unsafeShutdowns: hw.unsafeShutdowns,
@@ -933,6 +940,16 @@ final class DiskHealthMonitor: ObservableObject {
 
         if allowNotifications {
             processAlertsAndDigestLocked(snapshot: snapshot, rawMetrics: hw, driveKey: driveKey)
+        }
+
+        // Check if scheduled background volume verification is due
+        if allowNotifications && !isSystemSleeping && !isVerifyingInternal && cfg.scheduledVerifyIntervalHours > 0 && isMounted {
+            let intervalSec = Double(cfg.scheduledVerifyIntervalHours) * 3600.0
+            if (nowTs - driveState.lastVerifyTimestamp) >= intervalSec {
+                DispatchQueue.global(qos: .utility).async { [weak self] in
+                    self?.runVolumeVerification(sendTelegram: true)
+                }
+            }
         }
 
         saveStateLocked()
@@ -975,6 +992,12 @@ final class DiskHealthMonitor: ObservableObject {
                 : "\(snapshot.productName) HEALTH WARNING"
 
             ConfigManager.shared.log("Alert triggered: \(alertTitle) — \(snapshot.issues.map { $0.title }.joined(separator: ", "))")
+
+            if cfg.enableCriticalSoundAlert && snapshot.overallSeverity == .critical && MacOSNotifier.hasValidAppBundle {
+                DispatchQueue.main.async {
+                    NSSound.beep()
+                }
+            }
 
             // Send macOS notification
             if cfg.enableNativeNotifications {
