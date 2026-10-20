@@ -6,19 +6,30 @@ import AppKit
 
 final class MacOSNotifier: NSObject, UNUserNotificationCenterDelegate {
     static let shared = MacOSNotifier()
+    private let stateLock = NSLock()
     private var isAuthorized = false
 
-    private var isAppBundle: Bool {
-        Bundle.main.bundleURL.pathExtension == "app" && Bundle.main.bundleIdentifier != nil
+    static var hasValidAppBundle: Bool {
+        guard Bundle.main.bundleIdentifier != nil else { return false }
+        if Bundle.main.bundleURL.pathExtension == "app" {
+            return true
+        }
+        if let execURL = Bundle.main.executableURL?.resolvingSymlinksInPath(),
+           execURL.path.contains(".app/Contents/MacOS/") {
+            return true
+        }
+        return false
     }
 
     override private init() {
         super.init()
-        guard isAppBundle else { return }
+        guard MacOSNotifier.hasValidAppBundle else { return }
         let center = UNUserNotificationCenter.current()
         center.delegate = self
-        center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
-            self.isAuthorized = granted
+        center.requestAuthorization(options: [.alert, .sound, .badge]) { [weak self] granted, error in
+            self?.stateLock.lock()
+            self?.isAuthorized = granted
+            self?.stateLock.unlock()
             if let err = error {
                 ConfigManager.shared.log("Notification authorization error: \(err.localizedDescription)")
             }
@@ -34,8 +45,19 @@ final class MacOSNotifier: NSObject, UNUserNotificationCenterDelegate {
             .replacingOccurrences(of: "\0", with: "")
     }
 
-    func postNotification(title: String, subtitle: String, body: String, identifier: String = UUID().uuidString) {
-        if isAppBundle {
+    func postNotification(title: String, subtitle: String, body: String, identifier: String = "disk-health-status") {
+        guard MacOSNotifier.hasValidAppBundle else {
+            ConfigManager.shared.log("Skipping desktop banner (process is not running inside an .app bundle): \(title)")
+            return
+        }
+
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { settings in
+            guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else {
+                ConfigManager.shared.log("Desktop notification suppressed (authorizationStatus=\(settings.authorizationStatus.rawValue)): \(title)")
+                return
+            }
+
             let content = UNMutableNotificationContent()
             content.title = title
             if !subtitle.isEmpty { content.subtitle = subtitle }
@@ -43,32 +65,15 @@ final class MacOSNotifier: NSObject, UNUserNotificationCenterDelegate {
             content.sound = UNNotificationSound.default
 
             let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
-            UNUserNotificationCenter.current().add(request) { error in
+            center.add(request) { error in
                 if let error = error {
                     ConfigManager.shared.log("Failed to deliver native notification: \(error.localizedDescription)")
                 }
-            }
-        } else {
-            // Standalone CLI binary fallback via osascript
-            let safeTitle = MacOSNotifier.escapeAppleScriptLiteral(title)
-            let safeSub = MacOSNotifier.escapeAppleScriptLiteral(subtitle)
-            let safeBody = MacOSNotifier.escapeAppleScriptLiteral(body)
-            let script = subtitle.isEmpty
-                ? "display notification \"\(safeBody)\" with title \"\(safeTitle)\""
-                : "display notification \"\(safeBody)\" with title \"\(safeTitle)\" subtitle \"\(safeSub)\""
-            DispatchQueue.global(qos: .utility).async {
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-                proc.arguments = ["-e", script]
-                proc.standardOutput = FileHandle.nullDevice
-                proc.standardError = FileHandle.nullDevice
-                try? proc.run()
-                proc.waitUntilExit()
             }
         }
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        completionHandler([.banner, .sound])
+        completionHandler([.banner, .list, .sound])
     }
 }

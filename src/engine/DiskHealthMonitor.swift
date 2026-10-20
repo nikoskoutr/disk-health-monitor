@@ -22,15 +22,87 @@ final class DiskHealthMonitor: ObservableObject {
     private var cachedCanaryLatencyMs: Double = 0.0
     private var cachedCanaryError: String = ""
     private var lastWakeTime: TimeInterval = 0
+    private(set) var isSystemSleeping: Bool = false
 
     private init() {
         self.state = DiskHealthMonitor.loadState()
     }
 
+    static func isNonCorruptionVerifyFailure(_ result: String) -> Bool {
+        let lower = result.lowercased()
+        return lower.contains("-69863") ||
+               lower.contains("insufficient privileges") ||
+               lower.contains("permission denied") ||
+               lower.contains("not permitted") ||
+               lower.contains("operation not permitted") ||
+               lower.contains("-69888") ||
+               lower.contains("couldn't unmount") ||
+               lower.contains("could not unmount") ||
+               lower.contains("couldn't be unmounted") ||
+               lower.contains("could not be unmounted") ||
+               lower.contains("unable to unmount") ||
+               lower.contains("resource busy") ||
+               lower.contains("volume is busy")
+    }
+
+    static func classifyVolumeVerificationOutput(terminationStatus: Int32, output: String, didTimeout: Bool, timeStr: String) -> (isHealthy: Bool, isSkipped: Bool, summary: String) {
+        if didTimeout {
+            return (true, true, "Skipped (\(timeStr)): Verification timed out after 180s")
+        }
+        let passed = (terminationStatus == 0) &&
+            (output.contains("appears to be OK") ||
+             output.contains("Finished file system verification") ||
+             output.contains("File system check exit code is 0"))
+        if passed {
+            return (true, false, "Verified OK (\(timeStr))")
+        }
+        if isNonCorruptionVerifyFailure(output) {
+            let lower = output.lowercased()
+            if output.contains("-69863") || lower.contains("insufficient privileges") || lower.contains("permission denied") || lower.contains("not permitted") {
+                return (true, true, "Skipped (\(timeStr)): Requires administrator privileges (-69863)")
+            }
+            return (true, true, "Skipped (\(timeStr)): Volume busy / in use")
+        }
+        let lastLines = output.components(separatedBy: .newlines).filter { !$0.isEmpty }.suffix(2).joined(separator: " | ")
+        let detail = lastLines.isEmpty ? "Exit code \(terminationStatus)" : lastLines
+        return (false, false, "Failed (\(timeStr)): \(detail)")
+    }
+
     private static func loadState() -> DiskPersistentState {
         let path = ConfigManager.shared.stateFilePath
         if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-           let decoded = try? JSONDecoder().decode(DiskPersistentState.self, from: data) {
+           var decoded = try? JSONDecoder().decode(DiskPersistentState.self, from: data) {
+            var migrated = false
+            for (k, var d) in decoded.drives {
+                if !d.lastVerifyOk && isNonCorruptionVerifyFailure(d.lastVerifyResult) {
+                    d.lastVerifyOk = true
+                    d.lastVerifyResult = "Skipped: Requires administrator privileges (-69863)"
+                    if d.lastOverallSeverity == HealthSeverity.critical.rawValue {
+                        d.lastOverallSeverity = HealthSeverity.healthy.rawValue
+                    }
+                    decoded.drives[k] = d
+                    migrated = true
+                }
+                let verifyAlertKey = "\(k):VOLUME_VERIFY_FAILED"
+                if decoded.lastAlertTimestampByCode.removeValue(forKey: verifyAlertKey) != nil {
+                    migrated = true
+                }
+            }
+            if decoded.lastAlertTimestampByCode.removeValue(forKey: "VOLUME_VERIFY_FAILED") != nil {
+                migrated = true
+            }
+            if migrated {
+                if decoded.lastOverallSeverity == HealthSeverity.critical.rawValue &&
+                   !decoded.drives.values.contains(where: { $0.lastOverallSeverity == HealthSeverity.critical.rawValue }) {
+                    decoded.lastOverallSeverity = HealthSeverity.healthy.rawValue
+                }
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                if let outData = try? encoder.encode(decoded) {
+                    try? outData.write(to: URL(fileURLWithPath: path), options: .atomic)
+                    try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+                }
+            }
             return decoded
         }
         return DiskPersistentState()
@@ -48,6 +120,7 @@ final class DiskHealthMonitor: ObservableObject {
 
     func noteSystemWillSleep() {
         engineLock.lock()
+        isSystemSleeping = true
         previousSampleTime = 0
         engineLock.unlock()
         ConfigManager.shared.log("System entering sleep; pausing telemetry deltas.")
@@ -55,6 +128,7 @@ final class DiskHealthMonitor: ObservableObject {
 
     func noteSystemDidWake(at timestamp: TimeInterval = Date().timeIntervalSince1970) {
         engineLock.lock()
+        isSystemSleeping = false
         lastWakeTime = timestamp
         previousSampleTime = 0
         lastCanaryRunTime = 0
@@ -131,6 +205,8 @@ final class DiskHealthMonitor: ObservableObject {
                 d.baselineIoWriteErrors = snap.errorsWritten
                 d.baselineIoReadRetries = snap.retriesRead
                 d.baselineIoWriteRetries = snap.retriesWritten
+                d.lastVerifyOk = true
+                d.lastVerifyResult = "Not run yet"
                 d.lastOverallSeverity = HealthSeverity.healthy.rawValue
             }
         } else {
@@ -143,6 +219,8 @@ final class DiskHealthMonitor: ObservableObject {
                     d.baselineIoWriteErrors = nil
                     d.baselineIoReadRetries = nil
                     d.baselineIoWriteRetries = nil
+                    d.lastVerifyOk = true
+                    d.lastVerifyResult = "Not run yet"
                     d.lastOverallSeverity = HealthSeverity.healthy.rawValue
                 }
             }
@@ -151,6 +229,10 @@ final class DiskHealthMonitor: ObservableObject {
         }
         for k in Array(self.state.drives.keys) {
             self.state.updateDriveState(key: k) {
+                $0.lastVerifyOk = true
+                if !$0.lastVerifyResult.starts(with: "Verified OK") {
+                    $0.lastVerifyResult = "Not run yet"
+                }
                 $0.lastOverallSeverity = HealthSeverity.healthy.rawValue
             }
         }
@@ -167,9 +249,10 @@ final class DiskHealthMonitor: ObservableObject {
         }
 
         var result = performSingleCanaryPass(targetMount: targetMount)
-        if result.0 && result.1 > 300.0 {
+        if !result.0 || result.1 > 300.0 {
+            usleep(50_000) // 50ms settle before retry pass
             let secondPass = performSingleCanaryPass(targetMount: targetMount)
-            if secondPass.0 {
+            if secondPass.0 || !result.0 {
                 result = secondPass
             }
         }
@@ -351,7 +434,9 @@ final class DiskHealthMonitor: ObservableObject {
             subpathsStatus[subpath] = exists
         }
 
-        let driveKey = !serialNumber.isEmpty ? serialNumber : (!bsdName.isEmpty ? bsdName : (targetMount.isEmpty ? "default" : targetMount))
+        let driveKey = !serialNumber.isEmpty
+            ? serialNumber
+            : (!bsdName.isEmpty ? bsdName : (!targetMount.isEmpty ? targetMount : (!targetQuery.isEmpty ? targetQuery : "default")))
         if driveKey != previousDriveKey {
             if !previousDriveKey.isEmpty {
                 state.lastOverallSeverity = HealthSeverity.healthy.rawValue
@@ -368,7 +453,10 @@ final class DiskHealthMonitor: ObservableObject {
         var canaryLatencyMs = 0.0
         var canaryError = isMounted ? "Canary disabled" : "Volume not mounted"
         if isMounted && cfg.enableActiveCanary {
-            if !isReadOnly || mountPoint == "/" {
+            if isSystemSleeping {
+                canaryOk = true
+                canaryError = "Suppressed while system is sleeping"
+            } else if !isReadOnly || mountPoint == "/" {
                 (canaryOk, canaryLatencyMs, canaryError) = runCanaryCheck(targetMount: mountPoint, force: forceCanary)
             } else {
                 canaryOk = false
@@ -424,7 +512,7 @@ final class DiskHealthMonitor: ObservableObject {
         // 8. Health Evaluation Rules Engine
         var issues: [HealthIssue] = []
         var score = 100
-        let inWakeGrace = (lastWakeTime > 0 && (nowTs - lastWakeTime < 8.0))
+        let inWakeGrace = isSystemSleeping || (lastWakeTime > 0 && (nowTs - lastWakeTime < 8.0))
 
         // Rule 1: Hardware Presence
         if !hw.found {
@@ -683,13 +771,23 @@ final class DiskHealthMonitor: ObservableObject {
         }
 
         if !driveState.lastVerifyOk {
-            issues.append(HealthIssue(
-                code: "VOLUME_VERIFY_FAILED",
-                severity: .critical,
-                title: "File System Verification Failed",
-                detail: driveState.lastVerifyResult
-            ))
-            score -= 40
+            if DiskHealthMonitor.isNonCorruptionVerifyFailure(driveState.lastVerifyResult) {
+                state.updateDriveState(key: driveKey) {
+                    $0.lastVerifyOk = true
+                    if !$0.lastVerifyResult.starts(with: "Skipped") {
+                        $0.lastVerifyResult = "Skipped: Requires administrator privileges (-69863)"
+                    }
+                }
+                driveState.lastVerifyOk = true
+            } else {
+                issues.append(HealthIssue(
+                    code: "VOLUME_VERIFY_FAILED",
+                    severity: .critical,
+                    title: "File System Verification Failed",
+                    detail: driveState.lastVerifyResult
+                ))
+                score -= 40
+            }
         }
 
         score = max(0, min(100, score))
@@ -826,7 +924,8 @@ final class DiskHealthMonitor: ObservableObject {
                 MacOSNotifier.shared.postNotification(
                     title: alertTitle,
                     subtitle: "Score: \(snapshot.healthScore)/100 (\(snapshot.overallSeverity.rawValue))",
-                    body: body
+                    body: body,
+                    identifier: "disk-health-alert-\(driveKey)"
                 )
             }
 
@@ -860,7 +959,8 @@ final class DiskHealthMonitor: ObservableObject {
                 MacOSNotifier.shared.postNotification(
                     title: recoveryTitle,
                     subtitle: "Score: \(snapshot.healthScore)/100",
-                    body: "All storage and filesystem health checks passed."
+                    body: "All storage and filesystem health checks passed.",
+                    identifier: "disk-health-alert-\(driveKey)"
                 )
             }
 
@@ -967,20 +1067,17 @@ final class DiskHealthMonitor: ObservableObject {
 
                 let output = String(decoding: data, as: UTF8.self)
                 let timeStr = shortMonthDateFormatter.string(from: Date())
-                if didTimeout {
-                    ok = false
-                    summary = "Timed out after 180s (\(timeStr))"
-                } else {
-                    ok = (proc.terminationStatus == 0) && (output.contains("appears to be OK") || output.contains("Finished file system verification") || output.contains("File system check exit code is 0"))
-                    if ok {
-                        summary = "Verified OK (\(timeStr))"
-                    } else {
-                        let lastLines = output.components(separatedBy: .newlines).filter { !$0.isEmpty }.suffix(2).joined(separator: " | ")
-                        summary = "Failed (\(timeStr)): \(lastLines)"
-                    }
-                }
+                let classified = DiskHealthMonitor.classifyVolumeVerificationOutput(
+                    terminationStatus: proc.terminationStatus,
+                    output: output,
+                    didTimeout: didTimeout,
+                    timeStr: timeStr
+                )
+                ok = classified.isHealthy
+                summary = classified.summary
             } catch {
-                summary = "Error running diskutil: \(error.localizedDescription)"
+                ok = true
+                summary = "Skipped: Could not launch diskutil (\(error.localizedDescription))"
             }
 
             self.engineLock.lock()
@@ -995,9 +1092,16 @@ final class DiskHealthMonitor: ObservableObject {
 
             ConfigManager.shared.log("Volume verification finished: ok=\(ok), result=\(summary)")
 
-            let updatedSnap = self.evaluateHealth(forceCanary: true, allowNotifications: true)
+            let updatedSnap = self.evaluateHealth(forceCanary: true, allowNotifications: !ok)
             if sendTelegram {
-                let title = ok ? "\(updatedSnap.productName) File System Verification Passed" : "\(updatedSnap.productName) File System Verification FAILED"
+                let title: String
+                if summary.starts(with: "Verified OK") {
+                    title = "\(updatedSnap.productName) File System Verification Passed"
+                } else if summary.starts(with: "Skipped") {
+                    title = "\(updatedSnap.productName) File System Verification Skipped"
+                } else {
+                    title = "\(updatedSnap.productName) File System Verification FAILED"
+                }
                 let html = TelegramNotifier.shared.formatReportHTML(snapshot: updatedSnap, title: title)
                 TelegramNotifier.shared.sendMessageAsync(htmlText: html, disableNotification: ok)
             }

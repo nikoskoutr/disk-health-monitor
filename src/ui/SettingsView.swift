@@ -37,7 +37,9 @@ final class SettingsViewModel: ObservableObject {
         let bundleId = Bundle.main.bundleIdentifier ?? "io.github.disk-health-monitor"
         let agentsDir = "\(home)/Library/LaunchAgents"
         let plistPath = "\(agentsDir)/\(bundleId).plist"
-        let binaryPath = Bundle.main.executablePath ?? "/Applications/DiskHealthMonitor.app/Contents/MacOS/DiskHealthMonitor"
+        let binaryPath = Bundle.main.executableURL?.resolvingSymlinksInPath().path
+            ?? Bundle.main.executablePath
+            ?? "/Applications/DiskHealthMonitor.app/Contents/MacOS/DiskHealthMonitor"
         let logsDir = ConfigManager.shared.logsDir
         let isCurrentlyInstalled = launchAgentInstalled
 

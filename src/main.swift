@@ -307,4 +307,39 @@ func parseCommandLine() {
     app.run()
 }
 
+func ensureRunningFromAppBundleIfAvailable() {
+    guard Bundle.main.bundleIdentifier == nil else { return }
+    guard ProcessInfo.processInfo.environment["DISK_HEALTH_REEXEC"] == nil else { return }
+
+    let rawArg0 = CommandLine.arguments.first ?? ""
+    guard !rawArg0.isEmpty else { return }
+
+    var execURL: URL
+    if rawArg0.hasPrefix("/") {
+        execURL = URL(fileURLWithPath: rawArg0)
+    } else {
+        let cwd = FileManager.default.currentDirectoryPath
+        execURL = URL(fileURLWithPath: cwd).appendingPathComponent(rawArg0)
+    }
+    if !FileManager.default.fileExists(atPath: execURL.path), let bundleExecURL = Bundle.main.executableURL {
+        execURL = bundleExecURL
+    }
+
+    let resolvedPath = execURL.resolvingSymlinksInPath().standardizedFileURL.path
+    if resolvedPath != execURL.standardizedFileURL.path &&
+       resolvedPath.contains(".app/Contents/MacOS/") &&
+       FileManager.default.isExecutableFile(atPath: resolvedPath) {
+        setenv("DISK_HEALTH_REEXEC", "1", 1)
+        var cArgs: [UnsafeMutablePointer<CChar>?] = CommandLine.arguments.enumerated().map { idx, arg in
+            strdup(idx == 0 ? resolvedPath : arg)
+        }
+        cArgs.append(nil)
+        execv(resolvedPath, &cArgs)
+        for ptr in cArgs {
+            if let ptr = ptr { free(ptr) }
+        }
+    }
+}
+
+ensureRunningFromAppBundleIfAvailable()
 parseCommandLine()

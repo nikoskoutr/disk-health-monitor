@@ -16,6 +16,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var cachedDevices: [DiskHardwareMetrics] = []
     private var cachedMounts: [(path: String, name: String)] = []
     private let cacheLock = NSLock()
+    private var mountDebounceWorkItem: DispatchWorkItem?
+    private var wakeWorkItem: DispatchWorkItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -278,25 +280,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func volumeMountChanged(_ note: Notification) {
-        ConfigManager.shared.log("Volume mount change detected: \(note.name.rawValue)")
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.5) {
+        guard !DiskHealthMonitor.shared.isSystemSleeping else {
+            ConfigManager.shared.log("Ignoring dark-wake volume mount event while system is sleeping: \(note.name.rawValue)")
+            return
+        }
+        mountDebounceWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, !DiskHealthMonitor.shared.isSystemSleeping else { return }
+            ConfigManager.shared.log("Processing settled volume mount change (\(note.name.rawValue))")
             self.refreshHealth(forceCanary: true)
         }
+        mountDebounceWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
     }
 
     @objc private func systemWillSleep(_ note: Notification) {
         pollTimer?.invalidate()
+        mountDebounceWorkItem?.cancel()
+        wakeWorkItem?.cancel()
         DiskHealthMonitor.shared.noteSystemWillSleep()
     }
 
     @objc private func systemDidWake(_ note: Notification) {
         DiskHealthMonitor.shared.noteSystemDidWake()
+        wakeWorkItem?.cancel()
         // Wait 8 seconds for external USB/Thunderbolt buses to re-enumerate before polling
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) { [weak self] in
-            guard let self = self else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, !DiskHealthMonitor.shared.isSystemSleeping else { return }
             self.refreshHealth(forceCanary: false)
             self.schedulePollingTimer(interval: ConfigManager.shared.currentConfig.pollIntervalSeconds)
         }
+        wakeWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0, execute: work)
     }
 
     private func updateDiskCache() {

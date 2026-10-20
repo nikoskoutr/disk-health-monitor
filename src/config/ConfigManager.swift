@@ -88,7 +88,19 @@ final class ConfigManager: ObservableObject {
     private init() {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let currentDir = FileManager.default.currentDirectoryPath
-        let bundleParent = Bundle.main.bundleURL.deletingLastPathComponent().path
+        let resolvedBundleURL: URL = {
+            if Bundle.main.bundleURL.pathExtension == "app" {
+                return Bundle.main.bundleURL.resolvingSymlinksInPath()
+            }
+            if let execURL = Bundle.main.executableURL?.resolvingSymlinksInPath() {
+                let candidate = execURL.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+                if candidate.pathExtension == "app" {
+                    return candidate
+                }
+            }
+            return Bundle.main.bundleURL
+        }()
+        let bundleParent = resolvedBundleURL.deletingLastPathComponent().path
 
         // 1. Resolve User Configuration Directory
         if let envConfigDir = ProcessInfo.processInfo.environment["DISK_HEALTH_CONFIG_DIR"], !envConfigDir.isEmpty {

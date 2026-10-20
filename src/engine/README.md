@@ -21,6 +21,7 @@ This directory contains the core hardware and filesystem evaluation engine (`Dis
 - When invoked with `--deep` (or **"Verify Volume"** in the UI / digest dispatches), executes `/usr/sbin/diskutil verifyVolume <target>`.
 - Atomically captures target path and `driveKey` under `engineLock` before dispatching to prevent cross-drive attribution races.
 - Features a 180-second watchdog timer with `NSLock`-synchronized timeout handling, non-blocking pipe drainage via `readToEnd()`, cancellable `DispatchWorkItem` escalation, and clean two-stage process termination (`SIGTERM` followed by `SIGKILL` escalation).
+- Distinguishes genuine filesystem corruption from non-root permission limitations (`Insufficient privileges (-69863)`) or busy mounts (`-69888`), marking operational skips as `Skipped` without triggering false-positive `VOLUME_VERIFY_FAILED` critical alerts.
 
 #### 4. The 12 Health Evaluation Rules (`evaluateHealth`)
 

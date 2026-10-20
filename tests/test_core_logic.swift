@@ -1126,6 +1126,132 @@ struct CoreLogicTestRunner {
         assertTrue(testVM.isUpdatingLaunchAgent == false, "isUpdatingLaunchAgent must initialize to false")
         print("  [OK] Per-drive lastOverallSeverity tracking and cross-target recovery verified")
 
+        print("=== Swift Unit Test 30: Volume Verification Privilege (-69863) Classification, Self-Healing Migration & Dark-Wake Guard (IMPROVE-V9-01 to V9-06) ===")
+        // 30a. Verify classifyVolumeVerificationOutput does NOT fail on -69863 Insufficient privileges or permission denied
+        let privOut = "Error starting file system verification for disk7s1 (T7): Insufficient privileges (-69863)"
+        let privClassified = DiskHealthMonitor.classifyVolumeVerificationOutput(
+            terminationStatus: 1,
+            output: privOut,
+            didTimeout: false,
+            timeStr: "Oct 19, 23:16"
+        )
+        assertTrue(privClassified.isHealthy == true, "-69863 Insufficient privileges must be classified as healthy (not corruption)")
+        assertTrue(privClassified.isSkipped == true, "-69863 Insufficient privileges must be marked as skipped")
+        assertTrue(privClassified.summary.starts(with: "Skipped"), "Summary must start with 'Skipped', got: \(privClassified.summary)")
+
+        let permDeniedOut = "Error starting file system verification: Permission denied"
+        let permClassified = DiskHealthMonitor.classifyVolumeVerificationOutput(
+            terminationStatus: 1,
+            output: permDeniedOut,
+            didTimeout: false,
+            timeStr: "Oct 19, 23:18"
+        )
+        assertTrue(permClassified.isHealthy == true, "Permission denied without error code must be classified as healthy")
+        assertTrue(permClassified.isSkipped == true, "Permission denied must be marked as skipped")
+        assertTrue(permClassified.summary.contains("Requires administrator privileges"), "Summary must mention administrator privileges")
+
+        // 30b. Verify classifyVolumeVerificationOutput does NOT fail on -69888 Volume busy / couldn't unmount
+        let busyOut = "Error: -69888: Couldn't unmount disk"
+        let busyClassified = DiskHealthMonitor.classifyVolumeVerificationOutput(
+            terminationStatus: 1,
+            output: busyOut,
+            didTimeout: false,
+            timeStr: "Oct 19, 23:20"
+        )
+        assertTrue(busyClassified.isHealthy == true, "-69888 busy unmount failure must be classified as healthy")
+        assertTrue(busyClassified.isSkipped == true, "-69888 busy unmount failure must be marked as skipped")
+
+        let unmountWithoutCodeOut = "Volume could not unmount: resource busy"
+        let unmountClassified = DiskHealthMonitor.classifyVolumeVerificationOutput(
+            terminationStatus: 1,
+            output: unmountWithoutCodeOut,
+            didTimeout: false,
+            timeStr: "Oct 19, 23:22"
+        )
+        assertTrue(unmountClassified.isHealthy == true, "Unmount failure without error code must be classified as healthy")
+        assertTrue(unmountClassified.isSkipped == true, "Unmount failure without error code must be marked as skipped")
+
+        // 30c. Verify genuine fsck corruption still triggers failure, and empty output is handled
+        let corruptOut = "error: container_oid (0x1) is invalid\nFile system check exit code is 8.\nError: -69845: File system verify or repair failed"
+        let corruptClassified = DiskHealthMonitor.classifyVolumeVerificationOutput(
+            terminationStatus: 1,
+            output: corruptOut,
+            didTimeout: false,
+            timeStr: "Oct 19, 23:25"
+        )
+        assertTrue(corruptClassified.isHealthy == false, "Genuine filesystem corruption (-69845 / exit code 8) must be classified as unhealthy")
+        assertTrue(corruptClassified.isSkipped == false, "Genuine filesystem corruption must not be marked as skipped")
+        assertTrue(corruptClassified.summary.starts(with: "Failed"), "Corruption summary must start with 'Failed'")
+
+        let emptyOutputClassified = DiskHealthMonitor.classifyVolumeVerificationOutput(
+            terminationStatus: 1,
+            output: "",
+            didTimeout: false,
+            timeStr: "Oct 19, 23:26"
+        )
+        assertTrue(emptyOutputClassified.isHealthy == false, "Non-zero exit with empty output must be classified as failure")
+        assertTrue(emptyOutputClassified.summary.contains("Exit code 1"), "Empty output failure summary must include exit code")
+
+        // 30d. Verify poisoned state with -69863 does not trigger VOLUME_VERIFY_FAILED in evaluateHealth
+        monitor.setMonitoredTarget(volumePath: "/", deviceQuery: nil)
+        let rootCheckSnap = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        let rootKey = !rootCheckSnap.serialNumber.isEmpty ? rootCheckSnap.serialNumber : rootCheckSnap.bsdName
+        monitor.mutateStateForTesting { st in
+            st.updateDriveState(key: rootKey) { d in
+                d.lastVerifyOk = false
+                d.lastVerifyResult = "Failed (Oct 19, 16:07): Error starting file system verification for disk3s1 (Macintosh HD): Insufficient privileges (-69863)"
+            }
+        }
+        let healedSnap = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        assertTrue(!healedSnap.issues.contains(where: { $0.code == "VOLUME_VERIFY_FAILED" }), "Poisoned -69863 verify result must NEVER trigger VOLUME_VERIFY_FAILED")
+        assertTrue(healedSnap.lastVerifyOk == true, "evaluateHealth must auto-heal poisoned lastVerifyOk to true")
+
+        // 30e. Verify resetBaselines clears any failed lastVerifyOk state
+        monitor.mutateStateForTesting { st in
+            st.updateDriveState(key: rootKey) { d in
+                d.lastVerifyOk = false
+                d.lastVerifyResult = "Failed: simulated corruption"
+            }
+        }
+        let corruptVerifySnap = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        assertTrue(corruptVerifySnap.issues.contains(where: { $0.code == "VOLUME_VERIFY_FAILED" }), "Simulated corruption must trigger VOLUME_VERIFY_FAILED before reset")
+        monitor.resetBaselines()
+        let postResetVerifySnap = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        assertTrue(!postResetVerifySnap.issues.contains(where: { $0.code == "VOLUME_VERIFY_FAILED" }), "resetBaselines() must clear VOLUME_VERIFY_FAILED")
+        assertTrue(postResetVerifySnap.lastVerifyOk == true, "resetBaselines() must restore lastVerifyOk to true")
+
+        // 30f. Verify Dark-Wake suppression while isSystemSleeping is true
+        monitor.noteSystemWillSleep()
+        assertTrue(monitor.isSystemSleeping == true, "isSystemSleeping must be true after noteSystemWillSleep()")
+        cfgMgr.updateConfig { cfg in
+            cfg.targetVolumePath = "/Volumes/__Dark_Wake_Unmounted_Drive__"
+            cfg.targetDeviceQuery = "disk99997"
+        }
+        let darkWakeSnap = monitor.evaluateHealth(forceCanary: true, allowNotifications: false)
+        assertTrue(!darkWakeSnap.issues.contains(where: { $0.code == "HW_DISCONNECTED" }), "Dark wake must suppress HW_DISCONNECTED while system is sleeping")
+        assertTrue(!darkWakeSnap.issues.contains(where: { $0.code == "VOLUME_UNMOUNTED" }), "Dark wake must suppress VOLUME_UNMOUNTED while system is sleeping")
+        assertTrue(!darkWakeSnap.issues.contains(where: { $0.code == "CANARY_IO_FAILED" }), "Dark wake must suppress CANARY_IO_FAILED while system is sleeping")
+        monitor.noteSystemDidWake(at: Date().timeIntervalSince1970 - 20.0)
+        assertTrue(monitor.isSystemSleeping == false, "isSystemSleeping must be false after noteSystemDidWake()")
+
+        // 30g. Verify driveKey scoping uses targetDeviceQuery when hardware is disconnected and targetVolumePath is nil
+        cfgMgr.updateConfig { cfg in
+            cfg.targetVolumePath = nil
+            cfg.targetDeviceQuery = "disk99996"
+            cfg.enableNativeNotifications = false
+        }
+        _ = monitor.evaluateHealth(forceCanary: false, allowNotifications: true)
+        assertTrue(monitor.persistentState.lastAlertTimestampByCode["disk99996:HW_DISCONNECTED"] != nil, "Disconnected device query must scope cooldown key to 'disk99996:HW_DISCONNECTED'")
+
+        // Restore clean config
+        cfgMgr.updateConfig { cfg in
+            cfg.targetVolumePath = "/"
+            cfg.targetDeviceQuery = nil
+            cfg.enableNativeNotifications = true
+        }
+        monitor.resetBaselines()
+        print("  [OK] Volume verification -69863 handling, self-healing migration, and dark-wake guard verified")
+
         print("✅ All Swift Core Logic Unit Tests Passed!")
     }
 }

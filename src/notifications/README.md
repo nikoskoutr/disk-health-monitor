@@ -8,11 +8,10 @@ This directory contains the notification dispatchers responsible for delivering 
 
 ### 1. [`MacOSNotifier.swift`](MacOSNotifier.swift)
 Delivers native desktop notifications on macOS:
-- **Primary Engine (`UNUserNotificationCenter`)**:
-  - Checks whether the process is executing inside a valid `.app` bundle (`Bundle.main.bundleIdentifier != nil`).
-  - Requests `.alert` and `.sound` authorization and dispatches `UNMutableNotificationContent` notifications when enabled in `MonitorConfig`.
-- **Headless CLI Fallback (`osascript`)**:
-  - When invoked from a raw CLI context or background script where `UNUserNotificationCenter` is unavailable, safely falls back to `/usr/bin/osascript -e 'display notification ...'` with escaped string literals.
+- **Native Bundle Engine (`UNUserNotificationCenter`)**:
+  - `main.swift` automatically resolves symlink invocations (`./disk-health`) into `DiskHealthMonitor.app/Contents/MacOS/DiskHealthMonitor` so the process always runs with its native `CFBundleIdentifier` (`io.github.disk-health-monitor`).
+  - Requests `.alert`, `.sound`, and `.badge` authorization and dispatches `UNMutableNotificationContent` notifications with per-drive deduplication identifiers (`disk-health-alert-<driveKey>`) when enabled in `DiskHealthConfig`.
+  - Never invokes AppleScript or Script Editor, preventing third-party script popup attribution.
 
 ### 2. [`TelegramNotifier.swift`](TelegramNotifier.swift)
 Delivers formatted HTML alerts to a Telegram chat or channel via `https://api.telegram.org/bot<token>/sendMessage`:
