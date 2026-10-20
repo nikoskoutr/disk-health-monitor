@@ -55,8 +55,8 @@ jobs:
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.1.0' }}
-          name: Universal Disk Health Monitor ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.1.0' }} (macOS arm64 / x86_64 / Universal)
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.2.0' }}
+          name: Universal Disk Health Monitor ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.2.0' }} (macOS arm64 / x86_64 / Universal)
           body: |
             ### Universal Disk Health Monitor Release
             Download the appropriate asset for your Mac architecture:
