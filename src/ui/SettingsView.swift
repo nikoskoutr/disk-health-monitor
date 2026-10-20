@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import Darwin
 
 // MARK: - Native macOS Settings Window (Cmd+,)
 
@@ -38,6 +39,11 @@ final class SettingsViewModel: ObservableObject {
         let isCurrentlyInstalled = launchAgentInstalled
 
         DispatchQueue.global(qos: .userInitiated).async {
+            // Temporarily ignore SIGTERM so `launchctl bootout` does not kill the currently
+            // running GUI process if this instance was originally spawned by launchd.
+            let prevSigTerm = signal(SIGTERM, SIG_IGN)
+            defer { signal(SIGTERM, prevSigTerm) }
+
             if isCurrentlyInstalled {
                 let bootout = Process()
                 bootout.executableURL = URL(fileURLWithPath: "/bin/launchctl")
@@ -200,7 +206,7 @@ final class SettingsViewModel: ObservableObject {
             "ProgramArguments": [binaryPath, "--menubar"],
             "WorkingDirectory": logsDir,
             "RunAtLoad": true,
-            "KeepAlive": true,
+            "KeepAlive": ["SuccessfulExit": false],
             "StandardOutPath": "\(logsDir)/launchd.out.log",
             "StandardErrorPath": "\(logsDir)/launchd.err.log",
             "ProcessType": "Interactive"

@@ -426,4 +426,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func quitApp() {
         NSApplication.shared.terminate(nil)
     }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        SingleInstanceLock.shared.release()
+    }
 }

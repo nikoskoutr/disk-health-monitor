@@ -209,7 +209,10 @@ if [[ "${1:-}" == "--install-service" ]] || [[ "${1:-}" == "--service" ]]; then
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>StandardOutPath</key>
     <string>${SCRIPT_DIR}/logs/launchd.out.log</string>
     <key>StandardErrorPath</key>
@@ -220,8 +223,13 @@ if [[ "${1:-}" == "--install-service" ]] || [[ "${1:-}" == "--service" ]]; then
 </plist>
 EOF
 
-    # Reload service
+    # Reload service and ensure any standalone GUI instance hands off cleanly to launchd
     launchctl bootout "gui/$(id -u)/${BUNDLE_ID}" 2>/dev/null || true
+    pkill -f "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" 2>/dev/null || true
+    for _ in {1..20}; do
+        pgrep -f "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" >/dev/null 2>&1 || break
+        sleep 0.1
+    done
     launchctl bootstrap "gui/$(id -u)" "${SERVICE_PLIST}"
     echo "🚀 LaunchAgent registered: ${SERVICE_PLIST}"
 fi

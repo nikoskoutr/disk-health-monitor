@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 // MARK: - Swift Core Logic & Engine Unit Test Suite
 
@@ -848,7 +849,8 @@ struct CoreLogicTestRunner {
         assertTrue(plistDict["StandardErrorPath"] as? String == "\(mockLogs)/launchd.err.log", "StandardErrorPath must be in logsDir")
         assertTrue(plistDict["ProcessType"] as? String == "Interactive", "ProcessType must be Interactive")
         assertTrue(plistDict["RunAtLoad"] as? Bool == true, "RunAtLoad must be true")
-        assertTrue(plistDict["KeepAlive"] as? Bool == true, "KeepAlive must be true")
+        let keepAliveDict = plistDict["KeepAlive"] as? [String: Bool]
+        assertTrue(keepAliveDict?["SuccessfulExit"] == false, "KeepAlive must be ['SuccessfulExit': false] to prevent duplicate respawn loops on clean exit")
 
         let plistData = try? PropertyListSerialization.data(fromPropertyList: plistDict, format: .xml, options: 0)
         assertTrue(plistData != nil && (plistData?.count ?? 0) > 0, "PropertyListSerialization must generate valid XML data")
@@ -856,9 +858,49 @@ struct CoreLogicTestRunner {
            let deserialized = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] {
             assertTrue(deserialized["Label"] as? String == mockBundleId, "Deserialized Label must match")
             assertTrue(deserialized["WorkingDirectory"] as? String == mockLogs, "Deserialized WorkingDirectory must match")
+            let desKeepAlive = deserialized["KeepAlive"] as? [String: Bool]
+            assertTrue(desKeepAlive?["SuccessfulExit"] == false, "Deserialized KeepAlive must have SuccessfulExit: false")
         } else {
             fatalError("Failed to deserialize generated plist XML")
         }
+
+        // Verify POSIX flock single-instance lock mechanics, PID writing, and 0600 permissions
+        let testLockPath = "\(NSTemporaryDirectory())test_menubar_\(UUID().uuidString).lock"
+        let fd1 = open(testLockPath, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        assertTrue(fd1 >= 0, "First open on lockfile must succeed")
+        fchmod(fd1, 0o600)
+        assertTrue(flock(fd1, LOCK_EX | LOCK_NB) == 0, "First non-blocking exclusive flock must succeed")
+
+        // Verify PID writing into lockfile
+        ftruncate(fd1, 0)
+        lseek(fd1, 0, SEEK_SET)
+        let pidStr = "\(getpid())\n"
+        _ = pidStr.withCString { ptr in
+            write(fd1, ptr, strlen(ptr))
+        }
+        fsync(fd1)
+        if let writtenData = try? Data(contentsOf: URL(fileURLWithPath: testLockPath)),
+           let writtenStr = String(data: writtenData, encoding: .utf8) {
+            assertTrue(writtenStr == pidStr, "Lockfile must accurately contain active process PID")
+        } else {
+            fatalError("Failed to read PID from test lockfile")
+        }
+
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: testLockPath),
+           let perms = attrs[.posixPermissions] as? NSNumber {
+            assertTrue(perms.intValue == 0o600, "Lockfile must enforce 0600 permissions, got \(String(perms.intValue, radix: 8))")
+        }
+
+        let fd2 = open(testLockPath, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        assertTrue(fd2 >= 0, "Second open on lockfile must succeed")
+        assertTrue(flock(fd2, LOCK_EX | LOCK_NB) != 0 && errno == EWOULDBLOCK, "Second concurrent flock must fail with EWOULDBLOCK")
+
+        flock(fd1, LOCK_UN)
+        close(fd1)
+        assertTrue(flock(fd2, LOCK_EX | LOCK_NB) == 0, "Second descriptor must acquire flock after first releases")
+        flock(fd2, LOCK_UN)
+        close(fd2)
+        try? FileManager.default.removeItem(atPath: testLockPath)
         print("  [OK] LaunchAgent plist structure, --menubar argument, and XML serialization verified")
 
         print("=== Swift Unit Test 28: Per-Drive Cooldown Scoping, AppleScript Escaping & Enriched Diagnostics (IMPROVE-V5-01 to V5-07) ===")
