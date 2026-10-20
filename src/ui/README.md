@@ -36,11 +36,11 @@ Renders the visual telemetry popover card inside the menu bar dropdown:
   - **Power & Health**: SMART status badge, power-on hours (`POH`), power cycles, and unsafe shutdown count.
 - **Session I/O & Lifetime Totals**:
   - Displays cumulative session read/write throughput, average canary latency (`ms`), kernel I/O error count, and lifetime NVMe Terabytes Read/Written (`TBR` / `TBW`).
-- **Active Issues Banner & Quick Action Footer**:
-  - Highlights up to two active anomalies and provides one-click **Refresh**, **Diagnostics**, and **Settings** buttons.
+- **Active Issues Banner & Telemetry Footer**:
+  - Lists all active health anomalies with severity badges and displays power cycle counts, unsafe shutdowns, media errors, filesystem verification status, and last update timestamp.
 
 ### 3. [`SettingsView.swift`](SettingsView.swift)
-Implements the 4-tab macOS Preferences window (`Cmd+,`, 580×490 pt):
+Implements the 4-tab macOS Preferences window (`Cmd+,`, 630×590 pt):
 - **General Tab**:
   - Interactive drive picker listing all mounted disks plus custom volume/device fields and a **Config File** export button.
 - **Thresholds Tab**:

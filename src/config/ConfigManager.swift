@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import Darwin
 
 // MARK: - Universal Configuration
 
@@ -459,13 +460,15 @@ final class ConfigManager: ObservableObject {
             }
         }
 
-        if fm.fileExists(atPath: logFilePath), let handle = FileHandle(forWritingAtPath: logFilePath) {
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: data)
-            try? handle.close()
-        } else {
-            try? data.write(to: URL(fileURLWithPath: logFilePath), options: .atomic)
+        let fd = open(logFilePath, O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        if fd >= 0 {
+            fchmod(fd, 0o600)
+            data.withUnsafeBytes { ptr in
+                if let base = ptr.baseAddress {
+                    _ = write(fd, base, data.count)
+                }
+            }
+            close(fd)
         }
-        try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: logFilePath)
     }
 }

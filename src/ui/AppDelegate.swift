@@ -18,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let cacheLock = NSLock()
     private var mountDebounceWorkItem: DispatchWorkItem?
     private var wakeWorkItem: DispatchWorkItem?
+    private var configRefreshWorkItem: DispatchWorkItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -61,6 +62,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if abs(newInterval - self.currentPollInterval) > 0.01 {
                     self.schedulePollingTimer(interval: newInterval)
                 }
+                self.configRefreshWorkItem?.cancel()
+                let work = DispatchWorkItem { [weak self] in
+                    guard let self = self, !DiskHealthMonitor.shared.isSystemSleeping else { return }
+                    self.refreshHealth(forceCanary: false)
+                }
+                self.configRefreshWorkItem = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
             }
 
         ConfigManager.shared.log("Disk Health Monitor Menu Bar App launched.")
@@ -181,13 +189,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
     }
 
-    private func populateSelectDiskMenu() {
+    func populateSelectDiskMenu() {
         guard Thread.isMainThread else {
             DispatchQueue.main.async { [weak self] in
                 self?.populateSelectDiskMenu()
             }
             return
         }
+        guard selectDiskMenu != nil else { return }
 
         selectDiskMenu.removeAllItems()
 
@@ -223,14 +232,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let prod = cStringToSwift(d.productName)
             let vendor = cStringToSwift(d.vendorName)
             let bsd = cStringToSwift(d.bsdName)
+            let serial = cStringToSwift(d.serialNumber)
             let bus = cStringToSwift(d.interconnectType)
             let label = "\(vendor.isEmpty ? "" : vendor + " ")\(prod) (\(bsd), \(bus))"
 
             let item = NSMenuItem(title: label, action: #selector(selectDiskTarget(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = bsd
-            if (cfg.targetDeviceQuery == bsd) ||
-               (cfg.targetDeviceQuery == nil && currentActive == bsd) {
+            if (cfg.targetDeviceQuery == bsd || (!serial.isEmpty && cfg.targetDeviceQuery == serial)) ||
+               (cfg.targetVolumePath == nil && currentActive == bsd) {
                 item.state = .on
             }
             selectDiskMenu.addItem(item)
@@ -247,11 +257,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let item = NSMenuItem(title: "  📂 \(m.name)", action: #selector(selectDiskTarget(_:)), keyEquivalent: "")
                 item.target = self
                 item.representedObject = m.path
-                if cfg.targetVolumePath == m.path || currentMount == m.path {
+                if cfg.targetVolumePath == m.path ||
+                   (cfg.targetVolumePath == nil && cfg.targetDeviceQuery == nil && currentMount == m.path) {
                     item.state = .on
                 }
                 selectDiskMenu.addItem(item)
             }
+        }
+
+        // Custom / Offline configured target
+        if let customVol = cfg.targetVolumePath, !customVol.isEmpty,
+           !mounts.contains(where: { $0.path == customVol }) {
+            selectDiskMenu.addItem(NSMenuItem.separator())
+            let item = NSMenuItem(title: "📌 Configured Volume (\(customVol))", action: #selector(selectDiskTarget(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = customVol
+            item.state = .on
+            selectDiskMenu.addItem(item)
+        }
+        if let customDev = cfg.targetDeviceQuery, !customDev.isEmpty,
+           !devices.contains(where: { cStringToSwift($0.bsdName) == customDev || (!cStringToSwift($0.serialNumber).isEmpty && cStringToSwift($0.serialNumber) == customDev) }) {
+            selectDiskMenu.addItem(NSMenuItem.separator())
+            let item = NSMenuItem(title: "📌 Configured Device (\(customDev))", action: #selector(selectDiskTarget(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = customDev
+            item.state = .on
+            selectDiskMenu.addItem(item)
         }
     }
 
@@ -268,6 +299,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshHealth(forceCanary: true)
     }
 
+    func testingSetSelectDiskMenu(_ menu: NSMenu) {
+        self.selectDiskMenu = menu
+    }
+
+    var testingGetSelectDiskMenu: NSMenu? {
+        return self.selectDiskMenu
+    }
+
     func menuWillOpen(_ menu: NSMenu) {
         dailyDigestItem.state = DiskHealthMonitor.shared.dailySummaryEnabled ? .on : .off
         populateSelectDiskMenu()
@@ -279,15 +318,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    static func shouldProcessVolumeNotification(volumePath: String?) -> Bool {
+        guard let path = volumePath, !path.isEmpty else { return true }
+        if path == "/Volumes/Recovery" ||
+           path.hasPrefix("/System/Volumes/") ||
+           path.hasPrefix("/private/") ||
+           path.hasPrefix("/dev/") ||
+           path.contains(".timemachine") ||
+           path.contains("com.apple.TimeMachine.localsnapshots") {
+            return false
+        }
+        return path == "/" || path.hasPrefix("/Volumes/")
+    }
+
     @objc private func volumeMountChanged(_ note: Notification) {
         guard !DiskHealthMonitor.shared.isSystemSleeping else {
             ConfigManager.shared.log("Ignoring dark-wake volume mount event while system is sleeping: \(note.name.rawValue)")
             return
         }
+        let volumeURL = note.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL
+        let volumePath = volumeURL?.path
+        guard AppDelegate.shouldProcessVolumeNotification(volumePath: volumePath) else {
+            return
+        }
         mountDebounceWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self = self, !DiskHealthMonitor.shared.isSystemSleeping else { return }
-            ConfigManager.shared.log("Processing settled volume mount change (\(note.name.rawValue))")
+            let pathSuffix = volumePath.map { " [\($0)]" } ?? ""
+            ConfigManager.shared.log("Processing settled volume mount change (\(note.name.rawValue)\(pathSuffix))")
             self.refreshHealth(forceCanary: true)
         }
         mountDebounceWorkItem = work
@@ -298,6 +356,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pollTimer?.invalidate()
         mountDebounceWorkItem?.cancel()
         wakeWorkItem?.cancel()
+        configRefreshWorkItem?.cancel()
         DiskHealthMonitor.shared.noteSystemWillSleep()
     }
 

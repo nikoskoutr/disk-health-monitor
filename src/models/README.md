@@ -26,7 +26,7 @@ This directory defines the strongly typed, `Codable` Swift data models that repr
      - System metadata (`timestamp`, `formattedTime`, `formattedShortTime`, `healthScore`, `overallSeverity`, `issues`).
      - Volume & filesystem metrics (`isMounted`, `mountPoint`, `filesystemType`, `isReadOnly`, `totalBytes`, `freeBytes`, `usedBytes`, `usedPercent`, `subpathsStatus`, `canaryOk`, `canaryLatencyMs`).
      - Hardware & bus metrics (`hardwareFound`, `vendorName`, `productName`, `productRevision`, `bsdName`, `serialNumber`, `usbSerialNumber`, `interconnectType`, `protocolType`, `isInternal`, `isRemovable`, `linkSpeedBps`, `linkSpeedFormatted`).
-     - NVMe SMART metrics (`smartValid`, `criticalWarning`, `temperatureCelsius`, `temperatureKelvin`, `availableSpare`, `availableSpareThreshold`, `percentageUsed`, `lifeRemainingPercent`, `totalTerabytesRead`, `totalTerabytesWritten`, `powerCycles`, `powerOnHours`, `unsafeShutdowns`, `mediaErrors`, `errorInfoLogEntries`).
+     - NVMe SMART metrics (`smartValid`, `criticalWarning`, `temperatureCelsius`, `peakTemperatureCelsius`, `availableSpare`, `availableSpareThreshold`, `percentageUsed`, `lifeRemainingPercent`, `totalTerabytesRead`, `totalTerabytesWritten`, `powerCycles`, `powerOnHours`, `unsafeShutdowns`, `mediaErrors`, `errorInfoLogEntries`).
      - Storage driver statistics (`statsValid`, `sessionBytesRead`, `sessionBytesWritten`, `operationsRead`, `operationsWritten`, `errorsRead`, `errorsWritten`, `retriesRead`, `retriesWritten`, `avgReadLatencyMs`, `avgWriteLatencyMs`, `readThroughputMBps`, `writeThroughputMBps`).
      - Volume verification state (`lastVerifyResult`, `lastVerifyOk`).
 
@@ -40,6 +40,6 @@ This directory defines the strongly typed, `Codable` Swift data models that repr
 
 5. **Thread-Safe Date Formatters (`SynchronizedDateFormatter`)**:
    - Thread-safe date formatting wrappers using `NSLock` and `en_US_POSIX` locale to prevent concurrent mutation crashes and avoid 12-hour/24-hour locale formatting anomalies:
-     - `isoDateFormatter`: ISO-8601 formatting.
+     - `isoTimestampFormatter`: `yyyy-MM-dd HH:mm:ss` timestamp format.
      - `shortTimeFormatter`: `HH:mm:ss` timestamp format.
      - `shortMonthDateFormatter`: `MMM d, HH:mm` timestamp format.

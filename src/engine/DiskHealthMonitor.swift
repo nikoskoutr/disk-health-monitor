@@ -68,7 +68,7 @@ final class DiskHealthMonitor: ObservableObject {
         return (false, false, "Failed (\(timeStr)): \(detail)")
     }
 
-    private static func loadState() -> DiskPersistentState {
+    static func loadState() -> DiskPersistentState {
         let path = ConfigManager.shared.stateFilePath
         if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
            var decoded = try? JSONDecoder().decode(DiskPersistentState.self, from: data) {
@@ -83,9 +83,11 @@ final class DiskHealthMonitor: ObservableObject {
                     decoded.drives[k] = d
                     migrated = true
                 }
-                let verifyAlertKey = "\(k):VOLUME_VERIFY_FAILED"
-                if decoded.lastAlertTimestampByCode.removeValue(forKey: verifyAlertKey) != nil {
-                    migrated = true
+                if d.lastVerifyOk {
+                    let verifyAlertKey = "\(k):VOLUME_VERIFY_FAILED"
+                    if decoded.lastAlertTimestampByCode.removeValue(forKey: verifyAlertKey) != nil {
+                        migrated = true
+                    }
                 }
             }
             if decoded.lastAlertTimestampByCode.removeValue(forKey: "VOLUME_VERIFY_FAILED") != nil {
@@ -205,9 +207,6 @@ final class DiskHealthMonitor: ObservableObject {
                 d.baselineIoWriteErrors = snap.errorsWritten
                 d.baselineIoReadRetries = snap.retriesRead
                 d.baselineIoWriteRetries = snap.retriesWritten
-                d.lastVerifyOk = true
-                d.lastVerifyResult = "Not run yet"
-                d.lastOverallSeverity = HealthSeverity.healthy.rawValue
             }
         } else {
             for k in Array(self.state.drives.keys) {
@@ -219,9 +218,6 @@ final class DiskHealthMonitor: ObservableObject {
                     d.baselineIoWriteErrors = nil
                     d.baselineIoReadRetries = nil
                     d.baselineIoWriteRetries = nil
-                    d.lastVerifyOk = true
-                    d.lastVerifyResult = "Not run yet"
-                    d.lastOverallSeverity = HealthSeverity.healthy.rawValue
                 }
             }
             self.state.monitoredTarget = oldTarget
@@ -232,6 +228,7 @@ final class DiskHealthMonitor: ObservableObject {
                 $0.lastVerifyOk = true
                 if !$0.lastVerifyResult.starts(with: "Verified OK") {
                     $0.lastVerifyResult = "Not run yet"
+                    $0.lastVerifyTimestamp = 0
                 }
                 $0.lastOverallSeverity = HealthSeverity.healthy.rawValue
             }

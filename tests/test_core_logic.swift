@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import AppKit
 
 // MARK: - Swift Core Logic & Engine Unit Test Suite
 
@@ -938,12 +939,9 @@ struct CoreLogicTestRunner {
         try? FileManager.default.removeItem(atPath: symTarget)
         print("  [OK] LaunchAgent plist structure, --menubar argument, and XML serialization verified")
 
-        print("=== Swift Unit Test 28: Per-Drive Cooldown Scoping, AppleScript Escaping & Enriched Diagnostics (IMPROVE-V5-01 to V5-07) ===")
-        // 28a. Verify MacOSNotifier AppleScript literal escaping
-        let rawScriptStr = "Alert \"Drive\" \\ Path\nLine2\rLine3"
-        let escapedScript = MacOSNotifier.escapeAppleScriptLiteral(rawScriptStr)
-        assertTrue(!escapedScript.contains("\n") && !escapedScript.contains("\r"), "AppleScript literal must strip newlines")
-        assertTrue(escapedScript.contains("\\\"Drive\\\"") && escapedScript.contains("\\\\"), "AppleScript literal must escape quotes and backslashes")
+        print("=== Swift Unit Test 28: Per-Drive Cooldown Scoping, Native Bundle Verification & Enriched Diagnostics (IMPROVE-V5-01 to V5-07) ===")
+        // 28a. Verify MacOSNotifier bundle check does not crash in standalone test binary
+        _ = MacOSNotifier.hasValidAppBundle
 
         // 28b. Verify enriched DiagnosticExporter contains detectedDevices and recentLogLines
         let enrichedDiag = DiagnosticExporter.shared.generateDiagnosticReport(snapshot: normalSnap)
@@ -1251,6 +1249,165 @@ struct CoreLogicTestRunner {
         }
         monitor.resetBaselines()
         print("  [OK] Volume verification -69863 handling, self-healing migration, and dark-wake guard verified")
+
+        print("=== Swift Unit Test 31: Verification Cooldown Retention, Verified OK Baseline Preservation & Volume Mount Filtering (IMPROVE-V10-01 to V10-06) ===")
+        // 31a. IMPROVE-V10-01: Verify that genuine corruption cooldown keys are preserved across state loads, while healed (-69863) keys are purged
+        let testStatePath = ConfigManager.shared.stateFilePath
+        var testState = DiskPersistentState()
+        var corruptDrive = DriveBaselineState()
+        corruptDrive.lastVerifyOk = false
+        corruptDrive.lastVerifyResult = "Failed (Oct 20, 10:00): error: container_oid (0x1) is invalid (-69845)"
+        corruptDrive.lastOverallSeverity = HealthSeverity.critical.rawValue
+        testState.drives["disk_corrupt_test"] = corruptDrive
+        testState.lastAlertTimestampByCode["disk_corrupt_test:VOLUME_VERIFY_FAILED"] = 1792400100.0
+
+        var healedDrive = DriveBaselineState()
+        healedDrive.lastVerifyOk = false
+        healedDrive.lastVerifyResult = "Failed (Oct 20, 10:00): Error starting file system verification: Insufficient privileges (-69863)"
+        healedDrive.lastOverallSeverity = HealthSeverity.critical.rawValue
+        testState.drives["disk_healed_test"] = healedDrive
+        testState.lastAlertTimestampByCode["disk_healed_test:VOLUME_VERIFY_FAILED"] = 1792400200.0
+
+        let stateEncoder = JSONEncoder()
+        stateEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let encodedStateData = try? stateEncoder.encode(testState) {
+            try? encodedStateData.write(to: URL(fileURLWithPath: testStatePath), options: .atomic)
+        }
+
+        let loadedState = DiskHealthMonitor.loadState()
+        assertTrue(loadedState.drives["disk_corrupt_test"]?.lastVerifyOk == false, "Genuine corruption must keep lastVerifyOk = false")
+        assertTrue(loadedState.lastAlertTimestampByCode["disk_corrupt_test:VOLUME_VERIFY_FAILED"] == 1792400100.0, "Cooldown for genuine corruption must be preserved across loadState()")
+        assertTrue(loadedState.drives["disk_healed_test"]?.lastVerifyOk == true, "-69863 permission error must be healed to lastVerifyOk = true")
+        assertTrue(loadedState.lastAlertTimestampByCode["disk_healed_test:VOLUME_VERIFY_FAILED"] == nil, "Cooldown for healed -69863 error must be purged across loadState()")
+
+        // 31b. IMPROVE-V10-02: Verify that resetBaselines preserves 'Verified OK' timestamps and results for active and secondary drives, and clears them for failures
+        monitor.setMonitoredTarget(volumePath: "/", deviceQuery: nil)
+        let activeSnap = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        let activeKey = !activeSnap.serialNumber.isEmpty ? activeSnap.serialNumber : activeSnap.bsdName
+
+        monitor.mutateStateForTesting { st in
+            st.updateDriveState(key: activeKey) { d in
+                d.lastVerifyOk = true
+                d.lastVerifyResult = "Verified OK (Oct 20, 12:10)"
+                d.lastVerifyTimestamp = 1792491009.0
+            }
+            st.updateDriveState(key: "secondary_verified_disk") { d in
+                d.lastVerifyOk = true
+                d.lastVerifyResult = "Verified OK (Oct 19, 14:00)"
+                d.lastVerifyTimestamp = 1792400000.0
+            }
+            st.updateDriveState(key: "secondary_failed_disk") { d in
+                d.lastVerifyOk = false
+                d.lastVerifyResult = "Failed: bad superblock"
+                d.lastVerifyTimestamp = 1792300000.0
+            }
+        }
+
+        // Active drive snapshot is non-nil:
+        monitor.resetBaselines()
+        let stateAfterResetWithSnap = monitor.persistentState
+        assertTrue(stateAfterResetWithSnap.drives[activeKey]?.lastVerifyResult == "Verified OK (Oct 20, 12:10)", "Active drive 'Verified OK' result must be preserved across resetBaselines()")
+        assertTrue(stateAfterResetWithSnap.drives[activeKey]?.lastVerifyTimestamp == 1792491009.0, "Active drive 'Verified OK' timestamp must be preserved across resetBaselines()")
+        assertTrue(stateAfterResetWithSnap.drives["secondary_verified_disk"]?.lastVerifyResult == "Verified OK (Oct 19, 14:00)", "Secondary drive 'Verified OK' result must be preserved across resetBaselines()")
+        assertTrue(stateAfterResetWithSnap.drives["secondary_verified_disk"]?.lastVerifyTimestamp == 1792400000.0, "Secondary drive 'Verified OK' timestamp must be preserved across resetBaselines()")
+        assertTrue(stateAfterResetWithSnap.drives["secondary_failed_disk"]?.lastVerifyResult == "Not run yet", "Failed drive result must be reset to 'Not run yet'")
+        assertTrue(stateAfterResetWithSnap.drives["secondary_failed_disk"]?.lastVerifyTimestamp == 0, "Failed drive timestamp must be reset to 0")
+
+        // Also test when currentSnapshot is nil (e.g. engine startup / offline reset):
+        monitor.clearCurrentSnapshotForTesting()
+        monitor.resetBaselines()
+        let stateAfterResetWithoutSnap = monitor.persistentState
+        assertTrue(stateAfterResetWithoutSnap.drives[activeKey]?.lastVerifyResult == "Verified OK (Oct 20, 12:10)", "Active drive 'Verified OK' result must be preserved when snapshot is nil")
+        assertTrue(stateAfterResetWithoutSnap.drives[activeKey]?.lastVerifyTimestamp == 1792491009.0, "Active drive 'Verified OK' timestamp must be preserved when snapshot is nil")
+        assertTrue(stateAfterResetWithoutSnap.drives["secondary_verified_disk"]?.lastVerifyResult == "Verified OK (Oct 19, 14:00)", "Secondary drive 'Verified OK' result must be preserved when snapshot is nil")
+        assertTrue(stateAfterResetWithoutSnap.drives["secondary_verified_disk"]?.lastVerifyTimestamp == 1792400000.0, "Secondary drive 'Verified OK' timestamp must be preserved when snapshot is nil")
+
+        // 31c. IMPROVE-V10-03: Verify AppDelegate.shouldProcessVolumeNotification(volumePath:) filters system volumes and accepts user volumes
+        assertTrue(AppDelegate.shouldProcessVolumeNotification(volumePath: "/Volumes/T7") == true, "External volume /Volumes/T7 must be processed")
+        assertTrue(AppDelegate.shouldProcessVolumeNotification(volumePath: "/") == true, "Root volume / must be processed")
+        assertTrue(AppDelegate.shouldProcessVolumeNotification(volumePath: "/Volumes/External_Disk") == true, "User volume /Volumes/External_Disk must be processed")
+        assertTrue(AppDelegate.shouldProcessVolumeNotification(volumePath: nil) == true, "Nil volume path fallback must return true")
+        assertTrue(AppDelegate.shouldProcessVolumeNotification(volumePath: "") == true, "Empty volume path fallback must return true")
+        assertTrue(AppDelegate.shouldProcessVolumeNotification(volumePath: "/System/Volumes/Preboot") == false, "/System/Volumes/Preboot must be filtered")
+        assertTrue(AppDelegate.shouldProcessVolumeNotification(volumePath: "/System/Volumes/Update/mnt1") == false, "/System/Volumes/Update must be filtered")
+        assertTrue(AppDelegate.shouldProcessVolumeNotification(volumePath: "/System/Volumes/Data") == false, "/System/Volumes/Data mount note must be filtered")
+        assertTrue(AppDelegate.shouldProcessVolumeNotification(volumePath: "/Volumes/Recovery") == false, "/Volumes/Recovery must be filtered")
+        assertTrue(AppDelegate.shouldProcessVolumeNotification(volumePath: "/private/var/folders/zz") == false, "/private/* paths must be filtered")
+        assertTrue(AppDelegate.shouldProcessVolumeNotification(volumePath: "/dev/disk3s1") == false, "/dev/* paths must be filtered")
+        assertTrue(AppDelegate.shouldProcessVolumeNotification(volumePath: "/Volumes/.timemachine/backup") == false, "Time Machine mounts must be filtered")
+        assertTrue(AppDelegate.shouldProcessVolumeNotification(volumePath: "/Volumes/com.apple.TimeMachine.localsnapshots/mnt") == false, "Time Machine local snapshots must be filtered")
+
+        // 31d. IMPROVE-V10-05: Verify SettingsView custom target preservation
+        let settingsVM = SettingsViewModel()
+        settingsVM.refreshDiskList()
+        // Allow background thread to populate availableDisks
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        cfgMgr.updateConfig { cfg in
+            cfg.targetVolumePath = "/Volumes/OfflineCustomBackup"
+            cfg.targetDeviceQuery = nil
+        }
+        settingsVM.refreshDiskList()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        assertTrue(settingsVM.availableDisks.contains(where: { $0.id == "/Volumes/OfflineCustomBackup" }), "availableDisks must contain offline targetVolumePath")
+
+        cfgMgr.updateConfig { cfg in
+            cfg.targetVolumePath = nil
+            cfg.targetDeviceQuery = "SERIAL9999CUSTOM"
+        }
+        settingsVM.refreshDiskList()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        assertTrue(settingsVM.availableDisks.contains(where: { $0.id == "SERIAL9999CUSTOM" }), "availableDisks must contain custom targetDeviceQuery")
+
+        // 31e. IMPROVE-V10-05: Verify AppDelegate.populateSelectDiskMenu() handles offline volume & device queries
+        let appDelegate = AppDelegate()
+        let testMenu = NSMenu()
+        appDelegate.testingSetSelectDiskMenu(testMenu)
+        cfgMgr.updateConfig { cfg in
+            cfg.targetVolumePath = "/Volumes/OfflineCustomBackup"
+            cfg.targetDeviceQuery = nil
+        }
+        appDelegate.populateSelectDiskMenu()
+        let volumeOfflineItem = testMenu.items.first(where: { ($0.representedObject as? String) == "/Volumes/OfflineCustomBackup" })
+        assertTrue(volumeOfflineItem != nil, "populateSelectDiskMenu must include offline targetVolumePath item")
+        assertTrue(volumeOfflineItem?.state == .on, "Offline targetVolumePath item must have state = .on (checked)")
+
+        cfgMgr.updateConfig { cfg in
+            cfg.targetVolumePath = nil
+            cfg.targetDeviceQuery = "SERIAL9999CUSTOM"
+        }
+        appDelegate.populateSelectDiskMenu()
+        let deviceOfflineItem = testMenu.items.first(where: { ($0.representedObject as? String) == "SERIAL9999CUSTOM" })
+        assertTrue(deviceOfflineItem != nil, "populateSelectDiskMenu must include offline targetDeviceQuery item")
+        assertTrue(deviceOfflineItem?.state == .on, "Offline targetDeviceQuery item must have state = .on (checked)")
+
+        // 31f. IMPROVE-V10-02: Verify immediate snapshot update after resetBaselines + evaluateHealth
+        cfgMgr.updateConfig { cfg in
+            cfg.targetVolumePath = "/"
+            cfg.targetDeviceQuery = nil
+        }
+        let snapForTest = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        let testRootKey = !snapForTest.serialNumber.isEmpty ? snapForTest.serialNumber : snapForTest.bsdName
+        monitor.mutateStateForTesting { st in
+            st.updateDriveState(key: testRootKey) { d in
+                d.baselineUnsafeShutdowns = 0
+            }
+        }
+        let snapWithWarning = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        if snapWithWarning.unsafeShutdowns > 0 {
+            assertTrue(snapWithWarning.issues.contains(where: { $0.code == "NEW_UNSAFE_SHUTDOWN" }), "Baseline mismatch must trigger warning issue")
+        }
+        monitor.resetBaselines()
+        let snapAfterReset = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+        assertTrue(!snapAfterReset.issues.contains(where: { $0.code == "NEW_UNSAFE_SHUTDOWN" }), "Resetting baselines and evaluating health must clear NEW_UNSAFE_SHUTDOWN")
+        assertTrue(monitor.currentSnapshot?.issues.contains(where: { $0.code == "NEW_UNSAFE_SHUTDOWN" }) == false, "currentSnapshot must reflect cleared issues immediately")
+
+        // Clean up test state
+        cfgMgr.updateConfig { cfg in
+            cfg.targetVolumePath = "/"
+            cfg.targetDeviceQuery = nil
+        }
+        monitor.resetBaselines()
+        print("  [OK] Verification cooldown retention, baseline Verified OK preservation, and volume mount filtering verified")
 
         print("✅ All Swift Core Logic Unit Tests Passed!")
     }

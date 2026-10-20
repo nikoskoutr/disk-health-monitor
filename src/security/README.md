@@ -22,3 +22,14 @@ This directory implements secure credential storage for sensitive tokens (such a
 
 3. **Concurrency Synchronization**:
    - All Keychain and fallback file mutations and property accesses (`configDir`) are synchronized using an `NSRecursiveLock` to eliminate race conditions between background queues, Settings UI keystroke debouncers, and notification workers.
+
+### [`SingleInstanceLock.swift`](SingleInstanceLock.swift)
+
+`SingleInstanceLock` guarantees single-instance execution for the Menu Bar application:
+- **POSIX `flock` Mutual Exclusion**:
+  - Opens `~/.config/disk-health-monitor/menubar.lock` with atomic flags `O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC` and permissions `0600`.
+  - Acquires an exclusive non-blocking lock (`flock(fd, LOCK_EX | LOCK_NB)`). If another instance already holds the lock, immediately returns `false` without blocking.
+- **PID Registration**:
+  - Truncates the lock file and writes the current process ID (`getpid()`) followed by an immediate `fsync()` for diagnostic visibility in `launchctl` and terminal investigations.
+- **Safe Release**:
+  - Automatically unlocks (`LOCK_UN`) and closes file descriptor on application termination (`applicationWillTerminate`) or explicit lock release.

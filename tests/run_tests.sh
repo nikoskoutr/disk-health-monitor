@@ -36,11 +36,14 @@ swiftc -O \
     -import-objc-header "${ROOT_DIR}/src/bridge/DiskHealthBridge.h" \
     "${ROOT_DIR}/src/models/HealthModels.swift" \
     "${ROOT_DIR}/src/security/SecretStore.swift" \
+    "${ROOT_DIR}/src/security/SingleInstanceLock.swift" \
     "${ROOT_DIR}/src/config/ConfigManager.swift" \
     "${ROOT_DIR}/src/notifications/MacOSNotifier.swift" \
     "${ROOT_DIR}/src/notifications/TelegramNotifier.swift" \
     "${ROOT_DIR}/src/diagnostics/DiagnosticExporter.swift" \
     "${ROOT_DIR}/src/engine/DiskHealthMonitor.swift" \
+    "${ROOT_DIR}/src/ui/DashboardMenuView.swift" \
+    "${ROOT_DIR}/src/ui/AppDelegate.swift" \
     "${ROOT_DIR}/src/ui/SettingsView.swift" \
     "${SCRIPT_DIR}/test_core_logic.swift" \
     "${BUILD_CACHE}/DiskHealthBridge_test.o" \

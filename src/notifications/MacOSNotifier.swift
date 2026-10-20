@@ -6,8 +6,6 @@ import AppKit
 
 final class MacOSNotifier: NSObject, UNUserNotificationCenterDelegate {
     static let shared = MacOSNotifier()
-    private let stateLock = NSLock()
-    private var isAuthorized = false
 
     static var hasValidAppBundle: Bool {
         guard Bundle.main.bundleIdentifier != nil else { return false }
@@ -26,23 +24,11 @@ final class MacOSNotifier: NSObject, UNUserNotificationCenterDelegate {
         guard MacOSNotifier.hasValidAppBundle else { return }
         let center = UNUserNotificationCenter.current()
         center.delegate = self
-        center.requestAuthorization(options: [.alert, .sound, .badge]) { [weak self] granted, error in
-            self?.stateLock.lock()
-            self?.isAuthorized = granted
-            self?.stateLock.unlock()
+        center.requestAuthorization(options: [.alert, .sound, .badge]) { _, error in
             if let err = error {
                 ConfigManager.shared.log("Notification authorization error: \(err.localizedDescription)")
             }
         }
-    }
-
-    static func escapeAppleScriptLiteral(_ raw: String) -> String {
-        return raw
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-            .replacingOccurrences(of: "\r", with: " ")
-            .replacingOccurrences(of: "\n", with: " ")
-            .replacingOccurrences(of: "\0", with: "")
     }
 
     func postNotification(title: String, subtitle: String, body: String, identifier: String = "disk-health-status") {

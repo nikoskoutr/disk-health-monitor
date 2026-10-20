@@ -124,6 +124,15 @@ final class SettingsViewModel: ObservableObject {
                     }
                 }
             }
+            let cfg = ConfigManager.shared.currentConfig
+            if let customVol = cfg.targetVolumePath, !customVol.isEmpty,
+               !items.contains(where: { $0.id == customVol }) {
+                items.append((id: customVol, name: "📌 Configured Volume (\(customVol))"))
+            }
+            if let customDev = cfg.targetDeviceQuery, !customDev.isEmpty,
+               !items.contains(where: { $0.id == customDev }) {
+                items.append((id: customDev, name: "📌 Configured Device (\(customDev))"))
+            }
             DispatchQueue.main.async {
                 self.availableDisks = items
             }
@@ -978,6 +987,7 @@ struct DiagnosticsAndExportTab: View {
                     ) {
                         Button(action: {
                             DiskHealthMonitor.shared.resetBaselines()
+                            _ = DiskHealthMonitor.shared.evaluateHealth(forceCanary: false, allowNotifications: false)
                             viewModel.diagnosticsStatusMsg = "Baselines and persistent state reset to clean defaults."
                         }) {
                             Text("Reset Baselines")
