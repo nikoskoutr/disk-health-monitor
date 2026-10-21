@@ -284,10 +284,14 @@ func formatLinkSpeed(_ bps: UInt64, interconnect: String) -> String {
 
 func cStringToSwift<T>(_ tuple: T) -> String {
     var copy = tuple
-    return withUnsafePointer(to: &copy) { ptr in
-        ptr.withMemoryRebound(to: CChar.self, capacity: MemoryLayout<T>.size) { cStr in
-            String(cString: cStr).trimmingCharacters(in: .whitespacesAndNewlines)
+    return withUnsafeBytes(of: &copy) { rawBuffer in
+        let slice: Slice<UnsafeRawBufferPointer>
+        if let nullIndex = rawBuffer.firstIndex(of: 0) {
+            slice = rawBuffer[..<nullIndex]
+        } else {
+            slice = rawBuffer[...]
         }
+        return String(decoding: slice, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

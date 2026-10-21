@@ -737,14 +737,14 @@ final class DiskHealthMonitor: ObservableObject {
         _ = notificationGroup.wait(timeout: .now() + timeout)
     }
 
-    func testAlertScript() -> (ok: Bool, summary: String) {
+    func testAlertScriptResult() -> Result<String, DiskHealthError> {
         let rawScriptPath = ConfigManager.shared.resolvedAlertScriptPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rawScriptPath.isEmpty else {
-            return (false, "No alert script configured. Set alertScriptPath in Settings or via ALERT_SCRIPT_PATH environment variable.")
+            return .failure(.configurationInvalid(reason: "No alert script configured. Set alertScriptPath in Settings or via ALERT_SCRIPT_PATH environment variable."))
         }
         let expandedPath = (rawScriptPath as NSString).expandingTildeInPath
         guard FileManager.default.isExecutableFile(atPath: expandedPath) else {
-            return (false, "Alert script is not executable: \(expandedPath)")
+            return .failure(.scriptNotExecutable(path: expandedPath))
         }
 
         let snap = self.currentSnapshot ?? self.evaluateHealth(forceCanary: false, allowNotifications: false)
@@ -775,12 +775,30 @@ final class DiskHealthMonitor: ObservableObject {
             let outputStr = String(data: outputData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let outSuffix = outputStr.isEmpty ? "" : "\n\(outputStr)"
             if proc.terminationStatus == 0 {
-                return (true, "✅ Alert script executed successfully (exit code 0).\(outSuffix)")
+                return .success("✅ Alert script executed successfully (exit code 0).\(outSuffix)")
             } else {
-                return (false, "❌ Alert script failed with exit code \(proc.terminationStatus).\(outSuffix)")
+                return .failure(.scriptExecutionFailed(exitCode: proc.terminationStatus, output: "❌ Alert script failed with exit code \(proc.terminationStatus).\(outSuffix)"))
             }
         } catch {
-            return (false, "❌ Failed to execute alert script: \(error.localizedDescription)")
+            return .failure(.scriptExecutionFailed(exitCode: -1, output: "❌ Failed to execute alert script: \(error.localizedDescription)"))
+        }
+    }
+
+    func testAlertScript() -> (ok: Bool, summary: String) {
+        switch testAlertScriptResult() {
+        case .success(let msg):
+            return (true, msg)
+        case .failure(let err):
+            switch err {
+            case .configurationInvalid(let reason):
+                return (false, reason)
+            case .scriptNotExecutable(let path):
+                return (false, "Alert script is not executable: \(path)")
+            case .scriptExecutionFailed(_, let output):
+                return (false, output)
+            default:
+                return (false, err.localizedDescription)
+            }
         }
     }
 

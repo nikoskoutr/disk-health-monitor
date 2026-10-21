@@ -31,10 +31,15 @@ final class SettingsViewModel: ObservableObject {
     @Published var lastSurfaceScanOk: Bool = true
     @Published var isVerifyingVolumeInSettings: Bool = false
     @Published var diagnosticsStatusMsg: String? = nil
+    @Published var keychainState: KeychainIntegrationState = SecretStore.shared.keychainState
+    @Published var isOnboardingKeychain: Bool = false
+    @Published var keychainStatusMessage: String? = nil
+    @Published var keychainStatusIsError: Bool = false
 
     init() {
         self.botToken = ConfigManager.shared.resolvedTelegramBotToken
         self.webhookUrl = ConfigManager.shared.resolvedWebhookUrl
+        self.keychainState = SecretStore.shared.keychainState
         refreshDiskList()
         checkLaunchAgent()
     }
@@ -170,10 +175,10 @@ final class SettingsViewModel: ObservableObject {
     func commitBotTokenNow(_ val: String) {
         tokenSaveWorkItem?.cancel()
         if val.isEmpty {
-            _ = SecretStore.shared.deleteSecret(forKey: "telegramBotToken")
+            _ = SecretStore.shared.deleteSecret(forKey: "telegramBotToken", allowInteractiveKeychain: false)
             ConfigManager.shared.updateConfig { $0.telegramBotToken = "" }
         } else {
-            _ = SecretStore.shared.setSecret(val, forKey: "telegramBotToken")
+            _ = SecretStore.shared.setSecret(val, forKey: "telegramBotToken", allowInteractiveKeychain: false)
             ConfigManager.shared.updateConfig { $0.telegramBotToken = "REDACTED_IN_KEYCHAIN" }
         }
     }
@@ -194,12 +199,54 @@ final class SettingsViewModel: ObservableObject {
         webhookSaveWorkItem?.cancel()
         let trimmed = val.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
-            _ = SecretStore.shared.deleteSecret(forKey: "webhookUrl")
+            _ = SecretStore.shared.deleteSecret(forKey: "webhookUrl", allowInteractiveKeychain: false)
             ConfigManager.shared.updateConfig { $0.webhookUrl = "" }
         } else {
-            _ = SecretStore.shared.setSecret(trimmed, forKey: "webhookUrl")
+            _ = SecretStore.shared.setSecret(trimmed, forKey: "webhookUrl", allowInteractiveKeychain: false)
             ConfigManager.shared.updateConfig { $0.webhookUrl = "REDACTED_IN_KEYCHAIN" }
         }
+    }
+
+    func onboardCredentialsToKeychainAction() {
+        guard !isOnboardingKeychain else { return }
+        commitBotTokenNow(botToken)
+        commitWebhookUrlNow(webhookUrl)
+        isOnboardingKeychain = true
+        keychainStatusMessage = nil
+
+        let currentBotToken = self.botToken
+        let currentWebhook = self.webhookUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let res = SecretStore.shared.onboardOrUnlockKeychainInteractive(secretsToStore: [
+                "telegramBotToken": currentBotToken,
+                "webhookUrl": currentWebhook
+            ])
+            DispatchQueue.main.async {
+                self.isOnboardingKeychain = false
+                self.keychainState = SecretStore.shared.keychainState
+                switch res {
+                case .success:
+                    ConfigManager.shared.updateConfig { $0.useKeychainStorage = true }
+                    self.botToken = ConfigManager.shared.resolvedTelegramBotToken
+                    self.webhookUrl = ConfigManager.shared.resolvedWebhookUrl
+                    self.keychainStatusIsError = false
+                    self.keychainStatusMessage = "macOS Keychain unlocked and credentials synchronized."
+                case .failure(let err):
+                    ConfigManager.shared.updateConfig { $0.useKeychainStorage = false }
+                    self.keychainStatusIsError = true
+                    self.keychainStatusMessage = err.localizedDescription
+                }
+            }
+        }
+    }
+
+    func switchToLocalStorageOnlyAction() {
+        SecretStore.shared.switchToLocalRestrictedStorageOnly()
+        ConfigManager.shared.updateConfig { $0.useKeychainStorage = false }
+        self.keychainState = SecretStore.shared.keychainState
+        self.keychainStatusIsError = false
+        self.keychainStatusMessage = "Using local restricted storage (.env / .secrets.json 0600). macOS Keychain prompts disabled."
     }
 
     func runSurfaceScanAction() {
@@ -404,6 +451,7 @@ final class SettingsWindowController: NSWindowController {
         SettingsWindowController.sharedVM.checkLaunchAgent()
         SettingsWindowController.sharedVM.botToken = ConfigManager.shared.resolvedTelegramBotToken
         SettingsWindowController.sharedVM.webhookUrl = ConfigManager.shared.resolvedWebhookUrl
+        SettingsWindowController.sharedVM.keychainState = SecretStore.shared.keychainState
         guard let window = self.window else { return }
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)

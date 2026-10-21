@@ -16,9 +16,13 @@
 
 static bool getCFString(CFDictionaryRef dict, CFStringRef key, char *buf, size_t bufLen) {
     if (!dict || !key || !buf || bufLen == 0) return false;
+    buf[0] = '\0';
     CFTypeRef val = CFDictionaryGetValue(dict, key);
     if (val && CFGetTypeID(val) == CFStringGetTypeID()) {
-        return CFStringGetCString((CFStringRef)val, buf, (CFIndex)bufLen, kCFStringEncodingUTF8);
+        if (CFStringGetCString((CFStringRef)val, buf, (CFIndex)bufLen, kCFStringEncodingUTF8)) {
+            buf[bufLen - 1] = '\0';
+            return true;
+        }
     }
     return false;
 }
@@ -600,6 +604,9 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
     }
 
     int count = getfsstat(fsList, (int)(sizeof(struct statfs) * allocMounts), MNT_NOWAIT);
+    if (count > allocMounts) {
+        count = allocMounts;
+    }
     bool found = false;
     int bestScore = -1;
 
@@ -617,13 +624,19 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
 
         // 1. Exact partition slice or snapshot name match takes absolute priority (score 10)
         bool isExactSliceMatch = (strcmp(cleanFrom, cleanTargetBsd) == 0);
+        bool isSameDevice = false;
 
-        io_service_t dev = findBlockStorageDeviceByBSDName(fromName);
-        if (dev != 0) {
-            bool isSameDevice = IOObjectIsEqualTo(dev, targetDev);
-            IOObjectRelease(dev);
+        if (isExactSliceMatch) {
+            isSameDevice = true;
+        } else {
+            io_service_t dev = findBlockStorageDeviceByBSDName(fromName);
+            if (dev != 0) {
+                isSameDevice = IOObjectIsEqualTo(dev, targetDev);
+                IOObjectRelease(dev);
+            }
+        }
 
-            if (isExactSliceMatch || isSameDevice) {
+        if (isExactSliceMatch || isSameDevice) {
                 const char *mountPath = fsList[i].f_mntonname;
                 // Prioritize mounts:
                 // Exact slice match = 10 (target was a partition slice like disk3s5 or disk7s1)
@@ -645,13 +658,12 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
                     score = 0; // Hidden internal / recovery volumes
                 }
 
-                if (score > bestScore) {
-                    bestScore = score;
-                    strlcpy(outMountPoint, mountPath, maxLen);
-                    found = true;
-                    if (score == 10) {
-                        break;
-                    }
+            if (score > bestScore) {
+                bestScore = score;
+                strlcpy(outMountPoint, mountPath, maxLen);
+                found = true;
+                if (score == 10) {
+                    break;
                 }
             }
         }

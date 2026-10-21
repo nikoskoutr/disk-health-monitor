@@ -25,6 +25,7 @@ struct DiskHealthConfig: Codable, Equatable {
     var telegramChatId: String = ""
     var webhookUrl: String = ""
     var alertScriptPath: String = ""
+    var useKeychainStorage: Bool = false
 
     init() {}
 
@@ -51,6 +52,7 @@ struct DiskHealthConfig: Codable, Equatable {
         telegramChatId = try container.decodeIfPresent(String.self, forKey: .telegramChatId) ?? defaults.telegramChatId
         webhookUrl = try container.decodeIfPresent(String.self, forKey: .webhookUrl) ?? defaults.webhookUrl
         alertScriptPath = try container.decodeIfPresent(String.self, forKey: .alertScriptPath) ?? defaults.alertScriptPath
+        useKeychainStorage = try container.decodeIfPresent(Bool.self, forKey: .useKeychainStorage) ?? defaults.useKeychainStorage
     }
 }
 
@@ -163,16 +165,17 @@ final class ConfigManager: ObservableObject {
            let decoded = try? JSONDecoder().decode(DiskHealthConfig.self, from: data) {
             initialConfig = decoded
         }
+        SecretStore.shared.useKeychainOptIn = initialConfig.useKeychainStorage
 
         // 4. Migrate plaintext Telegram Bot Token & Webhook URL into SecretStore
         var needsResave = false
         if ConfigManager.isRealSecretToken(initialConfig.telegramBotToken) {
-            _ = SecretStore.shared.setSecret(initialConfig.telegramBotToken, forKey: "telegramBotToken")
+            _ = SecretStore.shared.setSecret(initialConfig.telegramBotToken, forKey: "telegramBotToken", allowInteractiveKeychain: false)
             initialConfig.telegramBotToken = "REDACTED_IN_KEYCHAIN"
             needsResave = true
         }
         if ConfigManager.isRealSecretToken(initialConfig.webhookUrl) {
-            _ = SecretStore.shared.setSecret(initialConfig.webhookUrl, forKey: "webhookUrl")
+            _ = SecretStore.shared.setSecret(initialConfig.webhookUrl, forKey: "webhookUrl", allowInteractiveKeychain: false)
             initialConfig.webhookUrl = "REDACTED_IN_KEYCHAIN"
             needsResave = true
         }
@@ -221,7 +224,7 @@ final class ConfigManager: ObservableObject {
         if let dotToken = dotEnvTelegramToken, !dotToken.isEmpty {
             return dotToken
         }
-        if let secret = SecretStore.shared.getSecret(forKey: "telegramBotToken"), !secret.isEmpty {
+        if let secret = SecretStore.shared.getSecret(forKey: "telegramBotToken", allowInteractiveKeychain: false), !secret.isEmpty {
             return secret
         }
         if ConfigManager.isRealSecretToken(_config.telegramBotToken) {
@@ -254,7 +257,7 @@ final class ConfigManager: ObservableObject {
         if let dotUrl = dotEnvWebhookUrl, !dotUrl.isEmpty {
             return dotUrl
         }
-        if let secret = SecretStore.shared.getSecret(forKey: "webhookUrl"), !secret.isEmpty {
+        if let secret = SecretStore.shared.getSecret(forKey: "webhookUrl", allowInteractiveKeychain: false), !secret.isEmpty {
             return secret
         }
         if ConfigManager.isRealSecretToken(_config.webhookUrl) {
@@ -423,13 +426,14 @@ final class ConfigManager: ObservableObject {
         defer { configLock.unlock() }
         var next = self._config
         updater(&next)
+        SecretStore.shared.useKeychainOptIn = next.useKeychainStorage
         if ConfigManager.isRealSecretToken(next.telegramBotToken) {
-            _ = SecretStore.shared.setSecret(next.telegramBotToken, forKey: "telegramBotToken")
+            _ = SecretStore.shared.setSecret(next.telegramBotToken, forKey: "telegramBotToken", allowInteractiveKeychain: false)
             self.dotEnvTelegramToken = nil
             next.telegramBotToken = "REDACTED_IN_KEYCHAIN"
         }
         if ConfigManager.isRealSecretToken(next.webhookUrl) {
-            _ = SecretStore.shared.setSecret(next.webhookUrl, forKey: "webhookUrl")
+            _ = SecretStore.shared.setSecret(next.webhookUrl, forKey: "webhookUrl", allowInteractiveKeychain: false)
             self.dotEnvWebhookUrl = nil
             next.webhookUrl = "REDACTED_IN_KEYCHAIN"
         }
@@ -452,13 +456,13 @@ final class ConfigManager: ObservableObject {
         var sanitized = cfg
         if !sanitized.telegramBotToken.isEmpty {
             if ConfigManager.isRealSecretToken(sanitized.telegramBotToken) {
-                _ = SecretStore.shared.setSecret(sanitized.telegramBotToken, forKey: "telegramBotToken")
+                _ = SecretStore.shared.setSecret(sanitized.telegramBotToken, forKey: "telegramBotToken", allowInteractiveKeychain: false)
             }
             sanitized.telegramBotToken = "REDACTED_IN_KEYCHAIN"
         }
         if !sanitized.webhookUrl.isEmpty {
             if ConfigManager.isRealSecretToken(sanitized.webhookUrl) {
-                _ = SecretStore.shared.setSecret(sanitized.webhookUrl, forKey: "webhookUrl")
+                _ = SecretStore.shared.setSecret(sanitized.webhookUrl, forKey: "webhookUrl", allowInteractiveKeychain: false)
             }
             sanitized.webhookUrl = "REDACTED_IN_KEYCHAIN"
         }

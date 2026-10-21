@@ -49,6 +49,15 @@ final class CanaryProbeService: @unchecked Sendable {
         return result
     }
 
+    func runCanaryCheckResult(targetMount: String, force: Bool, nowTs: TimeInterval = Date().timeIntervalSince1970) -> Result<CanaryProbeResult, DiskHealthError> {
+        let res = runCanaryCheck(targetMount: targetMount, force: force, nowTs: nowTs)
+        if res.ok {
+            return .success(res)
+        } else {
+            return .failure(.canaryFailed(reason: res.error))
+        }
+    }
+
     private func performSingleCanaryPass(targetMount: String) -> CanaryProbeResult {
         // On sealed macOS root volume ("/"), probe via /System/Volumes/Data/private/tmp if writable,
         // avoiding guaranteed EROFS on "/.disk_health_canary"

@@ -10,6 +10,9 @@ enum DiskHealthError: LocalizedError, Sendable, Equatable {
     case verificationFailed(summary: String)
     case configurationInvalid(reason: String)
     case secretStoreFailure(key: String)
+    case keychainAccessDenied(status: Int32)
+    case keychainOperationFailed(status: Int32)
+    case fileWriteFailed(path: String, underlying: String)
     case alertDeliveryFailed(channel: String, reason: String)
     case scriptNotExecutable(path: String)
     case scriptExecutionFailed(exitCode: Int32, output: String)
@@ -34,6 +37,12 @@ enum DiskHealthError: LocalizedError, Sendable, Equatable {
             return "Invalid configuration: \(reason)"
         case .secretStoreFailure(let key):
             return "Failed to access or persist secret for key '\(key)'."
+        case .keychainAccessDenied(let status):
+            return "macOS Keychain access was denied or cancelled by the user (OSStatus \(status)). Using local restricted storage (.secrets.json 0600)."
+        case .keychainOperationFailed(let status):
+            return "macOS Keychain operation failed (OSStatus \(status))."
+        case .fileWriteFailed(let path, let underlying):
+            return "Failed to write file at '\(path)': \(underlying)"
         case .alertDeliveryFailed(let channel, let reason):
             return "Alert delivery failed on \(channel): \(reason)"
         case .scriptNotExecutable(let path):

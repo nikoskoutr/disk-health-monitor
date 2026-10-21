@@ -36,12 +36,70 @@ struct NotificationsSettingsTab: View {
                     }
                 }
 
+                SettingsCard(title: "Credential Storage & Security", icon: "lock.shield.fill", iconColor: .green) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(alignment: .center) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Active Storage Backend")
+                                    .font(.system(size: 13, weight: .medium))
+                                Text(viewModel.keychainState.statusBadgeText)
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.secondary)
+                            }
+                            Spacer()
+
+                            HStack(spacing: 8) {
+                                if configMgr.config.useKeychainStorage || viewModel.keychainState.isAccessDenied {
+                                    Button(action: { viewModel.switchToLocalStorageOnlyAction() }) {
+                                        Text("Use Local File (.secrets.json)")
+                                            .font(.system(size: 12))
+                                    }
+                                }
+
+                                Button(action: { viewModel.onboardCredentialsToKeychainAction() }) {
+                                    HStack(spacing: 5) {
+                                        if viewModel.isOnboardingKeychain {
+                                            ProgressView()
+                                                .controlSize(.small)
+                                        } else {
+                                            Image(systemName: "key.fill")
+                                        }
+                                        Text(configMgr.config.useKeychainStorage ? "Unlock / Sync Keychain" : "Onboard to macOS Keychain")
+                                            .font(.system(size: 12))
+                                    }
+                                }
+                                .disabled(viewModel.isOnboardingKeychain)
+                            }
+                        }
+
+                        if let statusMsg = viewModel.keychainStatusMessage {
+                            HStack(alignment: .center, spacing: 8) {
+                                Image(systemName: viewModel.keychainStatusIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                                    .foregroundColor(viewModel.keychainStatusIsError ? .orange : .green)
+                                Text(statusMsg)
+                                    .font(.system(size: 11.5, weight: .medium))
+                                    .foregroundColor(.primary)
+                                Spacer()
+                            }
+                            .padding(8)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .fill((viewModel.keychainStatusIsError ? Color.orange : Color.green).opacity(0.12))
+                            )
+                        }
+
+                        Text("By default, credentials are read from .env and restricted .secrets.json (0600) without prompting macOS Keychain. Click 'Onboard to macOS Keychain' if you prefer system Keychain encryption.")
+                            .font(.system(size: 10.5))
+                            .foregroundColor(.secondary)
+                    }
+                }
+
                 SettingsCard(title: "Telegram Bot Integration", icon: "paperplane.fill", iconColor: .blue) {
                     HStack(alignment: .center, spacing: 14) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Telegram Bot Token")
                                 .font(.system(size: 13, weight: .medium))
-                            Text("Encrypted in macOS Keychain")
+                            Text(configMgr.config.useKeychainStorage ? "Protected in macOS Keychain" : "Stored in .env / .secrets.json (0600)")
                                 .font(.system(size: 11))
                                 .foregroundColor(.secondary)
                         }
@@ -151,7 +209,7 @@ struct NotificationsSettingsTab: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Webhook Endpoint URL")
                                 .font(.system(size: 13, weight: .medium))
-                            Text("Discord, Slack, ntfy, or JSON")
+                            Text(configMgr.config.useKeychainStorage ? "Protected in macOS Keychain" : "Discord, Slack, ntfy / .secrets.json")
                                 .font(.system(size: 11))
                                 .foregroundColor(.secondary)
                         }

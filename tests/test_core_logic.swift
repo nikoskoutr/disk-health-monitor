@@ -1935,6 +1935,9 @@ struct CoreLogicTestRunner {
                 .verificationFailed(summary: "File system corrupt"),
                 .configurationInvalid(reason: "Invalid JSON"),
                 .secretStoreFailure(key: "telegramToken"),
+                .keychainAccessDenied(status: -25293),
+                .keychainOperationFailed(status: -25308),
+                .fileWriteFailed(path: "/tmp/test", underlying: "Permission denied"),
                 .alertDeliveryFailed(channel: "Telegram", reason: "401 Unauthorized"),
                 .scriptNotExecutable(path: "/usr/local/bin/alert.sh"),
                 .scriptExecutionFailed(exitCode: 1, output: "Permission denied")
@@ -1955,6 +1958,56 @@ struct CoreLogicTestRunner {
             assertTrue(DiskHealthError.verificationAlreadyInProgress != DiskHealthError.configurationInvalid(reason: "test"), "Different cases must not be equal")
 
             print("  [OK] Synthetic fault injection, MockTelemetryProvider, and DiskHealthError (34a-34h) verified")
+        }
+
+        // Test 35: Keychain On-Demand Onboarding & Denial Fallback State Machine
+        print("\n=== Swift Unit Test 35: Keychain On-Demand Onboarding & Denial Fallback State Machine ===")
+        do {
+            SecretStore.shared.resetForTesting()
+            assertTrue(SecretStore.shared.keychainState == .localOnlyDefault, "Default state must be localOnlyDefault")
+            assertTrue(SecretStore.shared.useKeychainOptIn == false, "Keychain opt-in must default to false")
+
+            // 1. Default setSecret writes to local .secrets.json (0600) without Keychain
+            _ = SecretStore.shared.setSecret("token_local_default", forKey: "telegramBotToken")
+            assertTrue(SecretStore.shared.keychainState == .localOnlyDefault, "Default setSecret must not activate Keychain")
+            assertTrue(SecretStore.shared.getSecret(forKey: "telegramBotToken") == "token_local_default", "Secret must resolve from local store")
+
+            // 2. Simulate user clicking 'Deny' (-25293 / errSecAuthFailed) on explicit Keychain onboarding
+            SecretStore.shared.simulatedKeychainStatusForTesting = errSecAuthFailed
+            let denyRes = SecretStore.shared.onboardOrUnlockKeychainInteractive(secretsToStore: [
+                "telegramBotToken": "token_survives_denial",
+                "webhookUrl": "https://example.com/webhook_survives"
+            ])
+            if case .failure(let err) = denyRes {
+                assertTrue(err == .keychainAccessDenied(status: errSecAuthFailed), "Expected keychainAccessDenied error")
+            } else {
+                assertTrue(false, "Expected failure when Keychain access is denied")
+            }
+            assertTrue(SecretStore.shared.keychainState == .accessDenied(errSecAuthFailed), "State must transition to accessDenied")
+            assertTrue(SecretStore.shared.useKeychainOptIn == false, "Keychain opt-in must auto-disable on denial to prevent popup loops")
+            assertTrue(SecretStore.shared.getSecret(forKey: "telegramBotToken") == "token_survives_denial", "Secret must remain accessible via 0600 fallback after Keychain denial")
+            assertTrue(SecretStore.shared.getSecret(forKey: "webhookUrl") == "https://example.com/webhook_survives", "Webhook must remain accessible via 0600 fallback after Keychain denial")
+
+            // 3. Simulate user approving Keychain onboarding (errSecSuccess)
+            SecretStore.shared.simulatedKeychainStatusForTesting = errSecSuccess
+            let okRes = SecretStore.shared.onboardOrUnlockKeychainInteractive(secretsToStore: [
+                "telegramBotToken": "token_keychain_approved"
+            ])
+            assertTrue(okRes == .success(.keychainReadyAndUnlocked), "Expected keychainReadyAndUnlocked on errSecSuccess")
+            assertTrue(SecretStore.shared.keychainState == .keychainReadyAndUnlocked, "State must be keychainReadyAndUnlocked")
+            assertTrue(SecretStore.shared.useKeychainOptIn == true, "Keychain opt-in must be true on approval")
+            assertTrue(SecretStore.shared.getSecret(forKey: "telegramBotToken") == "token_keychain_approved", "Secret must resolve approved token")
+
+            // 4. Switch back to local restricted storage only
+            SecretStore.shared.switchToLocalRestrictedStorageOnly()
+            assertTrue(SecretStore.shared.keychainState == .localOnlyDefault, "State must reset to localOnlyDefault")
+            assertTrue(SecretStore.shared.useKeychainOptIn == false, "useKeychainOptIn must reset to false")
+
+            // Clean up test secrets
+            SecretStore.shared.resetForTesting()
+            _ = SecretStore.shared.deleteSecret(forKey: "telegramBotToken")
+            _ = SecretStore.shared.deleteSecret(forKey: "webhookUrl")
+            print("  [OK] Keychain on-demand onboarding, denial fallback (-25293), and zero-popup default verified")
         }
 
         print("✅ All Swift Core Logic Unit Tests Passed!")
