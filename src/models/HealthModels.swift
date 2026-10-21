@@ -18,7 +18,7 @@ public let kAppBuildNumber = "5"
 
 // MARK: - Data Models
 
-enum HealthSeverity: String, Codable {
+enum HealthSeverity: String, Codable, Sendable, Equatable {
     case healthy = "HEALTHY"
     case warning = "WARNING"
     case critical = "CRITICAL"
@@ -40,7 +40,7 @@ enum HealthSeverity: String, Codable {
     }
 }
 
-struct HealthIssue: Codable, Identifiable {
+struct HealthIssue: Codable, Identifiable, Sendable, Equatable {
     var id: String { code }
     let code: String
     let severity: HealthSeverity
@@ -48,7 +48,7 @@ struct HealthIssue: Codable, Identifiable {
     let detail: String
 }
 
-struct DriveBaselineState: Codable {
+struct DriveBaselineState: Codable, Sendable, Equatable {
     var bsdName: String = ""
     var serialNumber: String = ""
     var baselineUnsafeShutdowns: UInt64? = nil
@@ -98,7 +98,7 @@ struct DriveBaselineState: Codable {
     }
 }
 
-struct DiskPersistentState: Codable {
+struct DiskPersistentState: Codable, Sendable, Equatable {
     var monitoredTarget: String = ""
     var drives: [String: DriveBaselineState] = [:]
     var lastAlertTimestampByCode: [String: TimeInterval] = [:]
@@ -135,7 +135,7 @@ struct DiskPersistentState: Codable {
     }
 }
 
-struct DiskHealthSnapshot: Codable {
+struct DiskHealthSnapshot: Codable, Sendable, Equatable {
     let timestamp: TimeInterval
     let formattedTime: String
     let formattedShortTime: String
@@ -328,3 +328,6 @@ let shortMonthDateFormatter: SynchronizedDateFormatter = {
     df.dateFormat = "MMM d, HH:mm"
     return df
 }()
+
+// Enable DiskHardwareMetrics C struct to cross Swift concurrency boundaries safely
+extension DiskHardwareMetrics: @unchecked Sendable {}

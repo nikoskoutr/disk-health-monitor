@@ -43,10 +43,8 @@ uint64_t DiskExtractCFNumberU64(CFDictionaryRef dict, CFStringRef key) {
     return getCFNumberU64(dict, key);
 }
 
-// Safely decode 128-bit little-endian NVMe counter to 64-bit unsigned integer
-static uint64_t nvmeLe128ToU64(const void *ptr) {
-    if (!ptr) return 0;
-    const uint8_t *bytes = (const uint8_t *)ptr;
+uint64_t DiskDecodeNVMeLE128(const uint8_t *bytes) {
+    if (!bytes) return 0;
     uint64_t low = 0;
     uint64_t high = 0;
     memcpy(&low, bytes, sizeof(uint64_t));
@@ -55,6 +53,11 @@ static uint64_t nvmeLe128ToU64(const void *ptr) {
         return UINT64_MAX;
     }
     return CFSwapInt64LittleToHost(low);
+}
+
+// Safely decode 128-bit little-endian NVMe counter to 64-bit unsigned integer
+static uint64_t nvmeLe128ToU64(const void *ptr) {
+    return DiskDecodeNVMeLE128((const uint8_t *)ptr);
 }
 
 // Convert raw 16-bit NVMe composite temperature to Celsius with boundary validation
@@ -92,7 +95,11 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
 
     for (int depth = 0; depth < 16; depth++) {
         io_registry_entry_t parent = 0;
-        if (IORegistryEntryGetParentEntry(current, kIOServicePlane, &parent) != KERN_SUCCESS || parent == 0) {
+        kern_return_t kr = IORegistryEntryGetParentEntry(current, kIOServicePlane, &parent);
+        if (kr != KERN_SUCCESS || parent == 0) {
+            if (parent != 0) {
+                IOObjectRelease(parent);
+            }
             break;
         }
 
@@ -409,6 +416,7 @@ static io_service_t findParentBlockStorageDeviceRecursive(io_registry_entry_t en
 // Locate physical IOBlockStorageDevice for an APFS volume, snapshot, partition slice, or whole-disk BSD name
 static io_service_t findBlockStorageDeviceByBSDName(const char *rawBsdName) {
     if (!rawBsdName || rawBsdName[0] == '\0') return 0;
+    if (strlen(rawBsdName) >= MAXPATHLEN) return 0;
 
     const char *bsdName = rawBsdName;
     if (strncmp(bsdName, "/dev/", 5) == 0) {
@@ -424,7 +432,10 @@ static io_service_t findBlockStorageDeviceByBSDName(const char *rawBsdName) {
         }
     }
 
-    CFMutableDictionaryRef matching = IOBSDNameMatching(kIOMainPortDefault, 0, bsdName);
+    char cleanBsd[128] = {0};
+    strlcpy(cleanBsd, bsdName, sizeof(cleanBsd));
+
+    CFMutableDictionaryRef matching = IOBSDNameMatching(kIOMainPortDefault, 0, cleanBsd);
     if (!matching) return 0;
 
     io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, matching);

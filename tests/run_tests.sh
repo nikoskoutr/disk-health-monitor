@@ -31,21 +31,17 @@ echo "✅ test_disk_health_bridge passed!"
 
 # 2. Test Swift Core Logic & Health Evaluation Engine Unit Tests
 echo "--- [2/5] Building & Running test_core_logic (Swift Engine & Config Unit Tests) ---"
+TEST_SWIFT_SOURCES=()
+while IFS= read -r -d '' file; do
+    if [[ "$(basename "$file")" != "main.swift" ]]; then
+        TEST_SWIFT_SOURCES+=("$file")
+    fi
+done < <(find "${ROOT_DIR}/src" -name "*.swift" -print0 | sort -z)
+
 swiftc -O \
     -module-cache-path "${BUILD_CACHE}/ModuleCache" \
     -import-objc-header "${ROOT_DIR}/src/bridge/DiskHealthBridge.h" \
-    "${ROOT_DIR}/src/models/HealthModels.swift" \
-    "${ROOT_DIR}/src/security/SecretStore.swift" \
-    "${ROOT_DIR}/src/security/SingleInstanceLock.swift" \
-    "${ROOT_DIR}/src/config/ConfigManager.swift" \
-    "${ROOT_DIR}/src/notifications/MacOSNotifier.swift" \
-    "${ROOT_DIR}/src/notifications/TelegramNotifier.swift" \
-    "${ROOT_DIR}/src/notifications/WebhookNotifier.swift" \
-    "${ROOT_DIR}/src/diagnostics/DiagnosticExporter.swift" \
-    "${ROOT_DIR}/src/engine/DiskHealthMonitor.swift" \
-    "${ROOT_DIR}/src/ui/DashboardMenuView.swift" \
-    "${ROOT_DIR}/src/ui/AppDelegate.swift" \
-    "${ROOT_DIR}/src/ui/SettingsView.swift" \
+    "${TEST_SWIFT_SOURCES[@]}" \
     "${SCRIPT_DIR}/test_core_logic.swift" \
     "${BUILD_CACHE}/DiskHealthBridge_test.o" \
     -framework Cocoa \
