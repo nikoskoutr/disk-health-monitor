@@ -8,7 +8,7 @@ struct DashboardMenuView: View {
     @ObservedObject var configMgr: ConfigManager = ConfigManager.shared
 
     var body: some View {
-        if let snap = monitor.currentSnapshot {
+        if let snap = monitor.publishedSnapshot ?? monitor.currentSnapshot {
             let cfg = configMgr.config
             VStack(alignment: .leading, spacing: 10) {
                 // Header

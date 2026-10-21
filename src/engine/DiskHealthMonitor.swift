@@ -12,7 +12,7 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
     typealias SurfaceScanProgress = SurfaceScannerService.SurfaceScanProgress
     typealias SurfaceScanCancellationToken = SurfaceScannerService.SurfaceScanCancellationToken
 
-    @Published private var publishedSnapshot: DiskHealthSnapshot?
+    @Published private(set) var publishedSnapshot: DiskHealthSnapshot?
     private var latestSnapshotInternal: DiskHealthSnapshot?
 
     var currentSnapshot: DiskHealthSnapshot? {
@@ -737,7 +737,7 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         _ = notificationGroup.wait(timeout: .now() + timeout)
     }
 
-    func testAlertScriptResult() -> Result<String, DiskHealthError> {
+    func testAlertScriptResult(timeoutSec: TimeInterval = 15.0) -> Result<String, DiskHealthError> {
         let rawScriptPath = ConfigManager.shared.resolvedAlertScriptPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rawScriptPath.isEmpty else {
             return .failure(.configurationInvalid(reason: "No alert script configured. Set alertScriptPath in Settings or via ALERT_SCRIPT_PATH environment variable."))
@@ -754,6 +754,8 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         proc.standardInput = FileHandle.nullDevice
         proc.standardOutput = pipeOut
         proc.standardError = pipeOut
+        let readHandle = pipeOut.fileHandleForReading
+
         var env = ProcessInfo.processInfo.environment
         env.removeValue(forKey: "TELEGRAM_BOT_TOKEN")
         env.removeValue(forKey: "WEBHOOK_URL")
@@ -770,16 +772,52 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
 
         do {
             try proc.run()
+            let pid = proc.processIdentifier
+            let timeoutLock = NSLock()
+            var timedOut = false
+            var killWorkItem: DispatchWorkItem?
+            let watchdog = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+            watchdog.schedule(deadline: .now() + timeoutSec)
+            watchdog.setEventHandler {
+                if proc.isRunning {
+                    timeoutLock.lock()
+                    timedOut = true
+                    timeoutLock.unlock()
+                    proc.terminate()
+                    let escalation = DispatchWorkItem {
+                        if proc.isRunning && pid > 0 {
+                            kill(pid, SIGKILL)
+                        }
+                    }
+                    timeoutLock.lock()
+                    killWorkItem = escalation
+                    timeoutLock.unlock()
+                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0, execute: escalation)
+                }
+            }
+            watchdog.resume()
+
+            let outputData = (try? readHandle.readToEnd()) ?? Data()
             proc.waitUntilExit()
-            let outputData = (try? pipeOut.fileHandleForReading.readToEnd()) ?? Data()
+            watchdog.cancel()
+            timeoutLock.lock()
+            killWorkItem?.cancel()
+            let didTimeout = timedOut
+            timeoutLock.unlock()
+            try? readHandle.close()
+
             let outputStr = String(data: outputData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let outSuffix = outputStr.isEmpty ? "" : "\n\(outputStr)"
+            if didTimeout {
+                return .failure(.scriptExecutionFailed(exitCode: -1, output: "❌ Alert script timed out after \(Int(timeoutSec))s.\(outSuffix)"))
+            }
             if proc.terminationStatus == 0 {
                 return .success("✅ Alert script executed successfully (exit code 0).\(outSuffix)")
             } else {
                 return .failure(.scriptExecutionFailed(exitCode: proc.terminationStatus, output: "❌ Alert script failed with exit code \(proc.terminationStatus).\(outSuffix)"))
             }
         } catch {
+            try? readHandle.close()
             return .failure(.scriptExecutionFailed(exitCode: -1, output: "❌ Failed to execute alert script: \(error.localizedDescription)"))
         }
     }

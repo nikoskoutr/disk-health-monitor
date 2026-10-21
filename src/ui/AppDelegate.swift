@@ -214,11 +214,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cacheLock.unlock()
 
         if devices.isEmpty && mounts.isEmpty {
-            updateDiskCache()
-            cacheLock.lock()
-            devices = cachedDevices
-            mounts = cachedMounts
-            cacheLock.unlock()
+            if Thread.isMainThread {
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self = self else { return }
+                    self.updateDiskCache()
+                    DispatchQueue.main.async {
+                        self.populateSelectDiskMenu()
+                    }
+                }
+            } else {
+                updateDiskCache()
+                cacheLock.lock()
+                devices = cachedDevices
+                mounts = cachedMounts
+                cacheLock.unlock()
+            }
         }
 
         let currentActive = DiskHealthMonitor.shared.currentSnapshot?.bsdName ?? ""
@@ -452,14 +462,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func exportDiagnosticReportAction() {
-        if let path = DiagnosticExporter.shared.saveDiagnosticReportToFile() {
-            NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: ConfigManager.shared.logsDir)
+        let cachedSnap = DiskHealthMonitor.shared.currentSnapshot
+        DispatchQueue.global(qos: .userInitiated).async {
+            if let path = DiagnosticExporter.shared.saveDiagnosticReportToFile(snapshot: cachedSnap) {
+                DispatchQueue.main.async {
+                    NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: ConfigManager.shared.logsDir)
+                }
+            }
         }
     }
 
     @objc private func exportHtmlReportAction() {
-        if let path = DiagnosticExporter.shared.saveDiagnosticReportHTMLToFile() {
-            NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: ConfigManager.shared.logsDir)
+        let cachedSnap = DiskHealthMonitor.shared.currentSnapshot
+        DispatchQueue.global(qos: .userInitiated).async {
+            if let path = DiagnosticExporter.shared.saveDiagnosticReportHTMLToFile(snapshot: cachedSnap) {
+                DispatchQueue.main.async {
+                    NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: ConfigManager.shared.logsDir)
+                }
+            }
         }
     }
 

@@ -25,6 +25,7 @@ func printUsage() {
       --export-html         Generate standalone HTML health & RMA report in logs/ (or [path])
       --surface-scan [mode] Run non-destructive F_NOCACHE surface scan (modes: quick, standard, full)
       --verify              Run volume filesystem verification (diskutil verifyVolume)
+      --test-alert-script   Test execution of the configured custom alert shell script
       --send-report         Dispatch on-demand HTML health report to Telegram
       --menubar             Launch the macOS Menu Bar status item application (default)
       --version, -v         Display application version and target binary architecture

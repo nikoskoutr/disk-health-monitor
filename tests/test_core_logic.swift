@@ -2105,6 +2105,63 @@ struct CoreLogicTestRunner {
             print("  [OK] Synthetic canary fault injection, pure rule log outcomes, and AtomicFileWriter verified")
         }
 
+        // Test 37: Alert Script Pipe-Drain (>64KB) & Timeout Watchdog + Published Snapshot Sync
+        print("\n=== Swift Unit Test 37: Alert Script Large Pipe Drain, Watchdog Timeout & Published Snapshot ===")
+        do {
+            let origConfig = ConfigManager.shared.currentConfig
+            defer {
+                ConfigManager.shared.updateConfig { $0 = origConfig }
+            }
+
+            // 37a. Verify script producing >128KB stdout does not deadlock pipe buffer
+            let largeOutScript = "\(NSTemporaryDirectory())large_out_script_\(UUID().uuidString).sh"
+            let largeScriptBody = """
+            #!/bin/sh
+            yes "DISK_HEALTH_LARGE_PIPE_LINE_0123456789ABCDEF" | head -n 3000
+            exit 0
+            """
+            try? largeScriptBody.write(toFile: largeOutScript, atomically: true, encoding: .utf8)
+            _ = chmod(largeOutScript, 0o755)
+            ConfigManager.shared.updateConfig { $0.alertScriptPath = largeOutScript }
+
+            let largeRes = monitor.testAlertScriptResult(timeoutSec: 5.0)
+            if case .success(let msg) = largeRes {
+                assertTrue(msg.contains("DISK_HEALTH_LARGE_PIPE_LINE_0123456789ABCDEF"), "Large stdout output must be captured completely without pipe buffer deadlock")
+            } else {
+                assertTrue(false, "Expected large stdout alert script to succeed, got \(largeRes)")
+            }
+            try? FileManager.default.removeItem(atPath: largeOutScript)
+
+            // 37b. Verify hanging alert script is terminated by watchdog timer
+            let hangScript = "\(NSTemporaryDirectory())hang_script_\(UUID().uuidString).sh"
+            let hangScriptBody = """
+            #!/bin/sh
+            echo "STARTING_HANG_TEST"
+            sleep 30
+            exit 0
+            """
+            try? hangScriptBody.write(toFile: hangScript, atomically: true, encoding: .utf8)
+            _ = chmod(hangScript, 0o755)
+            ConfigManager.shared.updateConfig { $0.alertScriptPath = hangScript }
+
+            let t0 = Date().timeIntervalSince1970
+            let hangRes = monitor.testAlertScriptResult(timeoutSec: 1.0)
+            let elapsed = Date().timeIntervalSince1970 - t0
+            assertTrue(elapsed < 5.0, "Watchdog must terminate hanging alert script promptly (took \(elapsed)s)")
+            if case .failure(let err) = hangRes {
+                assertTrue(err.localizedDescription.contains("timed out"), "Watchdog failure must report timeout, got: \(err.localizedDescription)")
+            } else {
+                assertTrue(false, "Expected hanging alert script to fail with timeout")
+            }
+            try? FileManager.default.removeItem(atPath: hangScript)
+            ConfigManager.shared.updateConfig { $0.alertScriptPath = "" }
+
+            // 37c. Verify publishedSnapshot is populated on main thread
+            let snap37 = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
+            assertTrue(monitor.publishedSnapshot?.timestamp == snap37.timestamp, "publishedSnapshot must match latest evaluated snapshot on main thread")
+            print("  [OK] Large pipe drainage (>128KB), watchdog timeout termination, and publishedSnapshot verified")
+        }
+
         print("✅ All Swift Core Logic Unit Tests Passed!")
     }
 }
