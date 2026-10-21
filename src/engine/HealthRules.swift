@@ -27,6 +27,7 @@ struct HealthRuleOutcome: Sendable {
     var scorePenalty: Int = 0
     var updatedTemperatureSamples: [(timestamp: TimeInterval, tempC: Int)]? = nil
     var healVerifyFailureToSkipped: Bool = false
+    var logMessages: [String] = []
 }
 
 protocol HealthRule: Sendable {
@@ -44,7 +45,7 @@ struct HardwarePresenceRule: HealthRule {
         guard !context.hardware.found else { return outcome }
 
         if context.inWakeGrace {
-            ConfigManager.shared.log("Hardware presence not confirmed during wake grace period (8s); suppressing false alert.")
+            outcome.logMessages.append("Hardware presence not confirmed during wake grace period (8s); suppressing false alert.")
         } else {
             outcome.issues.append(HealthIssue(
                 code: "HW_DISCONNECTED",
@@ -68,7 +69,7 @@ struct VolumeMountAndReadOnlyRule: HealthRule {
 
         if !context.mountToInspect.isEmpty && !context.filesystem.isMounted {
             if context.inWakeGrace {
-                ConfigManager.shared.log("Volume unmounted status during wake grace period (8s); suppressing false alert.")
+                outcome.logMessages.append("Volume unmounted status during wake grace period (8s); suppressing false alert.")
             } else {
                 outcome.issues.append(HealthIssue(
                     code: "VOLUME_UNMOUNTED",
@@ -128,7 +129,7 @@ struct CanaryProbeRule: HealthRule {
         guard context.filesystem.isMounted && context.config.enableActiveCanary else { return outcome }
 
         if context.inWakeGrace {
-            ConfigManager.shared.log("Canary probe issue suppressed during wake grace period (8s).")
+            outcome.logMessages.append("Canary probe issue suppressed during wake grace period (8s).")
         } else if !context.canaryOk {
             outcome.issues.append(HealthIssue(
                 code: "CANARY_IO_FAILED",

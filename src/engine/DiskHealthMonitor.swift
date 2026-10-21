@@ -5,7 +5,7 @@ import AppKit
 
 // MARK: - Core Health Monitor Engine
 
-final class DiskHealthMonitor: ObservableObject {
+final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
     static let shared = DiskHealthMonitor()
 
     typealias SurfaceScanMode = SurfaceScannerService.SurfaceScanMode
@@ -101,8 +101,7 @@ final class DiskHealthMonitor: ObservableObject {
                 let encoder = JSONEncoder()
                 encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
                 if let outData = try? encoder.encode(decoded) {
-                    try? outData.write(to: URL(fileURLWithPath: path), options: .atomic)
-                    try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+                    _ = AtomicFileWriter.writeRestricted(data: outData, toPath: path, permissions: 0o600)
                 }
             }
             return decoded
@@ -115,8 +114,7 @@ final class DiskHealthMonitor: ObservableObject {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         if let data = try? encoder.encode(state) {
-            try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+            _ = AtomicFileWriter.writeRestricted(data: data, toPath: path, permissions: 0o600)
         }
     }
 
@@ -325,7 +323,7 @@ final class DiskHealthMonitor: ObservableObject {
                 canaryOk = true
                 canaryError = "Suppressed while system is sleeping"
             } else if !fsMetrics.isReadOnly || fsMetrics.mountPoint == "/" {
-                let res = CanaryProbeService.shared.runCanaryCheck(targetMount: fsMetrics.mountPoint, force: forceCanary, nowTs: nowTs)
+                let res = provider.runCanaryProbe(targetMount: fsMetrics.mountPoint, force: forceCanary, nowTs: nowTs)
                 canaryOk = res.ok
                 canaryLatencyMs = res.latencyMs
                 canaryError = res.error
@@ -407,6 +405,9 @@ final class DiskHealthMonitor: ObservableObject {
 
         for rule in StandardHealthRulePipeline.defaultRules {
             let outcome = rule.evaluate(context: evaluationContext)
+            for msg in outcome.logMessages {
+                ConfigManager.shared.log(msg)
+            }
             issues.append(contentsOf: outcome.issues)
             score -= outcome.scorePenalty
             if let updatedTemps = outcome.updatedTemperatureSamples {
@@ -509,8 +510,7 @@ final class DiskHealthMonitor: ObservableObject {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         if let jsonData = try? encoder.encode(snapshot) {
             let latestPath = ConfigManager.shared.latestJsonPath
-            try? jsonData.write(to: URL(fileURLWithPath: latestPath), options: .atomic)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: latestPath)
+            _ = AtomicFileWriter.writeRestricted(data: jsonData, toPath: latestPath, permissions: 0o600)
         }
 
         if allowNotifications {

@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Diagnostic Exporter
 
-final class DiagnosticExporter {
+final class DiagnosticExporter: @unchecked Sendable {
     static let shared = DiagnosticExporter()
 
     func generateDiagnosticReport(snapshot: DiskHealthSnapshot? = nil) -> [String: Any] {
@@ -12,15 +12,11 @@ final class DiagnosticExporter {
         let hostName = ProcessInfo.processInfo.hostName
 
         // Enumerate all detected block storage devices for topology diagnostics
-        var rawDevices = [DiskHardwareMetrics](repeating: DiskHardwareMetrics(), count: 32)
-        let devCount = Int(DiskListAllDevices(&rawDevices, 32))
+        let rawDevices = IOKitTelemetryProvider.shared.listAllDevices(maxCount: 32)
         var detectedDevicesList: [[String: Any]] = []
-        for i in 0..<devCount {
-            let d = rawDevices[i]
+        for d in rawDevices {
             let bsd = cStringToSwift(d.bsdName)
-            var cMount = [CChar](repeating: 0, count: 512)
-            let hasMount = !bsd.isEmpty && DiskFindMountForBlockDevice(bsd, &cMount, 512)
-            let mountPath = hasMount ? String(cString: cMount) : ""
+            let mountPath = IOKitTelemetryProvider.shared.findMountPoint(forBsdName: bsd) ?? ""
             detectedDevicesList.append([
                 "bsdName": bsd,
                 "vendorName": cStringToSwift(d.vendorName),
@@ -183,12 +179,10 @@ final class DiagnosticExporter {
         }
 
         if let data = jsonStr.data(using: .utf8) {
-            do {
-                try data.write(to: URL(fileURLWithPath: targetPath), options: .atomic)
-                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: targetPath)
+            if AtomicFileWriter.writeRestricted(data: data, toPath: targetPath, permissions: 0o600) {
                 return targetPath
-            } catch {
-                ConfigManager.shared.log("Failed to write diagnostic report: \(error.localizedDescription)")
+            } else {
+                ConfigManager.shared.log("Failed to write diagnostic report: could not write to \(targetPath)")
                 return nil
             }
         }
@@ -284,12 +278,10 @@ final class DiagnosticExporter {
             targetPath = "\(ConfigManager.shared.logsDir)/health_report_\(stamp).html"
         }
         if let data = htmlStr.data(using: .utf8) {
-            do {
-                try data.write(to: URL(fileURLWithPath: targetPath), options: .atomic)
-                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: targetPath)
+            if AtomicFileWriter.writeRestricted(data: data, toPath: targetPath, permissions: 0o600) {
                 return targetPath
-            } catch {
-                ConfigManager.shared.log("Failed to write HTML health report: \(error.localizedDescription)")
+            } else {
+                ConfigManager.shared.log("Failed to write HTML health report: could not write to \(targetPath)")
                 return nil
             }
         }

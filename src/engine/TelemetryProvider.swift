@@ -13,13 +13,30 @@ struct FilesystemMountMetrics: Sendable, Equatable {
     var usedPercent: Double = 0.0
 }
 
+struct MountedVolumeInfo: Sendable, Equatable {
+    let path: String
+    let displayName: String
+}
+
 protocol DiskTelemetryProvider: Sendable {
     func readHardwareMetrics(query: String) -> DiskHardwareMetrics
     func listAllDevices(maxCount: Int) -> [DiskHardwareMetrics]
+    func listLocalMountedVolumes() -> [MountedVolumeInfo]
     func findMountPoint(forBsdName bsdName: String) -> String?
     func inspectFilesystem(mountPath: String) -> FilesystemMountMetrics
     func checkSubpaths(mountPoint: String, isMounted: Bool, requiredSubpaths: [String]) -> [String: Bool]
+    func runCanaryProbe(targetMount: String, force: Bool, nowTs: TimeInterval) -> CanaryProbeResult
     func currentHostThermalState() -> ProcessInfo.ThermalState
+}
+
+extension DiskTelemetryProvider {
+    func listLocalMountedVolumes() -> [MountedVolumeInfo] {
+        return IOKitTelemetryProvider.shared.listLocalMountedVolumes()
+    }
+
+    func runCanaryProbe(targetMount: String, force: Bool, nowTs: TimeInterval) -> CanaryProbeResult {
+        return CanaryProbeService.shared.runCanaryCheck(targetMount: targetMount, force: force, nowTs: nowTs)
+    }
 }
 
 struct IOKitTelemetryProvider: DiskTelemetryProvider {
@@ -37,6 +54,30 @@ struct IOKitTelemetryProvider: DiskTelemetryProvider {
         var raw = [DiskHardwareMetrics](repeating: DiskHardwareMetrics(), count: maxCount)
         let count = Int(DiskListAllDevices(&raw, Int32(maxCount)))
         return Array(raw.prefix(max(0, min(count, maxCount))))
+    }
+
+    func listLocalMountedVolumes() -> [MountedVolumeInfo] {
+        var mounts: [MountedVolumeInfo] = []
+        let numMounts = getfsstat(nil, 0, MNT_NOWAIT)
+        guard numMounts > 0 else { return mounts }
+        let allocCount = Int(numMounts) + 4
+        var fsList = Array<Darwin.statfs>(repeating: Darwin.statfs(), count: allocCount)
+        let mCount = getfsstat(&fsList, Int32(MemoryLayout<Darwin.statfs>.size * allocCount), MNT_NOWAIT)
+        guard mCount > 0 else { return mounts }
+        for i in 0..<min(Int(mCount), allocCount) {
+            let volPath = cStringToSwift(fsList[i].f_mntonname)
+            let flags = UInt32(fsList[i].f_flags)
+            let isLocal = (flags & UInt32(MNT_LOCAL)) != 0
+            if isLocal && (volPath.hasPrefix("/Volumes/") || volPath == "/") {
+                let displayName = volPath == "/" ? "Macintosh HD (/)" : (volPath as NSString).lastPathComponent
+                mounts.append(MountedVolumeInfo(path: volPath, displayName: displayName))
+            }
+        }
+        return mounts
+    }
+
+    func runCanaryProbe(targetMount: String, force: Bool, nowTs: TimeInterval) -> CanaryProbeResult {
+        return CanaryProbeService.shared.runCanaryCheck(targetMount: targetMount, force: force, nowTs: nowTs)
     }
 
     func findMountPoint(forBsdName bsdName: String) -> String? {
@@ -127,6 +168,8 @@ final class MockTelemetryProvider: DiskTelemetryProvider, @unchecked Sendable {
     var filesystemMetrics: FilesystemMountMetrics = FilesystemMountMetrics()
     var subpathsOverride: [String: Bool]? = nil
     var hostThermalState: ProcessInfo.ThermalState = .nominal
+    var mountedVolumes: [MountedVolumeInfo] = []
+    var canaryResultOverride: CanaryProbeResult? = nil
 
     init() {}
 
@@ -148,6 +191,12 @@ final class MockTelemetryProvider: DiskTelemetryProvider, @unchecked Sendable {
         return Array(allDevices.prefix(maxCount))
     }
 
+    func listLocalMountedVolumes() -> [MountedVolumeInfo] {
+        lock.lock()
+        defer { lock.unlock() }
+        return mountedVolumes
+    }
+
     func findMountPoint(forBsdName bsdName: String) -> String? {
         lock.lock()
         defer { lock.unlock() }
@@ -158,6 +207,16 @@ final class MockTelemetryProvider: DiskTelemetryProvider, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return filesystemMetrics
+    }
+
+    func runCanaryProbe(targetMount: String, force: Bool, nowTs: TimeInterval) -> CanaryProbeResult {
+        lock.lock()
+        let override = canaryResultOverride
+        lock.unlock()
+        if let override = override {
+            return override
+        }
+        return CanaryProbeService.shared.runCanaryCheck(targetMount: targetMount, force: force, nowTs: nowTs)
     }
 
     func checkSubpaths(mountPoint: String, isMounted: Bool, requiredSubpaths: [String]) -> [String: Bool] {
