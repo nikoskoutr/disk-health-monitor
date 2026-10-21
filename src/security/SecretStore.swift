@@ -1,5 +1,53 @@
 import Foundation
 import Security
+import Darwin
+
+// MARK: - POSIX Atomic File Writer with Hardened 0600 Permissions
+
+enum AtomicFileWriter {
+    @discardableResult
+    static func writeRestricted(data: Data, toPath path: String, permissions: mode_t = 0o600) -> Bool {
+        let fm = FileManager.default
+        let parentDir = (path as NSString).deletingLastPathComponent
+        if !parentDir.isEmpty && !fm.fileExists(atPath: parentDir) {
+            try? fm.createDirectory(atPath: parentDir, withIntermediateDirectories: true)
+            try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parentDir)
+        }
+
+        let tmpPath = "\(path).tmp.\(getpid()).\(UUID().uuidString)"
+        let fd = open(tmpPath, O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, permissions)
+        guard fd >= 0 else { return false }
+        fchmod(fd, permissions)
+
+        let writtenOk: Bool = data.withUnsafeBytes { rawBuf in
+            guard let base = rawBuf.baseAddress else { return data.isEmpty }
+            var totalWritten = 0
+            while totalWritten < data.count {
+                let n = Darwin.write(fd, base.advanced(by: totalWritten), data.count - totalWritten)
+                if n < 0 {
+                    if errno == EINTR { continue }
+                    return false
+                }
+                totalWritten += n
+            }
+            return true
+        }
+
+        guard writtenOk, fsync(fd) == 0 else {
+            close(fd)
+            unlink(tmpPath)
+            return false
+        }
+        close(fd)
+
+        if rename(tmpPath, path) != 0 {
+            unlink(tmpPath)
+            return false
+        }
+        chmod(path, permissions)
+        return true
+    }
+}
 
 // MARK: - Keychain Integration State Machine
 
@@ -411,17 +459,9 @@ final class SecretStore: @unchecked Sendable {
             try? FileManager.default.removeItem(atPath: path)
             return true
         }
-        let url = URL(fileURLWithPath: path)
-        let parentDir = url.deletingLastPathComponent().path
-        do {
-            try FileManager.default.createDirectory(atPath: parentDir, withIntermediateDirectories: true)
-            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parentDir)
-            let data = try JSONEncoder().encode(secrets)
-            try data.write(to: url, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
-            return true
-        } catch {
+        guard let data = try? JSONEncoder().encode(secrets) else {
             return false
         }
+        return AtomicFileWriter.writeRestricted(data: data, toPath: path, permissions: 0o600)
     }
 }

@@ -56,7 +56,7 @@ struct DiskHealthConfig: Codable, Equatable {
     }
 }
 
-final class ConfigManager: ObservableObject {
+final class ConfigManager: ObservableObject, @unchecked Sendable {
     static let shared = ConfigManager()
 
     let configDir: String
@@ -80,10 +80,10 @@ final class ConfigManager: ObservableObject {
             return _config
         }
         set {
-            notifyObjectWillChangeOnMain()
             configLock.lock()
             _config = newValue
             configLock.unlock()
+            notifyObjectWillChangeOnMain()
         }
     }
 
@@ -403,13 +403,13 @@ final class ConfigManager: ObservableObject {
 
     // In-memory override for CLI invocations (does not mutate config.json)
     func overrideTarget(volumePath: String?, deviceQuery: String?) {
-        notifyObjectWillChangeOnMain()
         configLock.lock()
-        defer { configLock.unlock() }
         var next = self._config
         next.targetVolumePath = volumePath
         next.targetDeviceQuery = deviceQuery
         self._config = next
+        configLock.unlock()
+        notifyObjectWillChangeOnMain()
     }
 
     // Persistent target update (e.g. from Menu Bar UI dropdown)
@@ -421,9 +421,7 @@ final class ConfigManager: ObservableObject {
     }
 
     func updateConfig(_ updater: (inout DiskHealthConfig) -> Void) {
-        notifyObjectWillChangeOnMain()
         configLock.lock()
-        defer { configLock.unlock() }
         var next = self._config
         updater(&next)
         SecretStore.shared.useKeychainOptIn = next.useKeychainStorage
@@ -439,6 +437,8 @@ final class ConfigManager: ObservableObject {
         }
         self._config = next
         saveConfigLocked(next)
+        configLock.unlock()
+        notifyObjectWillChangeOnMain()
     }
 
     func saveConfig() {
@@ -471,11 +471,9 @@ final class ConfigManager: ObservableObject {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         do {
             let data = try encoder.encode(sanitized)
-            let url = URL(fileURLWithPath: path)
-            let parentDir = url.deletingLastPathComponent().path
-            try FileManager.default.createDirectory(atPath: parentDir, withIntermediateDirectories: true)
-            try data.write(to: url, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+            if !AtomicFileWriter.writeRestricted(data: data, toPath: path, permissions: 0o600) {
+                fputs("saveSanitizedConfigFile failed for \(path)\n", stderr)
+            }
         } catch {
             fputs("saveSanitizedConfigFile failed for \(path): \(error.localizedDescription)\n", stderr)
         }

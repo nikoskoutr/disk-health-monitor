@@ -3,7 +3,7 @@ import Darwin
 
 // MARK: - Single-Instance Menu Bar Lock (POSIX flock)
 
-final class SingleInstanceLock {
+final class SingleInstanceLock: @unchecked Sendable {
     static let shared = SingleInstanceLock()
     private var lockFd: Int32 = -1
     private let stateLock = NSLock()
