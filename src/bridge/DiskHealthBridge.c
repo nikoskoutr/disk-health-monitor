@@ -14,17 +14,22 @@
 #include <IOKit/storage/IOMedia.h>
 #include <IOKit/storage/nvme/NVMeSMARTLibExternal.h>
 
+static bool copyCFStringRefToBuffer(CFTypeRef strRef, char *buf, size_t bufLen) {
+    if (!strRef || !buf || bufLen == 0) return false;
+    if (CFGetTypeID(strRef) != CFStringGetTypeID()) return false;
+    if (CFStringGetCString((CFStringRef)strRef, buf, (CFIndex)bufLen, kCFStringEncodingUTF8)) {
+        buf[bufLen - 1] = '\0';
+        return true;
+    }
+    buf[0] = '\0';
+    return false;
+}
+
 static bool getCFString(CFDictionaryRef dict, CFStringRef key, char *buf, size_t bufLen) {
     if (!dict || !key || !buf || bufLen == 0) return false;
     buf[0] = '\0';
     CFTypeRef val = CFDictionaryGetValue(dict, key);
-    if (val && CFGetTypeID(val) == CFStringGetTypeID()) {
-        if (CFStringGetCString((CFStringRef)val, buf, (CFIndex)bufLen, kCFStringEncodingUTF8)) {
-            buf[bufLen - 1] = '\0';
-            return true;
-        }
-    }
-    return false;
+    return copyCFStringRefToBuffer(val, buf, bufLen);
 }
 
 static uint64_t getCFNumberU64(CFDictionaryRef dict, CFStringRef key) {
@@ -142,8 +147,7 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
                 serialRef = IORegistryEntryCreateCFProperty(parent, CFSTR("Serial Number"), kCFAllocatorDefault, 0);
             }
             if (serialRef) {
-                if (CFGetTypeID(serialRef) == CFStringGetTypeID()) {
-                    CFStringGetCString((CFStringRef)serialRef, outMetrics->serialNumber, sizeof(outMetrics->serialNumber), kCFStringEncodingUTF8);
+                if (copyCFStringRefToBuffer(serialRef, outMetrics->serialNumber, sizeof(outMetrics->serialNumber))) {
                     strlcpy(outMetrics->usbSerialNumber, outMetrics->serialNumber, sizeof(outMetrics->usbSerialNumber));
                 }
                 CFRelease(serialRef);
@@ -177,19 +181,23 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
 }
 
 // Inspect children for IOBlockStorageDriver statistics and physical whole-disk BSD Name (e.g. disk0, disk4)
-static void inspectChildrenForDriverStats(io_registry_entry_t service, DiskHardwareMetrics *outMetrics) {
+static void inspectChildrenForDriverStatsRecursive(io_registry_entry_t entry, DiskHardwareMetrics *outMetrics, int depth) {
+    if (!entry || !outMetrics || depth > 12) return;
+    if (outMetrics->statsValid && outMetrics->bsdName[0] != '\0') return;
+
     io_iterator_t childIter = 0;
-    if (IORegistryEntryCreateIterator(service, kIOServicePlane, kIORegistryIterateRecursively, &childIter) != KERN_SUCCESS || !childIter) {
+    if (IORegistryEntryGetChildIterator(entry, kIOServicePlane, &childIter) != KERN_SUCCESS || !childIter) {
         return;
     }
 
     io_registry_entry_t child;
     while ((child = IOIteratorNext(childIter)) != 0) {
-        // Stop descending into synthesized APFS containers so we never confuse AppleAPFSMedia (Whole=true)
-        // or virtual container statistics with the physical IOBlockStorageDriver and physical IOMedia.
+        // Prune synthesized APFS container subtrees completely so we never descend into
+        // virtual AppleAPFSMedia (Whole=true) or virtual container statistics.
         if (IOObjectConformsTo(child, "AppleAPFSContainerScheme") ||
             IOObjectConformsTo(child, "AppleAPFSContainer") ||
-            IOObjectConformsTo(child, "AppleAPFSMedia")) {
+            IOObjectConformsTo(child, "AppleAPFSMedia") ||
+            IOObjectConformsTo(child, "AppleAPFSVolume")) {
             IOObjectRelease(child);
             continue;
         }
@@ -230,12 +238,14 @@ static void inspectChildrenForDriverStats(io_registry_entry_t service, DiskHardw
             if (isWhole) {
                 CFTypeRef bsdRef = IORegistryEntryCreateCFProperty(child, CFSTR("BSD Name"), kCFAllocatorDefault, 0);
                 if (bsdRef) {
-                    if (CFGetTypeID(bsdRef) == CFStringGetTypeID()) {
-                        CFStringGetCString((CFStringRef)bsdRef, outMetrics->bsdName, sizeof(outMetrics->bsdName), kCFStringEncodingUTF8);
-                    }
+                    copyCFStringRefToBuffer(bsdRef, outMetrics->bsdName, sizeof(outMetrics->bsdName));
                     CFRelease(bsdRef);
                 }
             }
+        }
+
+        if (!(outMetrics->statsValid && outMetrics->bsdName[0] != '\0')) {
+            inspectChildrenForDriverStatsRecursive(child, outMetrics, depth + 1);
         }
 
         IOObjectRelease(child);
@@ -244,6 +254,10 @@ static void inspectChildrenForDriverStats(io_registry_entry_t service, DiskHardw
         }
     }
     IOObjectRelease(childIter);
+}
+
+static void inspectChildrenForDriverStats(io_registry_entry_t service, DiskHardwareMetrics *outMetrics) {
+    inspectChildrenForDriverStatsRecursive(service, outMetrics, 0);
 }
 
 // Populate all hardware, SMART, driver, and bus metrics from an IOBlockStorageDevice service
