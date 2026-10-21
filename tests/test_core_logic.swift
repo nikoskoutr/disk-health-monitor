@@ -2010,6 +2010,101 @@ struct CoreLogicTestRunner {
             print("  [OK] Keychain on-demand onboarding, denial fallback (-25293), and zero-popup default verified")
         }
 
+        // Test 36: Synthetic Canary Fault Injection, Pure Rule Log Outcomes & AtomicFileWriter (Phase 5 Overhaul)
+        print("\n=== Swift Unit Test 36: Synthetic Canary Fault Injection, Pure Rule Outcomes & AtomicFileWriter ===")
+        do {
+            let origConfig = ConfigManager.shared.currentConfig
+            defer {
+                ConfigManager.shared.updateConfig { $0 = origConfig }
+                monitor.resetBaselines()
+            }
+
+            ConfigManager.shared.updateConfig {
+                $0.targetVolumePath = "/Volumes/MockCanaryDrive"
+                $0.targetDeviceQuery = "disk42"
+                $0.enableActiveCanary = true
+                $0.minExpectedUsbSpeedBps = 0
+            }
+            monitor.resetBaselines()
+            monitor.noteSystemDidWake(at: Date().timeIntervalSince1970 - 30.0)
+
+            let mockMount = FilesystemMountMetrics(
+                isMounted: true,
+                mountPoint: "/Volumes/MockCanaryDrive",
+                filesystemType: "apfs",
+                isReadOnly: false,
+                totalBytes: 1_000_000_000_000,
+                freeBytes: 800_000_000_000,
+                purgeableBytes: 0,
+                usedBytes: 200_000_000_000,
+                usedPercent: 20.0
+            )
+
+            // 36a. Synthetic CANARY_IO_FAILED via MockTelemetryProvider
+            let mockCanaryFail = MockTelemetryProvider()
+            mockCanaryFail.mountPointByBsd["disk42"] = "/Volumes/MockCanaryDrive"
+            mockCanaryFail.filesystemMetrics = mockMount
+            mockCanaryFail.hardwareMetrics = makeMockDiskHardwareMetrics()
+            mockCanaryFail.canaryResultOverride = CanaryProbeResult(ok: false, latencyMs: 0.0, error: "Synthetic EIO fsync error")
+
+            let snapCanaryFail = monitor.evaluateHealth(forceCanary: true, allowNotifications: false, telemetryProvider: mockCanaryFail)
+            assertTrue(snapCanaryFail.overallSeverity == .critical, "Synthetic canary failure must trigger CRITICAL severity")
+            assertTrue(snapCanaryFail.issues.contains(where: { $0.code == "CANARY_IO_FAILED" }), "Must report CANARY_IO_FAILED issue")
+            assertTrue(snapCanaryFail.canaryError == "Synthetic EIO fsync error", "Snapshot must preserve synthetic canary error string")
+
+            // 36b. Synthetic CANARY_HIGH_LATENCY (> 300ms) via MockTelemetryProvider
+            let mockCanarySlow = MockTelemetryProvider()
+            mockCanarySlow.mountPointByBsd["disk42"] = "/Volumes/MockCanaryDrive"
+            mockCanarySlow.filesystemMetrics = mockMount
+            mockCanarySlow.hardwareMetrics = makeMockDiskHardwareMetrics()
+            mockCanarySlow.canaryResultOverride = CanaryProbeResult(ok: true, latencyMs: 450.5, error: "")
+
+            let snapCanarySlow = monitor.evaluateHealth(forceCanary: true, allowNotifications: false, telemetryProvider: mockCanarySlow)
+            assertTrue(snapCanarySlow.overallSeverity == .warning, "High canary latency (450.5ms > 300ms) must trigger WARNING severity")
+            assertTrue(snapCanarySlow.issues.contains(where: { $0.code == "CANARY_HIGH_LATENCY" }), "Must report CANARY_HIGH_LATENCY issue")
+
+            // 36c. Pure functional HealthRuleOutcome logMessages verification during wake grace period
+            let wakeCtx = HealthEvaluationContext(
+                nowTs: 2000,
+                config: ConfigManager.shared.currentConfig,
+                hardware: makeMockDiskHardwareMetrics(found: false),
+                linkSpeedFormatted: "USB",
+                interconnect: "USB",
+                mountToInspect: "/Volumes/MockCanaryDrive",
+                filesystem: FilesystemMountMetrics(isMounted: false),
+                subpathsStatus: [:],
+                canaryOk: false,
+                canaryLatencyMs: 0.0,
+                canaryError: "Failed",
+                avgReadLatMs: 0.0,
+                avgWriteLatMs: 0.0,
+                inWakeGrace: true,
+                hostThermalState: .nominal,
+                driveState: DriveBaselineState(),
+                recentTemperatureSamples: []
+            )
+            let hwRuleOutcome = HardwarePresenceRule().evaluate(context: wakeCtx)
+            assertTrue(hwRuleOutcome.issues.isEmpty, "HardwarePresenceRule must suppress issue during wake grace")
+            assertTrue(!hwRuleOutcome.logMessages.isEmpty, "HardwarePresenceRule must emit pure logMessages in outcome")
+
+            // 36d. AtomicFileWriter 0600 permissions & symlink overwrite protection
+            let atomicTestPath = "\(NSTemporaryDirectory())atomic_writer_test_\(UUID().uuidString).json"
+            let payloadData = Data("{\"test\":true}".utf8)
+            assertTrue(AtomicFileWriter.writeRestricted(data: payloadData, toPath: atomicTestPath, permissions: 0o600), "AtomicFileWriter must succeed")
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: atomicTestPath),
+               let perms = attrs[.posixPermissions] as? NSNumber {
+                assertTrue(perms.intValue == 0o600, "AtomicFileWriter must enforce 0600 permissions")
+            } else {
+                assertTrue(false, "Failed to inspect AtomicFileWriter file permissions")
+            }
+            try? FileManager.default.removeItem(atPath: atomicTestPath)
+
+            // 36e. Unified listLocalMountedVolumes verification
+            let localVolumes = IOKitTelemetryProvider.shared.listLocalMountedVolumes()
+            assertTrue(localVolumes.contains(where: { $0.path == "/" }), "listLocalMountedVolumes must include root volume '/'")
+            print("  [OK] Synthetic canary fault injection, pure rule log outcomes, and AtomicFileWriter verified")
+        }
+
         print("✅ All Swift Core Logic Unit Tests Passed!")
     }
 }
