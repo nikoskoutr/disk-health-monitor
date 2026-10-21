@@ -336,6 +336,41 @@ int main(void) {
     }
     printf("  SATA link speeds, space-separated 'Link Speed' key, and bus type validation verified\n");
 
-    printf("\n=== All Bridge Tests Passed Successfully! ===\n");
+    printf("\n=== Test 15: DiskDecodeNVMeLE128 128-bit NVMe Little-Endian Parsing ===\n");
+    // NULL pointer test
+    assert(DiskDecodeNVMeLE128(NULL) == 0);
+
+    // All zeros test
+    uint8_t zeroBuf[16] = {0};
+    assert(DiskDecodeNVMeLE128(zeroBuf) == 0);
+
+    // Little-endian low 64-bit decoding
+    uint8_t lowBuf[16] = {0};
+    lowBuf[0] = 0x34;
+    lowBuf[1] = 0x12; // 0x1234 = 4660
+    assert(DiskDecodeNVMeLE128(lowBuf) == 4660ULL);
+
+    uint8_t val64Buf[16] = {0};
+    uint64_t testVal = 0x0123456789ABCDEFULL;
+    uint64_t leVal = CFSwapInt64HostToLittle(testVal);
+    memcpy(val64Buf, &leVal, sizeof(uint64_t));
+    assert(DiskDecodeNVMeLE128(val64Buf) == testVal);
+
+    // Saturation clamping to UINT64_MAX when upper 64 bits are non-zero
+    uint8_t satBuf1[16] = {0};
+    satBuf1[8] = 0x01; // lowest bit of high 64
+    assert(DiskDecodeNVMeLE128(satBuf1) == UINT64_MAX);
+
+    uint8_t satBuf2[16] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                           0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
+    assert(DiskDecodeNVMeLE128(satBuf2) == UINT64_MAX);
+
+    uint8_t satBufAll[16];
+    memset(satBufAll, 0xFF, sizeof(satBufAll));
+    assert(DiskDecodeNVMeLE128(satBufAll) == UINT64_MAX);
+
+    printf("  DiskDecodeNVMeLE128 NULL handling, 64-bit LE decoding, and 128-bit saturation verified\n");
+
+    printf("\n=== All 15 Bridge Tests Passed Successfully! ===\n");
     return 0;
 }

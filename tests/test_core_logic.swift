@@ -11,6 +11,103 @@ private func assertTrue(_ condition: @autoclosure () -> Bool, _ message: String,
     }
 }
 
+private func copyStringToTuple<T>(_ string: String, _ tuple: inout T) {
+    withUnsafeMutablePointer(to: &tuple) { ptr in
+        ptr.withMemoryRebound(to: CChar.self, capacity: MemoryLayout<T>.size) { cPtr in
+            string.withCString { src in
+                strncpy(cPtr, src, MemoryLayout<T>.size - 1)
+                cPtr[MemoryLayout<T>.size - 1] = 0
+            }
+        }
+    }
+}
+
+private func makeMockDiskHardwareMetrics(
+    found: Bool = true,
+    bsdName: String = "disk42",
+    serialNumber: String = "MOCK-NVME-001",
+    vendorName: String = "MockVendor",
+    productName: String = "MockSSD",
+    productRevision: String = "1.0",
+    interconnectType: String = "PCI-Express",
+    protocolType: String = "NVMe",
+    isInternal: Bool = true,
+    isRemovable: Bool = false,
+    linkSpeedBps: UInt64 = 0,
+    smartValid: Bool = true,
+    criticalWarning: UInt8 = 0,
+    temperatureCelsius: Int32 = 35,
+    temperatureKelvin: Int32 = 308,
+    availableSpare: UInt8 = 100,
+    availableSpareThreshold: UInt8 = 10,
+    percentageUsed: UInt8 = 0,
+    dataUnitsRead: UInt64 = 1000,
+    dataUnitsWritten: UInt64 = 2000,
+    hostReadCommands: UInt64 = 500,
+    hostWriteCommands: UInt64 = 600,
+    controllerBusyTime: UInt64 = 10,
+    powerCycles: UInt64 = 20,
+    powerOnHours: UInt64 = 100,
+    unsafeShutdowns: UInt64 = 0,
+    mediaErrors: UInt64 = 0,
+    errorInfoLogEntries: UInt64 = 0,
+    statsValid: Bool = false,
+    bytesRead: UInt64 = 0,
+    bytesWritten: UInt64 = 0,
+    operationsRead: UInt64 = 0,
+    operationsWritten: UInt64 = 0,
+    errorsRead: UInt64 = 0,
+    errorsWritten: UInt64 = 0,
+    retriesRead: UInt64 = 0,
+    retriesWritten: UInt64 = 0,
+    totalTimeReadNs: UInt64 = 0,
+    totalTimeWriteNs: UInt64 = 0
+) -> DiskHardwareMetrics {
+    var hw = DiskHardwareMetrics()
+    hw.found = found
+    copyStringToTuple(bsdName, &hw.bsdName)
+    copyStringToTuple(serialNumber, &hw.serialNumber)
+    copyStringToTuple(serialNumber, &hw.usbSerialNumber)
+    copyStringToTuple(vendorName, &hw.vendorName)
+    copyStringToTuple(productName, &hw.productName)
+    copyStringToTuple(productRevision, &hw.productRevision)
+    copyStringToTuple(interconnectType, &hw.interconnectType)
+    copyStringToTuple(protocolType, &hw.protocolType)
+    hw.isInternal = isInternal
+    hw.isRemovable = isRemovable
+    hw.linkSpeedBps = linkSpeedBps
+    hw.usbLinkSpeedBps = linkSpeedBps
+    hw.smartValid = smartValid
+    hw.criticalWarning = criticalWarning
+    hw.temperatureCelsius = temperatureCelsius
+    hw.temperatureKelvin = temperatureKelvin
+    hw.availableSpare = availableSpare
+    hw.availableSpareThreshold = availableSpareThreshold
+    hw.percentageUsed = percentageUsed
+    hw.dataUnitsRead = dataUnitsRead
+    hw.dataUnitsWritten = dataUnitsWritten
+    hw.hostReadCommands = hostReadCommands
+    hw.hostWriteCommands = hostWriteCommands
+    hw.controllerBusyTime = controllerBusyTime
+    hw.powerCycles = powerCycles
+    hw.powerOnHours = powerOnHours
+    hw.unsafeShutdowns = unsafeShutdowns
+    hw.mediaErrors = mediaErrors
+    hw.errorInfoLogEntries = errorInfoLogEntries
+    hw.statsValid = statsValid
+    hw.bytesRead = bytesRead
+    hw.bytesWritten = bytesWritten
+    hw.operationsRead = operationsRead
+    hw.operationsWritten = operationsWritten
+    hw.errorsRead = errorsRead
+    hw.errorsWritten = errorsWritten
+    hw.retriesRead = retriesRead
+    hw.retriesWritten = retriesWritten
+    hw.totalTimeReadNs = totalTimeReadNs
+    hw.totalTimeWriteNs = totalTimeWriteNs
+    return hw
+}
+
 @main
 struct CoreLogicTestRunner {
     static func main() {
@@ -1617,6 +1714,248 @@ struct CoreLogicTestRunner {
         assertTrue(parsedV12.enableCriticalSoundAlert == true, "ENABLE_CRITICAL_SOUND_ALERT must parse to true")
         assertTrue(parsedV12.scheduledVerifyIntervalHours == 168, "SCHEDULED_VERIFY_INTERVAL_HOURS must parse to 168")
         print("  [OK] SSD endurance projection, raw NVMe SMART fields, and V12 configuration verified")
+
+        // MARK: - Swift Unit Test 34: MockTelemetryProvider & Synthetic Fault Injection (Phase 5)
+        do {
+            print("=== Swift Unit Test 34: MockTelemetryProvider & Synthetic Fault Injection (Phase 5) ===")
+
+            // Save original config & state for complete isolation and cleanup
+            let origConfig = ConfigManager.shared.currentConfig
+            defer {
+                ConfigManager.shared.updateConfig { $0 = origConfig }
+                monitor.resetBaselines()
+            }
+
+            // Configure test base environment: Canary disabled to isolate rule evaluations from filesystem side-effects
+            ConfigManager.shared.updateConfig {
+                $0.targetVolumePath = "/Volumes/MockDrive"
+                $0.targetDeviceQuery = "disk42"
+                $0.enableActiveCanary = false
+                $0.minExpectedUsbSpeedBps = 0
+                $0.tempWarningCelsius = 60
+                $0.tempCriticalCelsius = 70
+            }
+            monitor.resetBaselines()
+
+            let baseMountMetrics = FilesystemMountMetrics(
+                isMounted: true,
+                mountPoint: "/Volumes/MockDrive",
+                filesystemType: "apfs",
+                isReadOnly: false,
+                totalBytes: 1_000_000_000_000,
+                freeBytes: 800_000_000_000,
+                purgeableBytes: 0,
+                usedBytes: 200_000_000_000,
+                usedPercent: 20.0
+            )
+
+            // 34a: Synthetic SMART Critical Warnings
+            print("  --> 34a: Synthetic SMART Critical Warnings")
+            let mock34a = MockTelemetryProvider()
+            mock34a.mountPointByBsd["disk42"] = "/Volumes/MockDrive"
+            mock34a.filesystemMetrics = baseMountMetrics
+            mock34a.hardwareMetrics = makeMockDiskHardwareMetrics(criticalWarning: 0x01) // Bit 0: Available spare below threshold
+
+            let snap34a = monitor.evaluateHealth(forceCanary: false, allowNotifications: false, telemetryProvider: mock34a)
+            assertTrue(snap34a.overallSeverity == .critical, "SMART criticalWarning 0x01 must result in critical severity, got \(snap34a.overallSeverity)")
+            assertTrue(snap34a.criticalWarning == 0x01, "Snapshot criticalWarning must match mock hardware")
+            assertTrue(snap34a.issues.contains { $0.code == "SMART_CRITICAL_WARNING" }, "Snapshot must contain SMART_CRITICAL_WARNING issue")
+            assertTrue(snap34a.healthScore <= 50, "Health score penalty must be >= 50 for critical warning byte, got \(snap34a.healthScore)")
+
+            // Also test direct rule outcome when smartValid is false vs true
+            let hw34aNoSmart = makeMockDiskHardwareMetrics(smartValid: false, criticalWarning: 0x04)
+            let ctx34aNoSmart = HealthEvaluationContext(
+                nowTs: 1000,
+                config: ConfigManager.shared.currentConfig,
+                hardware: hw34aNoSmart,
+                linkSpeedFormatted: "PCIe",
+                interconnect: "PCI-Express",
+                mountToInspect: "/Volumes/MockDrive",
+                filesystem: baseMountMetrics,
+                subpathsStatus: [:],
+                canaryOk: true,
+                canaryLatencyMs: 1.0,
+                canaryError: "",
+                avgReadLatMs: 0.1,
+                avgWriteLatMs: 0.1,
+                inWakeGrace: false,
+                hostThermalState: .nominal,
+                driveState: DriveBaselineState(),
+                recentTemperatureSamples: []
+            )
+            let outcome34aNoSmart = NVMeCriticalWarningRule().evaluate(context: ctx34aNoSmart)
+            assertTrue(outcome34aNoSmart.issues.isEmpty, "NVMeCriticalWarningRule must ignore critical warning if smartValid == false")
+
+            // 34b: Spare Capacity Depletion
+            print("  --> 34b: Spare Capacity Depletion")
+            let mock34bCritical = MockTelemetryProvider()
+            mock34bCritical.mountPointByBsd["disk42"] = "/Volumes/MockDrive"
+            mock34bCritical.filesystemMetrics = baseMountMetrics
+            mock34bCritical.hardwareMetrics = makeMockDiskHardwareMetrics(availableSpare: 5, availableSpareThreshold: 10)
+
+            let snap34bCrit = monitor.evaluateHealth(forceCanary: false, allowNotifications: false, telemetryProvider: mock34bCritical)
+            assertTrue(snap34bCrit.overallSeverity == .critical, "availableSpare 5% <= 10% threshold must trigger critical severity")
+            assertTrue(snap34bCrit.issues.contains { $0.code == "SPARE_CRITICAL" }, "Must report SPARE_CRITICAL issue")
+
+            let mock34bWarn = MockTelemetryProvider()
+            mock34bWarn.mountPointByBsd["disk42"] = "/Volumes/MockDrive"
+            mock34bWarn.filesystemMetrics = baseMountMetrics
+            mock34bWarn.hardwareMetrics = makeMockDiskHardwareMetrics(availableSpare: 20, availableSpareThreshold: 10)
+
+            let snap34bWarn = monitor.evaluateHealth(forceCanary: false, allowNotifications: false, telemetryProvider: mock34bWarn)
+            assertTrue(snap34bWarn.overallSeverity == .warning, "availableSpare 20% (< 25%) must trigger warning severity")
+            assertTrue(snap34bWarn.issues.contains { $0.code == "SPARE_WARNING" }, "Must report SPARE_WARNING issue")
+
+            // 34c: SSD Wear & Lifespan Exhaustion
+            print("  --> 34c: SSD Wear & Lifespan Exhaustion")
+            let mock34cCrit = MockTelemetryProvider()
+            mock34cCrit.mountPointByBsd["disk42"] = "/Volumes/MockDrive"
+            mock34cCrit.filesystemMetrics = baseMountMetrics
+            mock34cCrit.hardwareMetrics = makeMockDiskHardwareMetrics(percentageUsed: 98)
+
+            let snap34cCrit = monitor.evaluateHealth(forceCanary: false, allowNotifications: false, telemetryProvider: mock34cCrit)
+            assertTrue(snap34cCrit.overallSeverity == .critical, "percentageUsed 98% (>= 95%) must trigger critical severity")
+            assertTrue(snap34cCrit.issues.contains { $0.code == "WEAR_CRITICAL" }, "Must report WEAR_CRITICAL issue")
+            assertTrue(snap34cCrit.lifeRemainingPercent == 2, "Expected lifeRemainingPercent == 2%, got \(snap34cCrit.lifeRemainingPercent)")
+
+            let mock34cWarn = MockTelemetryProvider()
+            mock34cWarn.mountPointByBsd["disk42"] = "/Volumes/MockDrive"
+            mock34cWarn.filesystemMetrics = baseMountMetrics
+            mock34cWarn.hardwareMetrics = makeMockDiskHardwareMetrics(percentageUsed: 85)
+
+            let snap34cWarn = monitor.evaluateHealth(forceCanary: false, allowNotifications: false, telemetryProvider: mock34cWarn)
+            assertTrue(snap34cWarn.overallSeverity == .warning, "percentageUsed 85% (>= 80%) must trigger warning severity")
+            assertTrue(snap34cWarn.issues.contains { $0.code == "WEAR_WARNING" }, "Must report WEAR_WARNING issue")
+            assertTrue(snap34cWarn.lifeRemainingPercent == 15, "Expected lifeRemainingPercent == 15%, got \(snap34cWarn.lifeRemainingPercent)")
+
+            // 34d: Thermal Thresholds & Thermal Spikes
+            print("  --> 34d: Thermal Thresholds & Thermal Spikes")
+            let mock34dCrit = MockTelemetryProvider()
+            mock34dCrit.mountPointByBsd["disk42"] = "/Volumes/MockDrive"
+            mock34dCrit.filesystemMetrics = baseMountMetrics
+            mock34dCrit.hardwareMetrics = makeMockDiskHardwareMetrics(temperatureCelsius: 72)
+
+            let snap34dCrit = monitor.evaluateHealth(forceCanary: false, allowNotifications: false, telemetryProvider: mock34dCrit)
+            assertTrue(snap34dCrit.overallSeverity == .critical, "72C >= 70C critical threshold must trigger critical severity")
+            assertTrue(snap34dCrit.issues.contains { $0.code == "TEMP_CRITICAL" }, "Must report TEMP_CRITICAL issue")
+
+            let mock34dWarn = MockTelemetryProvider()
+            mock34dWarn.mountPointByBsd["disk42"] = "/Volumes/MockDrive"
+            mock34dWarn.filesystemMetrics = baseMountMetrics
+            mock34dWarn.hardwareMetrics = makeMockDiskHardwareMetrics(temperatureCelsius: 64)
+
+            let snap34dWarn = monitor.evaluateHealth(forceCanary: false, allowNotifications: false, telemetryProvider: mock34dWarn)
+            assertTrue(snap34dWarn.overallSeverity == .warning, "64C >= 60C warning threshold must trigger warning severity")
+            assertTrue(snap34dWarn.issues.contains { $0.code == "TEMP_WARNING" }, "Must report TEMP_WARNING issue")
+
+            // Thermal spike unit test: +10C rise in 20s (>= 8C rise and current >= 45C)
+            let nowTs = Date().timeIntervalSince1970
+            let spikeSamples: [(timestamp: TimeInterval, tempC: Int)] = [
+                (timestamp: nowTs - 20, tempC: 38)
+            ]
+            let (updatedSamples, spikeIssue, spikePenalty) = ThermalAndSpikeRule.evaluateThermalSpike(
+                samples: spikeSamples,
+                currentTempC: 48,
+                nowTs: nowTs
+            )
+            assertTrue(spikeIssue != nil, "Thermal spike of +10C reaching 48C must produce an issue")
+            assertTrue(spikeIssue?.code == "TEMP_RAPID_RISE", "Expected TEMP_RAPID_RISE issue, got \(String(describing: spikeIssue?.code))")
+            assertTrue(spikePenalty == 10, "Expected scorePenalty 10 for rapid spike")
+            assertTrue(updatedSamples.count == 2, "Samples window must be updated with current sample")
+
+            // 34e: Media Errors & Unsafe Shutdowns
+            print("  --> 34e: Media Errors & Unsafe Shutdowns")
+            monitor.mutateStateForTesting { state in
+                state.updateDriveState(key: "MOCK-NVME-34E") { d in
+                    d.baselineMediaErrors = 0
+                    d.baselineUnsafeShutdowns = 5
+                }
+            }
+
+            let mock34eMedia = MockTelemetryProvider()
+            mock34eMedia.mountPointByBsd["disk42"] = "/Volumes/MockDrive"
+            mock34eMedia.filesystemMetrics = baseMountMetrics
+            mock34eMedia.hardwareMetrics = makeMockDiskHardwareMetrics(serialNumber: "MOCK-NVME-34E", unsafeShutdowns: 5, mediaErrors: 2)
+
+            let snap34eMedia = monitor.evaluateHealth(forceCanary: false, allowNotifications: false, telemetryProvider: mock34eMedia)
+            assertTrue(snap34eMedia.overallSeverity == .critical, "mediaErrors delta (2 > 0) must trigger critical severity")
+            assertTrue(snap34eMedia.issues.contains { $0.code == "MEDIA_ERRORS" }, "Must report MEDIA_ERRORS issue")
+
+            let mock34eShutdown = MockTelemetryProvider()
+            mock34eShutdown.mountPointByBsd["disk42"] = "/Volumes/MockDrive"
+            mock34eShutdown.filesystemMetrics = baseMountMetrics
+            mock34eShutdown.hardwareMetrics = makeMockDiskHardwareMetrics(serialNumber: "MOCK-NVME-34E", unsafeShutdowns: 8, mediaErrors: 0)
+
+            let snap34eShutdown = monitor.evaluateHealth(forceCanary: false, allowNotifications: false, telemetryProvider: mock34eShutdown)
+            assertTrue(snap34eShutdown.overallSeverity == .warning, "unsafeShutdowns delta (+3) must trigger warning severity")
+            assertTrue(snap34eShutdown.issues.contains { $0.code == "NEW_UNSAFE_SHUTDOWN" }, "Must report NEW_UNSAFE_SHUTDOWN issue")
+
+            // 34f: USB Link Degradation
+            print("  --> 34f: USB Link Degradation")
+            ConfigManager.shared.updateConfig {
+                $0.minExpectedUsbSpeedBps = 5_000_000_000 // Expect 5 Gbps (USB 3.0)
+            }
+            let mock34f = MockTelemetryProvider()
+            mock34f.mountPointByBsd["disk42"] = "/Volumes/MockDrive"
+            mock34f.filesystemMetrics = baseMountMetrics
+            mock34f.hardwareMetrics = makeMockDiskHardwareMetrics(
+                serialNumber: "MOCK-USB-34F",
+                interconnectType: "USB",
+                linkSpeedBps: 480_000_000 // Negotiated at USB 2.0 (480 Mbps)
+            )
+
+            let snap34f = monitor.evaluateHealth(forceCanary: false, allowNotifications: false, telemetryProvider: mock34f)
+            assertTrue(snap34f.overallSeverity == .warning, "Degraded USB speed (480 Mbps < 5 Gbps) must trigger warning severity")
+            assertTrue(snap34f.issues.contains { $0.code == "USB_LINK_DEGRADED" }, "Must report USB_LINK_DEGRADED issue")
+            ConfigManager.shared.updateConfig { $0.minExpectedUsbSpeedBps = 0 }
+
+            // 34g: Read-Only Volume Detection
+            print("  --> 34g: Read-Only Volume Detection")
+            var readOnlyMountMetrics = baseMountMetrics
+            readOnlyMountMetrics.isReadOnly = true
+
+            let mock34g = MockTelemetryProvider()
+            mock34g.mountPointByBsd["disk42"] = "/Volumes/MockDrive"
+            mock34g.filesystemMetrics = readOnlyMountMetrics
+            mock34g.hardwareMetrics = makeMockDiskHardwareMetrics()
+
+            let snap34g = monitor.evaluateHealth(forceCanary: false, allowNotifications: false, telemetryProvider: mock34g)
+            assertTrue(snap34g.overallSeverity == .critical, "Read-only volume on non-root mount must trigger critical severity")
+            assertTrue(snap34g.issues.contains { $0.code == "VOLUME_READONLY" }, "Must report VOLUME_READONLY issue")
+
+            // 34h: DiskHealthError Localized Descriptions & Equatable Conformance
+            print("  --> 34h: DiskHealthError Localized Descriptions & Equatable Conformance")
+            let errs: [DiskHealthError] = [
+                .hardwareNotFound(query: "disk99"),
+                .volumeNotMounted(path: "/Volumes/Data"),
+                .volumeReadOnly(path: "/Volumes/Data"),
+                .canaryFailed(reason: "EACCES"),
+                .surfaceScanFailed(reason: "Unreadable sectors", readErrors: 4),
+                .verificationAlreadyInProgress,
+                .verificationFailed(summary: "File system corrupt"),
+                .configurationInvalid(reason: "Invalid JSON"),
+                .secretStoreFailure(key: "telegramToken"),
+                .alertDeliveryFailed(channel: "Telegram", reason: "401 Unauthorized"),
+                .scriptNotExecutable(path: "/usr/local/bin/alert.sh"),
+                .scriptExecutionFailed(exitCode: 1, output: "Permission denied")
+            ]
+
+            for err in errs {
+                let desc = err.errorDescription
+                assertTrue(desc != nil && !desc!.isEmpty, "DiskHealthError.\(err) must have non-empty localized errorDescription")
+            }
+
+            assertTrue(DiskHealthError.hardwareNotFound(query: "disk99").errorDescription?.contains("disk99") == true, "Must include query in description")
+            assertTrue(DiskHealthError.surfaceScanFailed(reason: "Bad blocks", readErrors: 4).errorDescription?.contains("4 read errors") == true, "Must include read error count")
+            assertTrue(DiskHealthError.verificationAlreadyInProgress.errorDescription == "Verification already in progress", "Exact verification progress description")
+
+            // Equatable conformance
+            assertTrue(DiskHealthError.volumeNotMounted(path: "/Volumes/Test") == DiskHealthError.volumeNotMounted(path: "/Volumes/Test"), "Equatable must hold for matching errors")
+            assertTrue(DiskHealthError.volumeNotMounted(path: "/Volumes/A") != DiskHealthError.volumeNotMounted(path: "/Volumes/B"), "Equatable inequality must hold for distinct errors")
+            assertTrue(DiskHealthError.verificationAlreadyInProgress != DiskHealthError.configurationInvalid(reason: "test"), "Different cases must not be equal")
+
+            print("  [OK] Synthetic fault injection, MockTelemetryProvider, and DiskHealthError (34a-34h) verified")
+        }
 
         print("✅ All Swift Core Logic Unit Tests Passed!")
     }
