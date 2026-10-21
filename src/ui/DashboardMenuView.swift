@@ -5,10 +5,11 @@ import AppKit
 
 struct DashboardMenuView: View {
     @ObservedObject var monitor: DiskHealthMonitor
+    @ObservedObject var configMgr: ConfigManager = ConfigManager.shared
 
     var body: some View {
         if let snap = monitor.currentSnapshot {
-            let cfg = ConfigManager.shared.currentConfig
+            let cfg = configMgr.config
             VStack(alignment: .leading, spacing: 10) {
                 // Header
                 HStack(alignment: .center, spacing: 10) {

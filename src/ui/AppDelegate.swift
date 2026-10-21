@@ -14,7 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var selectDiskMenu: NSMenu!
     private var selectDiskMenuItem: NSMenuItem!
     private var cachedDevices: [DiskHardwareMetrics] = []
-    private var cachedMounts: [(path: String, name: String)] = []
+    private var cachedMounts: [MountedVolumeInfo] = []
     private let cacheLock = NSLock()
     private var mountDebounceWorkItem: DispatchWorkItem?
     private var wakeWorkItem: DispatchWorkItem?
@@ -262,7 +262,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             selectDiskMenu.addItem(sectionItem)
 
             for m in mounts {
-                let item = NSMenuItem(title: "  📂 \(m.name)", action: #selector(selectDiskTarget(_:)), keyEquivalent: "")
+                let item = NSMenuItem(title: "  📂 \(m.displayName)", action: #selector(selectDiskTarget(_:)), keyEquivalent: "")
                 item.target = self
                 item.representedObject = m.path
                 if cfg.targetVolumePath == m.path ||
@@ -382,30 +382,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateDiskCache() {
-        var devices = [DiskHardwareMetrics](repeating: DiskHardwareMetrics(), count: 16)
-        let count = DiskListAllDevices(&devices, 16)
-        var mounts: [(path: String, name: String)] = []
-
-        let numMounts = getfsstat(nil, 0, MNT_NOWAIT)
-        if numMounts > 0 {
-            let allocCount = Int(numMounts) + 4
-            var fsList = Array<Darwin.statfs>(repeating: Darwin.statfs(), count: allocCount)
-            let mCount = getfsstat(&fsList, Int32(MemoryLayout<Darwin.statfs>.size * allocCount), MNT_NOWAIT)
-            if mCount > 0 {
-                for i in 0..<min(Int(mCount), allocCount) {
-                    let volPath = cStringToSwift(fsList[i].f_mntonname)
-                    let flags = UInt32(fsList[i].f_flags)
-                    let isLocal = (flags & UInt32(MNT_LOCAL)) != 0
-                    if isLocal && (volPath.hasPrefix("/Volumes/") || volPath == "/") {
-                        let displayName = volPath == "/" ? "Macintosh HD (/)" : (volPath as NSString).lastPathComponent
-                        mounts.append((path: volPath, name: displayName))
-                    }
-                }
-            }
-        }
-
+        let devices = IOKitTelemetryProvider.shared.listAllDevices(maxCount: 16)
+        let mounts = IOKitTelemetryProvider.shared.listLocalMountedVolumes()
         cacheLock.lock()
-        cachedDevices = Array(devices.prefix(Int(count)))
+        cachedDevices = devices
         cachedMounts = mounts
         cacheLock.unlock()
     }

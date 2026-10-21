@@ -116,10 +116,8 @@ final class SettingsViewModel: ObservableObject {
     func refreshDiskList() {
         DispatchQueue.global(qos: .userInitiated).async {
             var items: [(id: String, name: String)] = []
-            var devices = [DiskHardwareMetrics](repeating: DiskHardwareMetrics(), count: 16)
-            let count = DiskListAllDevices(&devices, 16)
-            for i in 0..<Int(count) {
-                let d = devices[i]
+            let devices = IOKitTelemetryProvider.shared.listAllDevices(maxCount: 16)
+            for d in devices {
                 let prod = cStringToSwift(d.productName)
                 let vendor = cStringToSwift(d.vendorName)
                 let bsd = cStringToSwift(d.bsdName)
@@ -128,23 +126,11 @@ final class SettingsViewModel: ObservableObject {
                 items.append((id: bsd, name: label))
             }
 
-            let numMounts = getfsstat(nil, 0, MNT_NOWAIT)
-            if numMounts > 0 {
-                let allocCount = Int(numMounts) + 4
-                var fsList = Array<Darwin.statfs>(repeating: Darwin.statfs(), count: allocCount)
-                let mCount = getfsstat(&fsList, Int32(MemoryLayout<Darwin.statfs>.size * allocCount), MNT_NOWAIT)
-                if mCount > 0 {
-                    for i in 0..<min(Int(mCount), allocCount) {
-                        let volPath = cStringToSwift(fsList[i].f_mntonname)
-                        let flags = UInt32(fsList[i].f_flags)
-                        let isLocal = (flags & UInt32(MNT_LOCAL)) != 0
-                        if isLocal && (volPath.hasPrefix("/Volumes/") || volPath == "/") {
-                            let displayName = volPath == "/" ? "Macintosh HD (/)" : (volPath as NSString).lastPathComponent
-                            items.append((id: volPath, name: "📂 \(displayName) (\(volPath))"))
-                        }
-                    }
-                }
+            let mounts = IOKitTelemetryProvider.shared.listLocalMountedVolumes()
+            for m in mounts {
+                items.append((id: m.path, name: "📂 \(m.displayName) (\(m.path))"))
             }
+
             let cfg = ConfigManager.shared.currentConfig
             if let customVol = cfg.targetVolumePath, !customVol.isEmpty,
                !items.contains(where: { $0.id == customVol }) {
@@ -354,12 +340,11 @@ final class SettingsViewModel: ObservableObject {
         panel.allowedContentTypes = [.json]
         if panel.runModal() == .OK, let url = panel.url {
             let json = ConfigManager.shared.exportSanitizedConfigJSON(includeSecrets: false)
-            do {
-                try json.write(to: url, atomically: true, encoding: .utf8)
-                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            if let data = json.data(using: .utf8),
+               AtomicFileWriter.writeRestricted(data: data, toPath: url.path, permissions: 0o600) {
                 diagnosticsStatusMsg = "Saved configuration to \(url.lastPathComponent)"
-            } catch {
-                diagnosticsStatusMsg = "Failed to save configuration: \(error.localizedDescription)"
+            } else {
+                diagnosticsStatusMsg = "Failed to save configuration."
             }
         }
     }
