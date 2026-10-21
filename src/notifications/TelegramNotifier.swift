@@ -199,3 +199,23 @@ final class TelegramNotifier {
         return lines.joined(separator: "\n")
     }
 }
+
+// MARK: - Swift Concurrency Extensions
+
+extension TelegramNotifier: @unchecked Sendable {
+    func sendMessage(htmlText: String, disableNotification: Bool = false) async -> Bool {
+        await withCheckedContinuation { continuation in
+            sendMessageAsync(htmlText: htmlText, disableNotification: disableNotification) { ok in
+                continuation.resume(returning: ok)
+            }
+        }
+    }
+
+    func sendTestMessage(token: String, chatId: String) async -> (ok: Bool, message: String) {
+        await withCheckedContinuation { continuation in
+            sendTestMessage(token: token, chatId: chatId) { ok, msg in
+                continuation.resume(returning: (ok, msg))
+            }
+        }
+    }
+}

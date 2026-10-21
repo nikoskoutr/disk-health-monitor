@@ -173,3 +173,23 @@ final class WebhookNotifier {
         task.resume()
     }
 }
+
+// MARK: - Swift Concurrency Extensions
+
+extension WebhookNotifier: @unchecked Sendable {
+    func sendWebhook(snapshot: DiskHealthSnapshot, title: String, eventType: String = "health_alert") async -> Bool {
+        await withCheckedContinuation { continuation in
+            sendWebhookAsync(snapshot: snapshot, title: title, eventType: eventType) { ok in
+                continuation.resume(returning: ok)
+            }
+        }
+    }
+
+    func sendTestWebhook(webhookUrl: String) async -> (ok: Bool, message: String) {
+        await withCheckedContinuation { continuation in
+            sendTestWebhook(webhookUrl: webhookUrl) { ok, msg in
+                continuation.resume(returning: (ok, msg))
+            }
+        }
+    }
+}

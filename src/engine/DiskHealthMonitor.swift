@@ -12,7 +12,15 @@ final class DiskHealthMonitor: ObservableObject {
     typealias SurfaceScanProgress = SurfaceScannerService.SurfaceScanProgress
     typealias SurfaceScanCancellationToken = SurfaceScannerService.SurfaceScanCancellationToken
 
-    @Published private(set) var currentSnapshot: DiskHealthSnapshot?
+    @Published private var publishedSnapshot: DiskHealthSnapshot?
+    private var latestSnapshotInternal: DiskHealthSnapshot?
+
+    var currentSnapshot: DiskHealthSnapshot? {
+        engineLock.lock()
+        defer { engineLock.unlock() }
+        return latestSnapshotInternal
+    }
+
     @Published private(set) var isVerifyingVolume: Bool = false
     private var isVerifyingInternal: Bool = false
 
@@ -161,8 +169,15 @@ final class DiskHealthMonitor: ObservableObject {
 
     func clearCurrentSnapshotForTesting() {
         engineLock.lock()
-        defer { engineLock.unlock() }
-        self.currentSnapshot = nil
+        self.latestSnapshotInternal = nil
+        engineLock.unlock()
+        if Thread.isMainThread {
+            self.publishedSnapshot = nil
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.publishedSnapshot = nil
+            }
+        }
     }
 
     func setMonitoredTarget(volumePath: String?, deviceQuery: String?) {
@@ -512,13 +527,14 @@ final class DiskHealthMonitor: ObservableObject {
             }
         }
 
+        self.latestSnapshotInternal = snapshot
         saveStateLocked()
 
         if Thread.isMainThread {
-            self.currentSnapshot = snapshot
+            self.publishedSnapshot = snapshot
         } else {
-            DispatchQueue.main.async {
-                self.currentSnapshot = snapshot
+            DispatchQueue.main.async { [weak self] in
+                self?.publishedSnapshot = snapshot
             }
         }
         return snapshot
@@ -586,8 +602,14 @@ final class DiskHealthMonitor: ObservableObject {
 
             // Send Telegram alert
             let htmlMsg = TelegramNotifier.shared.formatReportHTML(snapshot: snapshot, title: alertTitle)
-            TelegramNotifier.shared.sendMessageAsync(htmlText: htmlMsg, disableNotification: false)
-            WebhookNotifier.shared.sendWebhookAsync(snapshot: snapshot, title: alertTitle, eventType: "health_alert")
+            notificationGroup.enter()
+            TelegramNotifier.shared.sendMessageAsync(htmlText: htmlMsg, disableNotification: false) { [weak self] _ in
+                self?.notificationGroup.leave()
+            }
+            notificationGroup.enter()
+            WebhookNotifier.shared.sendWebhookAsync(snapshot: snapshot, title: alertTitle, eventType: "health_alert") { [weak self] _ in
+                self?.notificationGroup.leave()
+            }
             executeAlertScriptAsync(snapshot: snapshot, title: alertTitle, eventType: "health_alert")
         } else if prevSeverity != .healthy && snapshot.overallSeverity == .healthy {
             // Recovery notification
@@ -608,8 +630,14 @@ final class DiskHealthMonitor: ObservableObject {
             }
 
             let msg = TelegramNotifier.shared.formatReportHTML(snapshot: snapshot, title: recoveryTitle)
-            TelegramNotifier.shared.sendMessageAsync(htmlText: msg, disableNotification: false)
-            WebhookNotifier.shared.sendWebhookAsync(snapshot: snapshot, title: recoveryTitle, eventType: "health_recovered")
+            notificationGroup.enter()
+            TelegramNotifier.shared.sendMessageAsync(htmlText: msg, disableNotification: false) { [weak self] _ in
+                self?.notificationGroup.leave()
+            }
+            notificationGroup.enter()
+            WebhookNotifier.shared.sendWebhookAsync(snapshot: snapshot, title: recoveryTitle, eventType: "health_recovered") { [weak self] _ in
+                self?.notificationGroup.leave()
+            }
             executeAlertScriptAsync(snapshot: snapshot, title: recoveryTitle, eventType: "health_recovered")
         }
 
@@ -630,7 +658,10 @@ final class DiskHealthMonitor: ObservableObject {
             } else if state.lastDailySummaryDate != todayStr && hour >= 9 {
                 state.lastDailySummaryDate = todayStr
                 let msg = TelegramNotifier.shared.formatReportHTML(snapshot: snapshot, title: "\(snapshot.productName) Daily Health Digest")
-                TelegramNotifier.shared.sendMessageAsync(htmlText: msg, disableNotification: true)
+                notificationGroup.enter()
+                TelegramNotifier.shared.sendMessageAsync(htmlText: msg, disableNotification: true) { [weak self] _ in
+                    self?.notificationGroup.leave()
+                }
             }
         }
     }
