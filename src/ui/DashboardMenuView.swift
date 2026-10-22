@@ -8,9 +8,53 @@ struct DashboardMenuView: View {
     @ObservedObject var configMgr: ConfigManager = ConfigManager.shared
 
     var body: some View {
-        if let snap = monitor.publishedSnapshot ?? monitor.currentSnapshot {
+        let multi = monitor.publishedMultiSnapshot ?? monitor.currentMultiSnapshot
+        let activeSnap = multi?.disks.first(where: { $0.driveKey == monitor.selectedDashboardDriveKey }) ?? monitor.publishedSnapshot ?? monitor.currentSnapshot
+        if let snap = activeSnap {
             let cfg = configMgr.config
             VStack(alignment: .leading, spacing: 10) {
+                // Multi-Disk Horizontal Switcher (when multiple disks are monitored)
+                if let multi = multi, multi.disks.count > 1 {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(multi.disks) { disk in
+                                let isSelected = (disk.driveKey == monitor.selectedDashboardDriveKey) ||
+                                                 (monitor.selectedDashboardDriveKey.isEmpty && disk.driveKey == multi.primarySnapshot?.driveKey)
+                                Button(action: {
+                                    monitor.selectedDashboardDriveKey = disk.driveKey
+                                }) {
+                                    HStack(spacing: 5) {
+                                        Circle()
+                                            .fill(statusColor(disk.overallSeverity))
+                                            .frame(width: 7, height: 7)
+                                        Text(disk.bsdName.isEmpty ? disk.productName : disk.bsdName)
+                                            .font(.system(size: 11, weight: isSelected ? .bold : .medium))
+                                        if disk.smartValid {
+                                            Text("\(disk.temperatureCelsius)°C")
+                                                .font(.system(size: 10, design: .monospaced))
+                                                .foregroundColor(.secondary)
+                                        }
+                                    }
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                            .fill(isSelected ? Color.accentColor.opacity(0.2) : Color.primary.opacity(0.06))
+                                    )
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                            .stroke(isSelected ? Color.accentColor : Color.clear, lineWidth: 1)
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.horizontal, 1)
+                        .padding(.bottom, 2)
+                    }
+                    Divider()
+                }
+
                 // Header
                 HStack(alignment: .center, spacing: 10) {
                     ZStack {

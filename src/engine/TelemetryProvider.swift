@@ -163,9 +163,11 @@ struct IOKitTelemetryProvider: DiskTelemetryProvider {
 final class MockTelemetryProvider: DiskTelemetryProvider, @unchecked Sendable {
     private let lock = NSLock()
     var hardwareMetrics: DiskHardwareMetrics = DiskHardwareMetrics()
+    var hardwareMetricsByQuery: [String: DiskHardwareMetrics] = [:]
     var allDevices: [DiskHardwareMetrics] = []
     var mountPointByBsd: [String: String] = [:]
     var filesystemMetrics: FilesystemMountMetrics = FilesystemMountMetrics()
+    var filesystemMetricsByMount: [String: FilesystemMountMetrics] = [:]
     var subpathsOverride: [String: Bool]? = nil
     var hostThermalState: ProcessInfo.ThermalState = .nominal
     var mountedVolumes: [MountedVolumeInfo] = []
@@ -182,6 +184,16 @@ final class MockTelemetryProvider: DiskTelemetryProvider, @unchecked Sendable {
     func readHardwareMetrics(query: String) -> DiskHardwareMetrics {
         lock.lock()
         defer { lock.unlock() }
+        if let specific = hardwareMetricsByQuery[query] {
+            return specific
+        }
+        if let match = allDevices.first(where: {
+            let bsd = cStringToSwift($0.bsdName)
+            let ser = cStringToSwift($0.serialNumber)
+            return (!bsd.isEmpty && bsd == query) || (!ser.isEmpty && ser == query)
+        }) {
+            return match
+        }
         return hardwareMetrics
     }
 
@@ -206,6 +218,9 @@ final class MockTelemetryProvider: DiskTelemetryProvider, @unchecked Sendable {
     func inspectFilesystem(mountPath: String) -> FilesystemMountMetrics {
         lock.lock()
         defer { lock.unlock() }
+        if let specific = filesystemMetricsByMount[mountPath] {
+            return specific
+        }
         return filesystemMetrics
     }
 

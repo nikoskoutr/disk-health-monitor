@@ -6,8 +6,26 @@ struct SmartInspectorTab: View {
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
-            if let snap = monitor.currentSnapshot {
+            let multi = monitor.publishedMultiSnapshot ?? monitor.currentMultiSnapshot
+            let targetSnap = multi?.disks.first(where: { $0.driveKey == monitor.selectedDashboardDriveKey }) ?? monitor.publishedSnapshot ?? monitor.currentSnapshot
+            if let snap = targetSnap {
                 VStack(alignment: .leading, spacing: 14) {
+                    if let multi = multi, multi.disks.count > 1 {
+                        HStack {
+                            Text("Inspect Drive:")
+                                .font(.system(size: 11, weight: .semibold))
+                            Picker("", selection: $monitor.selectedDashboardDriveKey) {
+                                ForEach(multi.disks) { d in
+                                    Text(d.displayLabel).tag(d.driveKey)
+                                }
+                            }
+                            .labelsHidden()
+                            .frame(width: 280)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 4)
+                    }
+
                     SettingsCard(title: "Physical Controller & Endurance Summary", icon: "cpu.fill", iconColor: .blue) {
                         HStack {
                             VStack(alignment: .leading, spacing: 3) {

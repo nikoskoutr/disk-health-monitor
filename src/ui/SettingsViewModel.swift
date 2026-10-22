@@ -146,6 +146,24 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
+    func isTargetSelected(_ id: String) -> Bool {
+        let cfg = ConfigManager.shared.currentConfig
+        if cfg.monitorAllDisks { return true }
+        if cfg.monitoredTargets.contains(id) { return true }
+        if cfg.targetVolumePath == id || cfg.targetDeviceQuery == id { return true }
+        return false
+    }
+
+    func toggleDiskSelection(_ id: String) {
+        ConfigManager.shared.toggleTargetInMonitoredList(id)
+    }
+
+    func toggleMonitorAllDisks() {
+        ConfigManager.shared.updateConfig {
+            $0.monitorAllDisks.toggle()
+        }
+    }
+
     private var tokenSaveWorkItem: DispatchWorkItem?
 
     func updateBotToken(_ newValue: String) {

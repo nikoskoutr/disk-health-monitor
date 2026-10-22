@@ -758,7 +758,7 @@ struct CoreLogicTestRunner {
         assertTrue(!kAppArchitecture.isEmpty, "kAppArchitecture must not be empty")
         assertTrue(!kAppArchShort.isEmpty, "kAppArchShort must not be empty")
         assertTrue(kAppArchShort == "arm64" || kAppArchShort == "x86_64", "kAppArchShort must be either arm64 or x86_64")
-        assertTrue(kAppVersion == "2.3.0", "kAppVersion must match 2.3.0")
+        assertTrue(kAppVersion == "2.4.0", "kAppVersion must match 2.4.0")
 
         let diag = DiagnosticExporter.shared.generateDiagnosticReport()
         guard let sys = diag["system"] as? [String: Any] else {
@@ -2160,6 +2160,134 @@ struct CoreLogicTestRunner {
             let snap37 = monitor.evaluateHealth(forceCanary: false, allowNotifications: false)
             assertTrue(monitor.publishedSnapshot?.timestamp == snap37.timestamp, "publishedSnapshot must match latest evaluated snapshot on main thread")
             print("  [OK] Large pipe drainage (>128KB), watchdog timeout termination, and publishedSnapshot verified")
+        }
+
+        // Test 38: Multi-Disk Monitoring, Fleet Evaluation & Canary Cache Isolation
+        print("\n=== Swift Unit Test 38: Multi-Disk Monitoring, Fleet Evaluation & Canary Cache Isolation ===")
+        do {
+            let origConfig = ConfigManager.shared.currentConfig
+            defer {
+                ConfigManager.shared.updateConfig { $0 = origConfig }
+            }
+
+            // 38a. Multi-disk config JSON serialization & backward compatibility
+            var cfg = DiskHealthConfig()
+            cfg.monitorAllDisks = true
+            cfg.monitoredTargets = ["disk0", "/Volumes/BackupSSD"]
+            if let encData = try? JSONEncoder().encode(cfg),
+               let decCfg = try? JSONDecoder().decode(DiskHealthConfig.self, from: encData) {
+                assertTrue(decCfg.monitorAllDisks == true, "monitorAllDisks must round-trip through JSON")
+                assertTrue(decCfg.monitoredTargets == ["disk0", "/Volumes/BackupSSD"], "monitoredTargets must round-trip through JSON")
+            } else {
+                assertTrue(false, "Failed to encode/decode multi-disk config")
+            }
+
+            // Test decoding legacy JSON without multi-disk keys
+            let legacyJson = """
+            {
+                "targetVolumePath": "/Volumes/Legacy",
+                "pollIntervalSeconds": 45.0
+            }
+            """.data(using: .utf8)!
+            if let decLegacy = try? JSONDecoder().decode(DiskHealthConfig.self, from: legacyJson) {
+                assertTrue(decLegacy.monitorAllDisks == false, "Legacy config must default monitorAllDisks to false")
+                assertTrue(decLegacy.monitoredTargets.isEmpty, "Legacy config must default monitoredTargets to empty array")
+                assertTrue(decLegacy.targetVolumePath == "/Volumes/Legacy", "Legacy targetVolumePath preserved")
+            } else {
+                assertTrue(false, "Failed to decode legacy config")
+            }
+
+            // 38b. Mock multi-disk telemetry provider evaluation
+            let mockMulti = MockTelemetryProvider()
+            let dev1 = makeMockDiskHardwareMetrics(
+                found: true,
+                bsdName: "disk0",
+                serialNumber: "SERIAL_INTERNAL_001",
+                vendorName: "Apple",
+                productName: "APPLE SSD AP0512Z",
+                isInternal: true,
+                smartValid: true,
+                temperatureCelsius: 38,
+                percentageUsed: 5
+            )
+
+            let dev2 = makeMockDiskHardwareMetrics(
+                found: true,
+                bsdName: "disk4",
+                serialNumber: "SERIAL_EXTERNAL_002",
+                vendorName: "Samsung",
+                productName: "Samsung PSSD T7",
+                isInternal: false,
+                smartValid: true,
+                temperatureCelsius: 62, // Warning temperature (> 58C)
+                percentageUsed: 82      // Warning wear (> 80%)
+            )
+
+            mockMulti.allDevices = [dev1, dev2]
+            mockMulti.hardwareMetricsByQuery["disk0"] = dev1
+            mockMulti.hardwareMetricsByQuery["disk4"] = dev2
+
+            var fs1 = FilesystemMountMetrics()
+            fs1.isMounted = true
+            fs1.mountPoint = "/"
+            fs1.totalBytes = 500_000_000_000
+            fs1.freeBytes = 350_000_000_000
+            fs1.usedBytes = 150_000_000_000
+            fs1.usedPercent = 30.0
+
+            var fs2 = FilesystemMountMetrics()
+            fs2.isMounted = true
+            fs2.mountPoint = "/Volumes/BackupSSD"
+            fs2.totalBytes = 1_000_000_000_000
+            fs2.freeBytes = 800_000_000_000
+            fs2.usedBytes = 200_000_000_000
+            fs2.usedPercent = 20.0
+
+            mockMulti.filesystemMetricsByMount["/"] = fs1
+            mockMulti.filesystemMetricsByMount["/Volumes/BackupSSD"] = fs2
+            mockMulti.mountPointByBsd["disk0"] = "/"
+            mockMulti.mountPointByBsd["disk4"] = "/Volumes/BackupSSD"
+            mockMulti.canaryResultOverride = CanaryProbeResult(ok: true, latencyMs: 1.5, error: "")
+
+            ConfigManager.shared.updateConfig {
+                $0.monitorAllDisks = true
+                $0.monitoredTargets.removeAll()
+            }
+
+            let multiSnap = monitor.evaluateAllMonitoredDisks(forceCanary: false, allowNotifications: false, telemetryProvider: mockMulti)
+            assertTrue(multiSnap.disks.count == 2, "Must evaluate both disks simultaneously, got \(multiSnap.disks.count)")
+            assertTrue(multiSnap.overallSeverity == .warning, "Aggregate severity must reflect worst disk (expected WARNING, got \(multiSnap.overallSeverity))")
+            assertTrue(multiSnap.worstHealthScore < 100, "Worst score must reflect degraded disk")
+            assertTrue(monitor.publishedMultiSnapshot?.disks.count == 2, "publishedMultiSnapshot must be populated")
+
+            // 38c. Canary Cache Isolation across distinct mount points
+            CanaryProbeService.shared.resetCache()
+            let canaryRes1 = CanaryProbeService.shared.runCanaryCheck(targetMount: "/", force: true)
+            let canaryRes2 = CanaryProbeService.shared.runCanaryCheck(targetMount: NSTemporaryDirectory(), force: true)
+            assertTrue(canaryRes1.ok, "Canary pass on / must succeed")
+            assertTrue(canaryRes2.ok, "Canary pass on temp dir must succeed")
+            let cached1 = CanaryProbeService.shared.runCanaryCheck(targetMount: "/", force: false)
+            assertTrue(cached1.latencyMs == canaryRes1.latencyMs, "Canary cached latency must match per-mount entry")
+
+            // 38d. Dynamic unmounted external physical disk in monitorAllDisks mode
+            let dev3 = makeMockDiskHardwareMetrics(
+                found: true,
+                bsdName: "disk7",
+                serialNumber: "SERIAL_FLASH_003",
+                vendorName: "SanDisk",
+                productName: "Unmounted Flash Drive",
+                isInternal: false,
+                smartValid: false
+            )
+            mockMulti.allDevices = [dev1, dev3]
+
+            let multiSnapDynamic = monitor.evaluateAllMonitoredDisks(forceCanary: false, allowNotifications: false, telemetryProvider: mockMulti)
+            let flashSnap = multiSnapDynamic.disks.first(where: { $0.bsdName == "disk7" })
+            assertTrue(flashSnap != nil, "Unmounted external physical disk must still be evaluated")
+            let hasUnmountedAlert = flashSnap?.issues.contains(where: { $0.code == "VOLUME_UNMOUNTED" }) ?? false
+            assertTrue(!hasUnmountedAlert, "Auto-discovered unmounted external disk must not trigger false VOLUME_UNMOUNTED critical alert")
+
+            print("  [OK] Multi-disk configuration, simultaneous fleet evaluation, canary isolation, and dynamic ejection verified")
         }
 
         print("✅ All Swift Core Logic Unit Tests Passed!")

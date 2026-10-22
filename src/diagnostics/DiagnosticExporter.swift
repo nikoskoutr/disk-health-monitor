@@ -55,8 +55,26 @@ final class DiagnosticExporter: @unchecked Sendable {
             ],
             "target": [
                 "volumePath": cfg.targetVolumePath ?? "auto",
-                "deviceQuery": cfg.targetDeviceQuery ?? "auto"
+                "deviceQuery": cfg.targetDeviceQuery ?? "auto",
+                "monitorAllDisks": cfg.monitorAllDisks,
+                "monitoredTargets": cfg.monitoredTargets
             ],
+            "monitoredFleet": (DiskHealthMonitor.shared.currentMultiSnapshot?.disks ?? [snap]).map { d in
+                [
+                    "driveKey": d.driveKey,
+                    "bsdName": d.bsdName,
+                    "vendorName": d.vendorName,
+                    "productName": d.productName,
+                    "serialNumber": d.serialNumber,
+                    "mountPoint": d.mountPoint,
+                    "overallSeverity": d.overallSeverity.rawValue,
+                    "healthScore": d.healthScore,
+                    "temperatureCelsius": d.temperatureCelsius,
+                    "lifeRemainingPercent": d.lifeRemainingPercent,
+                    "totalTerabytesWritten": d.totalTerabytesWritten,
+                    "issuesCount": d.issues.count
+                ]
+            },
             "detectedDevices": detectedDevicesList,
             "hardware": [
                 "productName": snap.productName,
@@ -191,6 +209,7 @@ final class DiagnosticExporter: @unchecked Sendable {
 
     func exportDiagnosticReportHTML(snapshot: DiskHealthSnapshot? = nil) -> String {
         let snap = snapshot ?? DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: false)
+        let multi = DiskHealthMonitor.shared.currentMultiSnapshot ?? DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: true, allowNotifications: false)
         let esc = TelegramNotifier.shared.escapeHTML
         let badgeColor: String = {
             switch snap.overallSeverity {
@@ -199,6 +218,40 @@ final class DiagnosticExporter: @unchecked Sendable {
             case .critical: return "#ef4444"
             }
         }()
+
+        var fleetSection = ""
+        if multi.disks.count > 1 {
+            var fleetRows = ""
+            for d in multi.disks {
+                let statusColor = d.overallSeverity == .healthy ? "#10b981" : (d.overallSeverity == .warning ? "#f59e0b" : "#ef4444")
+                fleetRows += """
+                <tr>
+                  <td><b>\(esc(d.vendorName)) \(esc(d.productName))</b></td>
+                  <td><code>\(esc(d.bsdName))</code></td>
+                  <td><code>\(esc(d.mountPoint.isEmpty ? "Unmounted" : d.mountPoint))</code></td>
+                  <td>\(d.smartValid ? "\(d.temperatureCelsius)°C" : "N/A")</td>
+                  <td>\(d.smartValid ? "\(d.lifeRemainingPercent)% Left" : "N/A")</td>
+                  <td>\(d.smartValid ? String(format: "%.2f TBW", d.totalTerabytesWritten) : "N/A")</td>
+                  <td><span style='color:\(statusColor);font-weight:700;'>\(esc(d.overallSeverity.rawValue)) (\(d.healthScore)%)</span></td>
+                </tr>
+                """
+            }
+            fleetSection = """
+            <div class="card">
+              <h2>Multi-Disk Monitored Fleet Overview (\(multi.disks.count) Devices)</h2>
+              <table>
+                <thead>
+                  <tr style='border-bottom: 2px solid #475569;'>
+                    <th style='width:auto;'>Device</th><th style='width:auto;'>BSD</th><th style='width:auto;'>Mount</th><th style='width:auto;'>Temp</th><th style='width:auto;'>Wear</th><th style='width:auto;'>TBW</th><th style='width:auto;'>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  \(fleetRows)
+                </tbody>
+              </table>
+            </div>
+            """
+        }
 
         var issuesRows = ""
         if snap.issues.isEmpty {
@@ -233,6 +286,7 @@ final class DiagnosticExporter: @unchecked Sendable {
             <p>Generated: <code>\(esc(snap.formattedTime))</code> • Architecture: <code>\(esc(kAppArchitecture))</code> • Version: <code>v\(esc(kAppVersion))</code></p>
             <span class="badge">\(esc(snap.overallSeverity.rawValue)) — Score: \(snap.healthScore)/100</span>
           </div>
+          \(fleetSection)
           <div class="card">
             <h2>1. Hardware &amp; Interconnect Identity</h2>
             <table>

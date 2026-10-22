@@ -15,6 +15,7 @@ func printUsage() {
     Commands & Modes:
       --status              Print human-readable disk health summary and active issues
       --check               Run a single background check cycle and send alerts
+      --all                 Monitor and evaluate all connected physical disks simultaneously
       --watch-mounts        Run a check triggered by a mount event
       --deep                Include filesystem verification (diskutil verifyVolume)
       --list-disks          List all detected block storage devices, buses, and SMART status
@@ -48,6 +49,10 @@ func parseCommandLine() {
     let args = CommandLine.arguments
 
     // Process override flags first (in-memory overrides for this invocation)
+    if args.contains("--all") {
+        ConfigManager.shared.overrideMonitorAll(true)
+    }
+
     for i in 0..<args.count {
         if args[i] == "--volume" {
             guard i + 1 < args.count, !args[i + 1].hasPrefix("-") else {
@@ -230,13 +235,21 @@ func parseCommandLine() {
     }
 
     if args.contains("--json") {
-        let snap = DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: false)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? encoder.encode(snap), let str = String(data: data, encoding: .utf8) {
-            print(str)
+        if args.contains("--all") || ConfigManager.shared.currentConfig.monitorAllDisks {
+            let multi = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: true, allowNotifications: false)
+            if let data = try? encoder.encode(multi), let str = String(data: data, encoding: .utf8) {
+                print(str)
+            }
+            exit(Int32(multi.overallSeverity.rank))
+        } else {
+            let snap = DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: false)
+            if let data = try? encoder.encode(snap), let str = String(data: data, encoding: .utf8) {
+                print(str)
+            }
+            exit(Int32(snap.overallSeverity.rank))
         }
-        exit(Int32(snap.overallSeverity.rank))
     }
 
     let isCheckMode = args.contains("--cli") || args.contains("--status") || args.contains("--check") || args.contains("--watch-mounts") || args.contains("--deep")
@@ -249,48 +262,80 @@ func parseCommandLine() {
             }
             sem.wait()
         }
-        let snap = DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: notify)
 
-        print("============================================================")
-        print("  \(snap.overallSeverity.emoji) DISK HEALTH MONITOR — \(snap.overallSeverity.rawValue) (Score: \(snap.healthScore)/100) [\(kAppArchShort)]")
-        print("============================================================")
-        print("  Device         : \(snap.vendorName) \(snap.productName) (\(snap.bsdName.isEmpty ? "offline" : snap.bsdName))")
-        print("  Interconnect   : \(snap.interconnectType) (\(snap.isInternal ? "Internal" : "External")) • \(snap.linkSpeedFormatted)")
-        print("  Serial Number  : \(snap.serialNumber.isEmpty ? "N/A" : snap.serialNumber)")
-        print("  Mount Status   : \(snap.isMounted ? "Mounted at \(snap.mountPoint) (\(snap.isReadOnly ? "READ-ONLY" : "R/W")) [\(snap.filesystemType)]" : "UNMOUNTED")")
-        if snap.isMounted {
-            let purgeableSuffix = snap.purgeableBytes > 0 ? " [Purgeable: \(formatBytes(snap.purgeableBytes))]" : ""
-            print(String(format: "  Capacity       : %@ used / %@ free (%.1f%% of %@)%@",
-                         formatBytes(snap.usedBytes), formatBytes(snap.freeBytes), snap.usedPercent, formatBytes(snap.totalBytes), purgeableSuffix))
-        }
-        if snap.smartValid {
-            let cfg = ConfigManager.shared.currentConfig
-            print("  Temperature    : \(snap.temperatureCelsius)°C (Peak: \(snap.peakTemperatureCelsius)°C | Warn: \(cfg.tempWarningCelsius)°C | Crit: \(cfg.tempCriticalCelsius)°C)")
-            print("  SSD Lifespan   : \(snap.lifeRemainingPercent)% Remaining (Percentage Used: \(snap.percentageUsed)%, Spare: \(snap.availableSpare)% / Thresh: \(snap.availableSpareThreshold)%)")
-            print(String(format: "  Lifetime I/O   : %.2f TB Written (TBW) / %.2f TB Read", snap.totalTerabytesWritten, snap.totalTerabytesRead))
-            print("  SMART Counters : Power On: \(snap.powerOnHours)h (\(snap.powerOnHours / 24)d) | Cycles: \(snap.powerCycles) | Unsafe Shutdowns: \(snap.unsafeShutdowns)")
-            print("  SMART Errors   : Critical Warning: 0x\(String(format: "%02X", snap.criticalWarning)) | Media Errors: \(snap.mediaErrors) | Error Log: \(snap.errorInfoLogEntries)")
-        }
-        if snap.statsValid {
-            print(String(format: "  Driver Stats   : Errors: %llu R / %llu W | Retries: %llu R / %llu W | Avg Latency: %.2f ms R / %.2f ms W",
-                         snap.errorsRead, snap.errorsWritten, snap.retriesRead, snap.retriesWritten, snap.avgReadLatencyMs, snap.avgWriteLatencyMs))
-        }
-        if ConfigManager.shared.currentConfig.enableActiveCanary {
-            print(String(format: "  I/O Canary     : %@", snap.canaryOk ? String(format: "PASSED (%.2f ms write+fsync+read)", snap.canaryLatencyMs) : "FAILED (\(snap.canaryError))"))
-        }
-        print("  File System    : \(snap.lastVerifyResult)")
-        if !snap.issues.isEmpty {
-            print("------------------------------------------------------------")
-            print("  Active Issues:")
-            for issue in snap.issues {
-                print("   \(issue.severity.emoji) [\(issue.code)] \(issue.title): \(issue.detail)")
+        let isMulti = ConfigManager.shared.currentConfig.monitorAllDisks || ConfigManager.shared.currentConfig.monitoredTargets.count > 1
+        if isMulti {
+            let multi = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: true, allowNotifications: notify)
+            print("============================================================")
+            print("  \(multi.overallSeverity.emoji) FLEET DISK HEALTH MONITOR — \(multi.overallSeverity.rawValue) (Worst: \(multi.worstHealthScore)/100, Avg: \(multi.averageHealthScore)/100) [\(multi.disks.count) Disks]")
+            print("============================================================")
+            for (idx, snap) in multi.disks.enumerated() {
+                print("  [\(idx + 1)/\(multi.disks.count)] \(snap.overallSeverity.emoji) \(snap.vendorName) \(snap.productName) (\(snap.bsdName.isEmpty ? "offline" : snap.bsdName)) — Score: \(snap.healthScore)%")
+                print("      Mount    : \(snap.isMounted ? "\(snap.mountPoint) (\(snap.filesystemType), \(snap.isReadOnly ? "RO" : "RW"))" : "UNMOUNTED")")
+                if snap.smartValid {
+                    print(String(format: "      SMART    : %d°C | Wear: %d%% Left | TBW: %.2f TB | Unsafe: %llu", snap.temperatureCelsius, snap.lifeRemainingPercent, snap.totalTerabytesWritten, snap.unsafeShutdowns))
+                }
+                if snap.statsValid {
+                    print(String(format: "      IO Stats : Read: %@, Write: %@ | Latency: %.2f ms R / %.2f ms W", formatBytes(snap.sessionBytesRead), formatBytes(snap.sessionBytesWritten), snap.avgReadLatencyMs, snap.avgWriteLatencyMs))
+                }
+                if !snap.issues.isEmpty {
+                    for issue in snap.issues {
+                        print("      \(issue.severity.emoji) [\(issue.code)] \(issue.title): \(issue.detail)")
+                    }
+                }
+                if idx < multi.disks.count - 1 {
+                    print("  ----------------------------------------------------------")
+                }
             }
+            print("============================================================")
+            if notify {
+                DiskHealthMonitor.shared.waitForPendingNotifications(timeout: 3.0)
+            }
+            exit(Int32(multi.overallSeverity.rank))
+        } else {
+            let snap = DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: notify)
+
+            print("============================================================")
+            print("  \(snap.overallSeverity.emoji) DISK HEALTH MONITOR — \(snap.overallSeverity.rawValue) (Score: \(snap.healthScore)/100) [\(kAppArchShort)]")
+            print("============================================================")
+            print("  Device         : \(snap.vendorName) \(snap.productName) (\(snap.bsdName.isEmpty ? "offline" : snap.bsdName))")
+            print("  Interconnect   : \(snap.interconnectType) (\(snap.isInternal ? "Internal" : "External")) • \(snap.linkSpeedFormatted)")
+            print("  Serial Number  : \(snap.serialNumber.isEmpty ? "N/A" : snap.serialNumber)")
+            print("  Mount Status   : \(snap.isMounted ? "Mounted at \(snap.mountPoint) (\(snap.isReadOnly ? "READ-ONLY" : "R/W")) [\(snap.filesystemType)]" : "UNMOUNTED")")
+            if snap.isMounted {
+                let purgeableSuffix = snap.purgeableBytes > 0 ? " [Purgeable: \(formatBytes(snap.purgeableBytes))]" : ""
+                print(String(format: "  Capacity       : %@ used / %@ free (%.1f%% of %@)%@",
+                             formatBytes(snap.usedBytes), formatBytes(snap.freeBytes), snap.usedPercent, formatBytes(snap.totalBytes), purgeableSuffix))
+            }
+            if snap.smartValid {
+                let cfg = ConfigManager.shared.currentConfig
+                print("  Temperature    : \(snap.temperatureCelsius)°C (Peak: \(snap.peakTemperatureCelsius)°C | Warn: \(cfg.tempWarningCelsius)°C | Crit: \(cfg.tempCriticalCelsius)°C)")
+                print("  SSD Lifespan   : \(snap.lifeRemainingPercent)% Remaining (Percentage Used: \(snap.percentageUsed)%, Spare: \(snap.availableSpare)% / Thresh: \(snap.availableSpareThreshold)%)")
+                print(String(format: "  Lifetime I/O   : %.2f TB Written (TBW) / %.2f TB Read", snap.totalTerabytesWritten, snap.totalTerabytesRead))
+                print("  SMART Counters : Power On: \(snap.powerOnHours)h (\(snap.powerOnHours / 24)d) | Cycles: \(snap.powerCycles) | Unsafe Shutdowns: \(snap.unsafeShutdowns)")
+                print("  SMART Errors   : Critical Warning: 0x\(String(format: "%02X", snap.criticalWarning)) | Media Errors: \(snap.mediaErrors) | Error Log: \(snap.errorInfoLogEntries)")
+            }
+            if snap.statsValid {
+                print(String(format: "  Driver Stats   : Errors: %llu R / %llu W | Retries: %llu R / %llu W | Avg Latency: %.2f ms R / %.2f ms W",
+                             snap.errorsRead, snap.errorsWritten, snap.retriesRead, snap.retriesWritten, snap.avgReadLatencyMs, snap.avgWriteLatencyMs))
+            }
+            if ConfigManager.shared.currentConfig.enableActiveCanary {
+                print(String(format: "  I/O Canary     : %@", snap.canaryOk ? String(format: "PASSED (%.2f ms write+fsync+read)", snap.canaryLatencyMs) : "FAILED (\(snap.canaryError))"))
+            }
+            print("  File System    : \(snap.lastVerifyResult)")
+            if !snap.issues.isEmpty {
+                print("------------------------------------------------------------")
+                print("  Active Issues:")
+                for issue in snap.issues {
+                    print("   \(issue.severity.emoji) [\(issue.code)] \(issue.title): \(issue.detail)")
+                }
+            }
+            print("============================================================")
+            if notify {
+                DiskHealthMonitor.shared.waitForPendingNotifications(timeout: 3.0)
+            }
+            exit(Int32(snap.overallSeverity.rank))
         }
-        print("============================================================")
-        if notify {
-            DiskHealthMonitor.shared.waitForPendingNotifications(timeout: 3.0)
-        }
-        exit(Int32(snap.overallSeverity.rank))
     }
 
     if args.contains("--send-report") {

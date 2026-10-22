@@ -157,6 +157,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         smartInspectorItem.target = self
         menu.addItem(smartInspectorItem)
 
+        let statsItem = NSMenuItem(title: "Health Statistics & Insights...", action: #selector(openStatisticsTab), keyEquivalent: "s")
+        statsItem.target = self
+        menu.addItem(statsItem)
+
         let telegramReportItem = NSMenuItem(title: "Send Status Report to Telegram Now", action: #selector(sendTelegramReportNow), keyEquivalent: "t")
         telegramReportItem.target = self
         menu.addItem(telegramReportItem)
@@ -235,15 +239,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let currentMount = DiskHealthMonitor.shared.currentSnapshot?.mountPoint ?? ""
         let cfg = ConfigManager.shared.currentConfig
 
+        // Monitor All Disks Option
+        let allItem = NSMenuItem(title: "Monitor All Connected Disks", action: #selector(toggleMonitorAllDisksAction(_:)), keyEquivalent: "")
+        allItem.target = self
+        if cfg.monitorAllDisks {
+            allItem.state = .on
+        }
+        selectDiskMenu.addItem(allItem)
+        selectDiskMenu.addItem(NSMenuItem.separator())
+
         // Auto option
         let autoItem = NSMenuItem(title: "Auto-detect First External Volume", action: #selector(selectDiskTarget(_:)), keyEquivalent: "")
         autoItem.target = self
         autoItem.representedObject = "auto"
-        if cfg.targetVolumePath == nil && cfg.targetDeviceQuery == nil {
+        if !cfg.monitorAllDisks && cfg.targetVolumePath == nil && cfg.targetDeviceQuery == nil {
             autoItem.state = .on
         }
         selectDiskMenu.addItem(autoItem)
         selectDiskMenu.addItem(NSMenuItem.separator())
+
+        let multi = DiskHealthMonitor.shared.currentMultiSnapshot
 
         // Physical Disks
         for d in devices {
@@ -252,13 +267,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let bsd = cStringToSwift(d.bsdName)
             let serial = cStringToSwift(d.serialNumber)
             let bus = cStringToSwift(d.interconnectType)
-            let label = "\(vendor.isEmpty ? "" : vendor + " ")\(prod) (\(bsd), \(bus))"
+            var label = "\(vendor.isEmpty ? "" : vendor + " ")\(prod) (\(bsd), \(bus))"
+
+            if let dSnap = multi?.disks.first(where: { $0.bsdName == bsd || (!serial.isEmpty && $0.serialNumber == serial) }) {
+                label += " [\(dSnap.overallSeverity.emoji) \(dSnap.temperatureCelsius)°C]"
+            }
 
             let item = NSMenuItem(title: label, action: #selector(selectDiskTarget(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = bsd
-            if (cfg.targetDeviceQuery == bsd || (!serial.isEmpty && cfg.targetDeviceQuery == serial)) ||
-               (cfg.targetVolumePath == nil && currentActive == bsd) {
+            if !cfg.monitorAllDisks && ((cfg.targetDeviceQuery == bsd || (!serial.isEmpty && cfg.targetDeviceQuery == serial)) ||
+               (cfg.targetVolumePath == nil && currentActive == bsd)) {
                 item.state = .on
             }
             selectDiskMenu.addItem(item)
@@ -304,9 +323,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    @objc private func toggleMonitorAllDisksAction(_ sender: NSMenuItem) {
+        ConfigManager.shared.updateConfig {
+            $0.monitorAllDisks.toggle()
+            if $0.monitorAllDisks {
+                $0.monitoredTargets.removeAll()
+            }
+        }
+        refreshHealth(forceCanary: true)
+    }
+
     @objc private func selectDiskTarget(_ sender: NSMenuItem) {
         guard let target = sender.representedObject as? String else { return }
         ConfigManager.shared.log("User selected disk target: \(target)")
+        if ConfigManager.shared.currentConfig.monitorAllDisks {
+            ConfigManager.shared.setMonitorAllDisks(false)
+        }
         if target == "auto" {
             DiskHealthMonitor.shared.setMonitoredTarget(volumePath: nil, deviceQuery: nil)
         } else if target.hasPrefix("/") {
@@ -403,9 +435,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshHealth(forceCanary: Bool) {
         DispatchQueue.global(qos: .utility).async {
             self.updateDiskCache()
-            let snap = DiskHealthMonitor.shared.evaluateHealth(forceCanary: forceCanary, allowNotifications: true)
+            let multi = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: forceCanary, allowNotifications: true)
             DispatchQueue.main.async {
-                self.updateStatusBarButton(with: snap)
+                self.updateStatusBarButton(with: multi)
                 self.populateSelectDiskMenu()
                 if let hostingView = self.statusItem.menu?.items.first?.view {
                     hostingView.invalidateIntrinsicContentSize()
@@ -416,11 +448,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func updateStatusBarButton(with snap: DiskHealthSnapshot) {
+    private func updateStatusBarButton(with multi: MultiDiskHealthSnapshot) {
         guard let button = statusItem.button else { return }
 
         let symbolName: String
-        switch snap.overallSeverity {
+        switch multi.overallSeverity {
         case .healthy:
             symbolName = "externaldrive.fill.badge.checkmark"
         case .warning:
@@ -432,22 +464,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Disk Health") {
             let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
             let configured = img.withSymbolConfiguration(config) ?? img
-            configured.isTemplate = (snap.overallSeverity == .healthy)
+            configured.isTemplate = (multi.overallSeverity == .healthy)
             button.image = configured
             button.imagePosition = .imageLeading
         }
 
-        let shortName = snap.mountPoint.isEmpty ? (snap.bsdName.isEmpty ? "Disk" : snap.bsdName) : (snap.mountPoint as NSString).lastPathComponent
-        if !snap.isMounted || !snap.hardwareFound {
-            button.title = " \(shortName) ❌"
-        } else if snap.overallSeverity == .critical {
-            button.title = " \(shortName) 🚨 \(snap.temperatureCelsius)°C"
-        } else if snap.overallSeverity == .warning {
-            button.title = " \(shortName) ⚠️ \(snap.temperatureCelsius)°C"
-        } else if snap.smartValid {
-            button.title = " \(shortName) \(snap.temperatureCelsius)°C"
+        if multi.disks.count > 1 {
+            let maxTemp = multi.disks.map(\.temperatureCelsius).max() ?? 0
+            let tempStr = maxTemp > 0 ? " \(maxTemp)°C" : ""
+            if multi.overallSeverity == .critical {
+                button.title = " \(multi.disks.count) Disks 🚨\(tempStr)"
+            } else if multi.overallSeverity == .warning {
+                button.title = " \(multi.disks.count) Disks ⚠️\(tempStr)"
+            } else {
+                button.title = " \(multi.disks.count) Disks\(tempStr)"
+            }
+        } else if let snap = multi.primarySnapshot ?? multi.disks.first {
+            let shortName = snap.mountPoint.isEmpty ? (snap.bsdName.isEmpty ? "Disk" : snap.bsdName) : (snap.mountPoint as NSString).lastPathComponent
+            if !snap.isMounted || !snap.hardwareFound {
+                button.title = " \(shortName) ❌"
+            } else if snap.overallSeverity == .critical {
+                button.title = " \(shortName) 🚨 \(snap.temperatureCelsius)°C"
+            } else if snap.overallSeverity == .warning {
+                button.title = " \(shortName) ⚠️ \(snap.temperatureCelsius)°C"
+            } else if snap.smartValid {
+                button.title = " \(shortName) \(snap.temperatureCelsius)°C"
+            } else {
+                button.title = " \(shortName) OK"
+            }
+        }
+    }
+
+    private func updateStatusBarButton(with snap: DiskHealthSnapshot) {
+        if let multi = DiskHealthMonitor.shared.currentMultiSnapshot {
+            updateStatusBarButton(with: multi)
         } else {
-            button.title = " \(shortName) OK"
+            let dummyMulti = MultiDiskHealthSnapshot(
+                timestamp: snap.timestamp,
+                formattedTime: snap.formattedTime,
+                formattedShortTime: snap.formattedShortTime,
+                overallSeverity: snap.overallSeverity,
+                worstHealthScore: snap.healthScore,
+                averageHealthScore: snap.healthScore,
+                totalIssuesCount: snap.issues.count,
+                disks: [snap]
+            )
+            updateStatusBarButton(with: dummyMulti)
         }
     }
 
@@ -459,6 +521,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func openSmartInspector() {
         statusItem.menu?.cancelTracking()
         SettingsWindowController.shared.showSettings(tab: 3)
+    }
+
+    @objc func openStatisticsTab() {
+        statusItem.menu?.cancelTracking()
+        SettingsWindowController.shared.showSettings(tab: 4)
     }
 
     @objc private func exportDiagnosticReportAction() {

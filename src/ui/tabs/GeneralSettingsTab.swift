@@ -10,33 +10,54 @@ struct GeneralSettingsTab: View {
             VStack(alignment: .leading, spacing: 14) {
                 SettingsCard(title: "Monitored Storage Target", icon: "externaldrive.fill.badge.checkmark", iconColor: .blue) {
                     SettingsRow(
-                        title: "Target Drive or Volume",
-                        subtitle: "Choose a specific physical disk, mounted volume, or automatic external detection."
+                        title: "Monitor All Connected Disks",
+                        subtitle: "Automatically detect and monitor hardware health for all internal SSDs and external storage devices simultaneously."
                     ) {
-                        Picker("", selection: Binding(
-                            get: {
-                                if let v = configMgr.config.targetVolumePath, !v.isEmpty { return v }
-                                if let d = configMgr.config.targetDeviceQuery, !d.isEmpty { return d }
-                                return "auto"
-                            },
-                            set: { newVal in
-                                if newVal == "auto" {
-                                    DiskHealthMonitor.shared.setMonitoredTarget(volumePath: nil, deviceQuery: nil)
-                                } else if newVal.hasPrefix("/") {
-                                    DiskHealthMonitor.shared.setMonitoredTarget(volumePath: newVal, deviceQuery: nil)
-                                } else {
-                                    DiskHealthMonitor.shared.setMonitoredTarget(volumePath: nil, deviceQuery: newVal)
+                        Toggle("", isOn: Binding(
+                            get: { configMgr.config.monitorAllDisks },
+                            set: { val in
+                                configMgr.setMonitorAllDisks(val)
+                                DispatchQueue.global(qos: .userInitiated).async {
+                                    _ = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: false, allowNotifications: false)
                                 }
                             }
-                        )) {
-                            Text("Auto-detect First External Volume").tag("auto")
-                            Divider()
-                            ForEach(viewModel.availableDisks, id: \.id) { disk in
-                                Text(disk.name).tag(disk.id)
-                            }
-                        }
+                        ))
                         .labelsHidden()
-                        .frame(width: 260)
+                        .toggleStyle(.switch)
+                    }
+
+                    if !configMgr.config.monitorAllDisks {
+                        Divider()
+
+                        SettingsRow(
+                            title: "Target Drive or Volume",
+                            subtitle: "Choose a specific physical disk, mounted volume, or automatic external detection."
+                        ) {
+                            Picker("", selection: Binding(
+                                get: {
+                                    if let v = configMgr.config.targetVolumePath, !v.isEmpty { return v }
+                                    if let d = configMgr.config.targetDeviceQuery, !d.isEmpty { return d }
+                                    return "auto"
+                                },
+                                set: { newVal in
+                                    if newVal == "auto" {
+                                        DiskHealthMonitor.shared.setMonitoredTarget(volumePath: nil, deviceQuery: nil)
+                                    } else if newVal.hasPrefix("/") {
+                                        DiskHealthMonitor.shared.setMonitoredTarget(volumePath: newVal, deviceQuery: nil)
+                                    } else {
+                                        DiskHealthMonitor.shared.setMonitoredTarget(volumePath: nil, deviceQuery: newVal)
+                                    }
+                                }
+                            )) {
+                                Text("Auto-detect First External Volume").tag("auto")
+                                Divider()
+                                ForEach(viewModel.availableDisks, id: \.id) { disk in
+                                    Text(disk.name).tag(disk.id)
+                                }
+                            }
+                            .labelsHidden()
+                            .frame(width: 260)
+                        }
                     }
                 }
 

@@ -15,10 +15,20 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
     @Published private(set) var publishedSnapshot: DiskHealthSnapshot?
     private var latestSnapshotInternal: DiskHealthSnapshot?
 
+    @Published private(set) var publishedMultiSnapshot: MultiDiskHealthSnapshot?
+    private var latestMultiSnapshotInternal: MultiDiskHealthSnapshot?
+    @Published var selectedDashboardDriveKey: String = ""
+
     var currentSnapshot: DiskHealthSnapshot? {
         engineLock.lock()
         defer { engineLock.unlock() }
         return latestSnapshotInternal
+    }
+
+    var currentMultiSnapshot: MultiDiskHealthSnapshot? {
+        engineLock.lock()
+        defer { engineLock.unlock() }
+        return latestMultiSnapshotInternal
     }
 
     @Published private(set) var isVerifyingVolume: Bool = false
@@ -34,6 +44,13 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
     private(set) var isSystemSleeping: Bool = false
     private var recentTemperatureSamples: [String: [(timestamp: TimeInterval, tempC: Int)]] = [:]
     private var defaultTelemetryProvider: any DiskTelemetryProvider = IOKitTelemetryProvider.shared
+
+    private struct DriveThroughputSample {
+        var bytesRead: UInt64 = 0
+        var bytesWritten: UInt64 = 0
+        var timestamp: TimeInterval = 0
+    }
+    private var throughputSamplesByDrive: [String: DriveThroughputSample] = [:]
 
     private init() {
         self.state = DiskHealthMonitor.loadState()
@@ -168,12 +185,16 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
     func clearCurrentSnapshotForTesting() {
         engineLock.lock()
         self.latestSnapshotInternal = nil
+        self.latestMultiSnapshotInternal = nil
+        self.throughputSamplesByDrive.removeAll()
         engineLock.unlock()
         if Thread.isMainThread {
             self.publishedSnapshot = nil
+            self.publishedMultiSnapshot = nil
         } else {
             DispatchQueue.main.async { [weak self] in
                 self?.publishedSnapshot = nil
+                self?.publishedMultiSnapshot = nil
             }
         }
     }
@@ -249,29 +270,28 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
 
     // MARK: - Health Evaluation Pipeline
 
-    @discardableResult
-    func evaluateHealth(
-        forceCanary: Bool = false,
-        allowNotifications: Bool = true,
-        telemetryProvider: (any DiskTelemetryProvider)? = nil
+    private func evaluateSingleTargetLocked(
+        targetMount: String,
+        targetQuery: String,
+        preloadedHardware: DiskHardwareMetrics?,
+        isAutoDiscovered: Bool,
+        forceCanary: Bool,
+        allowNotifications: Bool,
+        now: Date,
+        nowTs: TimeInterval,
+        formattedTime: String,
+        formattedShortTime: String,
+        cfg: DiskHealthConfig,
+        provider: any DiskTelemetryProvider
     ) -> DiskHealthSnapshot {
-        engineLock.lock()
-        defer { engineLock.unlock() }
-
-        let provider = telemetryProvider ?? self.defaultTelemetryProvider
-        let now = Date()
-        let nowTs = now.timeIntervalSince1970
-        let formattedTime = isoTimestampFormatter.string(from: now)
-        let formattedShortTime = shortTimeFormatter.string(from: now)
-        let cfg = ConfigManager.shared.currentConfig
-
-        // 1. Determine Target Mount & Hardware Query
-        var targetMount = cfg.targetVolumePath ?? ""
-        let targetQuery = cfg.targetDeviceQuery ?? ""
-
-        // 2. Hardware Telemetry Query
-        let queryToPass = !targetMount.isEmpty ? targetMount : (!targetQuery.isEmpty ? targetQuery : "auto")
-        let hw = provider.readHardwareMetrics(query: queryToPass)
+        // 1. Hardware Telemetry Query
+        let hw: DiskHardwareMetrics
+        if let preloaded = preloadedHardware, preloaded.found {
+            hw = preloaded
+        } else {
+            let queryToPass = !targetMount.isEmpty ? targetMount : (!targetQuery.isEmpty ? targetQuery : "auto")
+            hw = provider.readHardwareMetrics(query: queryToPass)
+        }
 
         let vendorName = hw.found ? cStringToSwift(hw.vendorName) : "Generic"
         let productName = hw.found ? cStringToSwift(hw.productName) : "Storage Device"
@@ -282,39 +302,38 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         let protocolType = hw.found ? cStringToSwift(hw.protocolType) : ""
         let linkSpeedFormatted = formatLinkSpeed(hw.linkSpeedBps, interconnect: interconnect)
 
-        // 3. Resolve Mount Point for this Hardware Device if targetMount is not explicitly set
-        if targetMount.isEmpty && hw.found && !bsdName.isEmpty {
-            if let resolvedMount = provider.findMountPoint(forBsdName: bsdName) {
-                targetMount = resolvedMount
+        // 2. Resolve Mount Point for this Hardware Device if targetMount is not explicitly set
+        var resolvedMount = targetMount
+        if resolvedMount.isEmpty && hw.found && !bsdName.isEmpty {
+            if let m = provider.findMountPoint(forBsdName: bsdName) {
+                resolvedMount = m
             }
         }
 
-        // 4. Mount & Filesystem Inspection
-        let mountToInspect = !targetMount.isEmpty ? targetMount : (!targetQuery.isEmpty && targetQuery.starts(with: "/") ? targetQuery : "")
+        // 3. Mount & Filesystem Inspection
+        var mountToInspect = !resolvedMount.isEmpty ? resolvedMount : (!targetQuery.isEmpty && targetQuery.starts(with: "/") ? targetQuery : "")
+        if isAutoDiscovered && resolvedMount.isEmpty {
+            mountToInspect = ""
+        }
         let fsMetrics = provider.inspectFilesystem(mountPath: mountToInspect)
 
-        // 5. Required Subpaths Check
-        let subpathsStatus = provider.checkSubpaths(
-            mountPoint: fsMetrics.mountPoint,
-            isMounted: fsMetrics.isMounted,
-            requiredSubpaths: cfg.requiredSubpaths
-        )
+        // 4. Required Subpaths Check
+        let subpathsStatus: [String: Bool]
+        if mountToInspect.isEmpty {
+            subpathsStatus = [:]
+        } else {
+            subpathsStatus = provider.checkSubpaths(
+                mountPoint: fsMetrics.mountPoint,
+                isMounted: fsMetrics.isMounted,
+                requiredSubpaths: cfg.requiredSubpaths
+            )
+        }
 
         let driveKey = !serialNumber.isEmpty
             ? serialNumber
-            : (!bsdName.isEmpty ? bsdName : (!targetMount.isEmpty ? targetMount : (!targetQuery.isEmpty ? targetQuery : "default")))
-        if driveKey != previousDriveKey {
-            if !previousDriveKey.isEmpty {
-                state.lastOverallSeverity = HealthSeverity.healthy.rawValue
-            }
-            previousDriveKey = driveKey
-            previousBytesRead = 0
-            previousBytesWritten = 0
-            previousSampleTime = 0
-            CanaryProbeService.shared.resetCache()
-        }
+            : (!bsdName.isEmpty ? bsdName : (!resolvedMount.isEmpty ? resolvedMount : (!targetQuery.isEmpty ? targetQuery : "default")))
 
-        // 6. Active I/O Canary Probe
+        // 5. Active I/O Canary Probe
         var canaryOk = false
         var canaryLatencyMs = 0.0
         var canaryError = fsMetrics.isMounted ? "Canary disabled" : "Volume not mounted"
@@ -333,22 +352,20 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             }
         }
 
-        // 7. Throughput & Latency Calculations
+        // 6. Throughput & Latency Calculations (tracked per driveKey)
         var readMBps = 0.0
         var writeMBps = 0.0
         if hw.statsValid {
-            if previousSampleTime > 0 && nowTs > previousSampleTime {
-                let dt = nowTs - previousSampleTime
-                if hw.bytesRead >= previousBytesRead {
-                    readMBps = Double(hw.bytesRead - previousBytesRead) / (1_000_000.0 * dt)
+            if let prev = throughputSamplesByDrive[driveKey], prev.timestamp > 0 && nowTs > prev.timestamp {
+                let dt = nowTs - prev.timestamp
+                if hw.bytesRead >= prev.bytesRead {
+                    readMBps = Double(hw.bytesRead - prev.bytesRead) / (1_000_000.0 * dt)
                 }
-                if hw.bytesWritten >= previousBytesWritten {
-                    writeMBps = Double(hw.bytesWritten - previousBytesWritten) / (1_000_000.0 * dt)
+                if hw.bytesWritten >= prev.bytesWritten {
+                    writeMBps = Double(hw.bytesWritten - prev.bytesWritten) / (1_000_000.0 * dt)
                 }
             }
-            previousBytesRead = hw.bytesRead
-            previousBytesWritten = hw.bytesWritten
-            previousSampleTime = nowTs
+            throughputSamplesByDrive[driveKey] = DriveThroughputSample(bytesRead: hw.bytesRead, bytesWritten: hw.bytesWritten, timestamp: nowTs)
         }
 
         let avgReadLatMs = (hw.statsValid && hw.operationsRead > 0)
@@ -358,7 +375,7 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             ? (Double(hw.totalTimeWriteNs) / Double(hw.operationsWritten) / 1_000_000.0)
             : 0.0
 
-        // 8. Update Peak Temp & Baselines for this specific physical drive
+        // 7. Update Peak Temp & Baselines for this specific physical drive
         var driveState = state.getDriveState(key: driveKey, bsdName: bsdName, serial: serialNumber)
 
         let tempC = Int(hw.temperatureCelsius)
@@ -378,7 +395,7 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         }
         state.drives[driveKey] = driveState
 
-        // 9. Evaluate Health Rules Pipeline
+        // 8. Evaluate Health Rules Pipeline
         let inWakeGrace = isSystemSleeping || (lastWakeTime > 0 && (nowTs - lastWakeTime < 8.0))
         let evaluationContext = HealthEvaluationContext(
             nowTs: nowTs,
@@ -505,14 +522,6 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             lastVerifyOk: driveState.lastVerifyOk
         )
 
-        // Write snapshot JSON to latest_status.json
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let jsonData = try? encoder.encode(snapshot) {
-            let latestPath = ConfigManager.shared.latestJsonPath
-            _ = AtomicFileWriter.writeRestricted(data: jsonData, toPath: latestPath, permissions: 0o600)
-        }
-
         if allowNotifications {
             processAlertsAndDigestLocked(snapshot: snapshot, rawMetrics: hw, driveKey: driveKey)
         }
@@ -527,17 +536,184 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             }
         }
 
-        self.latestSnapshotInternal = snapshot
+        return snapshot
+    }
+
+    @discardableResult
+    func evaluateAllMonitoredDisks(
+        forceCanary: Bool = false,
+        allowNotifications: Bool = true,
+        telemetryProvider: (any DiskTelemetryProvider)? = nil
+    ) -> MultiDiskHealthSnapshot {
+        engineLock.lock()
+        defer { engineLock.unlock() }
+
+        let provider = telemetryProvider ?? self.defaultTelemetryProvider
+        let now = Date()
+        let nowTs = now.timeIntervalSince1970
+        let formattedTime = isoTimestampFormatter.string(from: now)
+        let formattedShortTime = shortTimeFormatter.string(from: now)
+        let cfg = ConfigManager.shared.currentConfig
+
+        var snapshots: [DiskHealthSnapshot] = []
+
+        if cfg.monitorAllDisks {
+            let all = provider.listAllDevices(maxCount: 32)
+            var seenKeys = Set<String>()
+            let foundDevices = all.filter { $0.found }
+
+            var enumeratedDevices: [DiskHardwareMetrics] = []
+            for dev in foundDevices {
+                let ser = cStringToSwift(dev.serialNumber)
+                let bsd = cStringToSwift(dev.bsdName)
+                let key = !ser.isEmpty ? ser : bsd
+                if key.isEmpty || !seenKeys.contains(key) {
+                    if !key.isEmpty { seenKeys.insert(key) }
+                    enumeratedDevices.append(dev)
+                }
+            }
+
+            if !enumeratedDevices.isEmpty {
+                for dev in enumeratedDevices {
+                    let bsd = cStringToSwift(dev.bsdName)
+                    let snap = evaluateSingleTargetLocked(
+                        targetMount: "",
+                        targetQuery: bsd,
+                        preloadedHardware: dev,
+                        isAutoDiscovered: true,
+                        forceCanary: forceCanary,
+                        allowNotifications: allowNotifications,
+                        now: now,
+                        nowTs: nowTs,
+                        formattedTime: formattedTime,
+                        formattedShortTime: formattedShortTime,
+                        cfg: cfg,
+                        provider: provider
+                    )
+                    snapshots.append(snap)
+                }
+            } else {
+                let snap = evaluateSingleTargetLocked(
+                    targetMount: cfg.targetVolumePath ?? "",
+                    targetQuery: cfg.targetDeviceQuery ?? "",
+                    preloadedHardware: nil,
+                    isAutoDiscovered: false,
+                    forceCanary: forceCanary,
+                    allowNotifications: allowNotifications,
+                    now: now,
+                    nowTs: nowTs,
+                    formattedTime: formattedTime,
+                    formattedShortTime: formattedShortTime,
+                    cfg: cfg,
+                    provider: provider
+                )
+                snapshots.append(snap)
+            }
+        } else if !cfg.monitoredTargets.isEmpty {
+            for target in cfg.monitoredTargets {
+                let isMount = target.hasPrefix("/")
+                let snap = evaluateSingleTargetLocked(
+                    targetMount: isMount ? target : "",
+                    targetQuery: isMount ? "" : target,
+                    preloadedHardware: nil,
+                    isAutoDiscovered: false,
+                    forceCanary: forceCanary,
+                    allowNotifications: allowNotifications,
+                    now: now,
+                    nowTs: nowTs,
+                    formattedTime: formattedTime,
+                    formattedShortTime: formattedShortTime,
+                    cfg: cfg,
+                    provider: provider
+                )
+                snapshots.append(snap)
+            }
+        } else {
+            let snap = evaluateSingleTargetLocked(
+                targetMount: cfg.targetVolumePath ?? "",
+                targetQuery: cfg.targetDeviceQuery ?? "",
+                preloadedHardware: nil,
+                isAutoDiscovered: false,
+                forceCanary: forceCanary,
+                allowNotifications: allowNotifications,
+                now: now,
+                nowTs: nowTs,
+                formattedTime: formattedTime,
+                formattedShortTime: formattedShortTime,
+                cfg: cfg,
+                provider: provider
+            )
+            snapshots.append(snap)
+        }
+
+        let worstSeverity: HealthSeverity = snapshots.reduce(.healthy) { cur, snap in
+            snap.overallSeverity.rank > cur.rank ? snap.overallSeverity : cur
+        }
+        let worstScore = snapshots.map(\.healthScore).min() ?? 100
+        let avgScore = snapshots.isEmpty ? 100 : Int(snapshots.map(\.healthScore).reduce(0, +) / snapshots.count)
+        let totalIssues = snapshots.reduce(0) { $0 + $1.issues.count }
+
+        let multi = MultiDiskHealthSnapshot(
+            timestamp: nowTs,
+            formattedTime: formattedTime,
+            formattedShortTime: formattedShortTime,
+            overallSeverity: worstSeverity,
+            worstHealthScore: worstScore,
+            averageHealthScore: avgScore,
+            totalIssuesCount: totalIssues,
+            disks: snapshots
+        )
+
+        self.latestMultiSnapshotInternal = multi
+
+        if selectedDashboardDriveKey.isEmpty || !snapshots.contains(where: { $0.driveKey == selectedDashboardDriveKey }) {
+            selectedDashboardDriveKey = multi.primarySnapshot?.driveKey ?? snapshots.first?.driveKey ?? ""
+        }
+        let primary = snapshots.first(where: { $0.driveKey == selectedDashboardDriveKey }) ?? multi.primarySnapshot ?? snapshots.first!
+        self.latestSnapshotInternal = primary
+
+        // Save latest_status.json (single disk writes primary for full backward compatibility, multi writes multi)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if multi.disks.count > 1 {
+            if let jsonData = try? encoder.encode(multi) {
+                _ = AtomicFileWriter.writeRestricted(data: jsonData, toPath: ConfigManager.shared.latestJsonPath, permissions: 0o600)
+            }
+        } else {
+            if let jsonData = try? encoder.encode(primary) {
+                _ = AtomicFileWriter.writeRestricted(data: jsonData, toPath: ConfigManager.shared.latestJsonPath, permissions: 0o600)
+            }
+        }
+
         saveStateLocked()
 
         if Thread.isMainThread {
-            self.publishedSnapshot = snapshot
+            self.publishedMultiSnapshot = multi
+            self.publishedSnapshot = primary
         } else {
             DispatchQueue.main.async { [weak self] in
-                self?.publishedSnapshot = snapshot
+                self?.publishedMultiSnapshot = multi
+                self?.publishedSnapshot = primary
             }
         }
-        return snapshot
+
+        return multi
+    }
+
+    @discardableResult
+    func evaluateHealth(
+        forceCanary: Bool = false,
+        allowNotifications: Bool = true,
+        telemetryProvider: (any DiskTelemetryProvider)? = nil
+    ) -> DiskHealthSnapshot {
+        let multi = evaluateAllMonitoredDisks(
+            forceCanary: forceCanary,
+            allowNotifications: allowNotifications,
+            telemetryProvider: telemetryProvider
+        )
+        engineLock.lock()
+        defer { engineLock.unlock() }
+        return multi.disks.first(where: { $0.driveKey == selectedDashboardDriveKey }) ?? multi.primarySnapshot ?? multi.disks.first!
     }
 
     private func processAlertsAndDigestLocked(snapshot: DiskHealthSnapshot, rawMetrics hw: DiskHardwareMetrics, driveKey: String) {

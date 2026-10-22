@@ -13,8 +13,8 @@ public let kAppArchitecture = "unknown"
 public let kAppArchShort = "unknown"
 #endif
 
-public let kAppVersion = "2.3.0"
-public let kAppBuildNumber = "6"
+public let kAppVersion = "2.4.0"
+public let kAppBuildNumber = "7"
 
 // MARK: - Data Models
 
@@ -335,3 +335,64 @@ let shortMonthDateFormatter: SynchronizedDateFormatter = {
 
 // Enable DiskHardwareMetrics C struct to cross Swift concurrency boundaries safely
 extension DiskHardwareMetrics: @unchecked Sendable {}
+
+// MARK: - Multi-Disk Fleet Models & Snapshot Extensions
+
+extension DiskHealthSnapshot: Identifiable {
+    var driveKey: String {
+        if !serialNumber.isEmpty { return serialNumber }
+        if !bsdName.isEmpty { return bsdName }
+        if !mountPoint.isEmpty { return mountPoint }
+        return "\(vendorName)-\(productName)"
+    }
+
+    var id: String { driveKey }
+
+    var displayLabel: String {
+        let model = "\(vendorName) \(productName)".trimmingCharacters(in: .whitespaces)
+        if !bsdName.isEmpty {
+            return "\(model) (\(bsdName))"
+        }
+        return model
+    }
+}
+
+struct MultiDiskHealthSnapshot: Codable, Sendable, Equatable {
+    let timestamp: TimeInterval
+    let formattedTime: String
+    let formattedShortTime: String
+    let overallSeverity: HealthSeverity
+    let worstHealthScore: Int
+    let averageHealthScore: Int
+    let totalIssuesCount: Int
+    let disks: [DiskHealthSnapshot]
+
+    init(
+        timestamp: TimeInterval,
+        formattedTime: String,
+        formattedShortTime: String,
+        overallSeverity: HealthSeverity,
+        worstHealthScore: Int,
+        averageHealthScore: Int,
+        totalIssuesCount: Int,
+        disks: [DiskHealthSnapshot]
+    ) {
+        self.timestamp = timestamp
+        self.formattedTime = formattedTime
+        self.formattedShortTime = formattedShortTime
+        self.overallSeverity = overallSeverity
+        self.worstHealthScore = worstHealthScore
+        self.averageHealthScore = averageHealthScore
+        self.totalIssuesCount = totalIssuesCount
+        self.disks = disks
+    }
+
+    var primarySnapshot: DiskHealthSnapshot? {
+        disks.max(by: { a, b in
+            if a.overallSeverity.rank != b.overallSeverity.rank {
+                return a.overallSeverity.rank < b.overallSeverity.rank
+            }
+            return a.healthScore > b.healthScore
+        }) ?? disks.first
+    }
+}

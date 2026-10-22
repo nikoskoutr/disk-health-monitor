@@ -11,22 +11,21 @@ final class CanaryProbeService: @unchecked Sendable {
     static let shared = CanaryProbeService()
 
     private let lock = NSLock()
-    private var lastRunTime: TimeInterval = 0
-    private var cachedResult = CanaryProbeResult(ok: true, latencyMs: 0.0, error: "")
+    private var cacheByMount: [String: (timestamp: TimeInterval, result: CanaryProbeResult)] = [:]
 
     init() {}
 
     func resetCache() {
         lock.lock()
-        lastRunTime = 0
-        cachedResult = CanaryProbeResult(ok: true, latencyMs: 0.0, error: "")
+        cacheByMount.removeAll()
         lock.unlock()
     }
 
     func runCanaryCheck(targetMount: String, force: Bool, nowTs: TimeInterval = Date().timeIntervalSince1970) -> CanaryProbeResult {
+        let key = targetMount.isEmpty ? "/" : targetMount
         lock.lock()
-        if !force && (nowTs - lastRunTime) < 300 && lastRunTime > 0 {
-            let res = cachedResult
+        if !force, let entry = cacheByMount[key], (nowTs - entry.timestamp) < 300, entry.timestamp > 0 {
+            let res = entry.result
             lock.unlock()
             return res
         }
@@ -42,8 +41,7 @@ final class CanaryProbeService: @unchecked Sendable {
         }
 
         lock.lock()
-        cachedResult = result
-        lastRunTime = nowTs
+        cacheByMount[key] = (timestamp: nowTs, result: result)
         lock.unlock()
 
         return result

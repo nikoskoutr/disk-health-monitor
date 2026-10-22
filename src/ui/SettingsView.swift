@@ -13,7 +13,8 @@ struct SettingsView: View {
         (1, "Thresholds", "slider.horizontal.3"),
         (2, "Notifications", "bell.badge.fill"),
         (3, "S.M.A.R.T.", "cpu.fill"),
-        (4, "Diagnostics", "wrench.and.screwdriver.fill")
+        (4, "Statistics", "chart.bar.xaxis"),
+        (5, "Diagnostics", "wrench.and.screwdriver.fill")
     ]
 
     var body: some View {
@@ -62,6 +63,8 @@ struct SettingsView: View {
                     NotificationsSettingsTab(configMgr: configMgr, viewModel: viewModel)
                 case 3:
                     SmartInspectorTab(monitor: monitor)
+                case 4:
+                    StatisticsAndInsightsTab(monitor: monitor, configMgr: configMgr)
                 default:
                     DiagnosticsAndExportTab(configMgr: configMgr, viewModel: viewModel, monitor: monitor)
                 }
@@ -70,6 +73,6 @@ struct SettingsView: View {
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
-        .frame(width: 700, height: 650)
+        .frame(width: 760, height: 680)
     }
 }

@@ -7,6 +7,8 @@ import Darwin
 struct DiskHealthConfig: Codable, Equatable {
     var targetVolumePath: String? = nil
     var targetDeviceQuery: String? = nil
+    var monitorAllDisks: Bool = false
+    var monitoredTargets: [String] = []
     var requiredSubpaths: [String] = []
     var enableActiveCanary: Bool = true
     var pollIntervalSeconds: TimeInterval = 30.0
@@ -34,6 +36,8 @@ struct DiskHealthConfig: Codable, Equatable {
         let defaults = DiskHealthConfig()
         targetVolumePath = try container.decodeIfPresent(String.self, forKey: .targetVolumePath) ?? defaults.targetVolumePath
         targetDeviceQuery = try container.decodeIfPresent(String.self, forKey: .targetDeviceQuery) ?? defaults.targetDeviceQuery
+        monitorAllDisks = try container.decodeIfPresent(Bool.self, forKey: .monitorAllDisks) ?? defaults.monitorAllDisks
+        monitoredTargets = try container.decodeIfPresent([String].self, forKey: .monitoredTargets) ?? defaults.monitoredTargets
         requiredSubpaths = try container.decodeIfPresent([String].self, forKey: .requiredSubpaths) ?? defaults.requiredSubpaths
         enableActiveCanary = try container.decodeIfPresent(Bool.self, forKey: .enableActiveCanary) ?? defaults.enableActiveCanary
         pollIntervalSeconds = try container.decodeIfPresent(TimeInterval.self, forKey: .pollIntervalSeconds) ?? defaults.pollIntervalSeconds
@@ -319,6 +323,10 @@ final class ConfigManager: ObservableObject, @unchecked Sendable {
                         result.targetVolumePath = val
                     case "DISK_HEALTH_DEVICE":
                         result.targetDeviceQuery = val
+                    case "MONITOR_ALL_DISKS":
+                        result.monitorAllDisks = (val.lowercased() == "true" || val == "1" || val.lowercased() == "yes")
+                    case "DISK_HEALTH_TARGETS":
+                        result.monitoredTargets = val.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
                     case "DISK_HEALTH_REQUIRED_SUBPATHS":
                         result.requiredSubpaths = val.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
                     case "ENABLE_ACTIVE_CANARY":
@@ -371,6 +379,12 @@ final class ConfigManager: ObservableObject, @unchecked Sendable {
         var result = cfg
         if let v = env["DISK_HEALTH_VOLUME"], !v.isEmpty { result.targetVolumePath = v }
         if let v = env["DISK_HEALTH_DEVICE"], !v.isEmpty { result.targetDeviceQuery = v }
+        if let v = env["MONITOR_ALL_DISKS"], !v.isEmpty {
+            result.monitorAllDisks = (v.lowercased() == "true" || v == "1" || v.lowercased() == "yes")
+        }
+        if let v = env["DISK_HEALTH_TARGETS"], !v.isEmpty {
+            result.monitoredTargets = v.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        }
         if let v = env["DISK_HEALTH_REQUIRED_SUBPATHS"], !v.isEmpty {
             result.requiredSubpaths = v.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         }
@@ -410,6 +424,31 @@ final class ConfigManager: ObservableObject, @unchecked Sendable {
         self._config = next
         configLock.unlock()
         notifyObjectWillChangeOnMain()
+    }
+
+    func overrideMonitorAll(_ all: Bool) {
+        configLock.lock()
+        var next = self._config
+        next.monitorAllDisks = all
+        self._config = next
+        configLock.unlock()
+        notifyObjectWillChangeOnMain()
+    }
+
+    func setMonitorAllDisks(_ all: Bool) {
+        updateConfig { cfg in
+            cfg.monitorAllDisks = all
+        }
+    }
+
+    func toggleTargetInMonitoredList(_ target: String) {
+        updateConfig { cfg in
+            if let idx = cfg.monitoredTargets.firstIndex(of: target) {
+                cfg.monitoredTargets.remove(at: idx)
+            } else {
+                cfg.monitoredTargets.append(target)
+            }
+        }
     }
 
     // Persistent target update (e.g. from Menu Bar UI dropdown)
