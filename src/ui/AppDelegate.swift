@@ -20,6 +20,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var wakeWorkItem: DispatchWorkItem?
     private var configRefreshWorkItem: DispatchWorkItem?
     private var isRefreshingHealth: Bool = false
+    private var lastStatusSymbolSeverity: HealthSeverity?
+    private var lastStatusTitle: String = ""
+    private var statusSymbolCache: [HealthSeverity: NSImage] = [:]
+
+    private func cachedStatusImage(for severity: HealthSeverity) -> NSImage? {
+        if let cached = statusSymbolCache[severity] {
+            return cached
+        }
+        let symbolName: String
+        switch severity {
+        case .healthy: symbolName = "externaldrive.fill.badge.checkmark"
+        case .warning: symbolName = "externaldrive.trianglebadge.exclamationmark"
+        case .critical: symbolName = "externaldrive.fill.badge.xmark"
+        }
+        guard let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Disk Health") else {
+            return nil
+        }
+        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+        let configured = img.withSymbolConfiguration(config) ?? img
+        configured.isTemplate = (severity == .healthy)
+        statusSymbolCache[severity] = configured
+        return configured
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -459,48 +482,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func updateStatusBarButton(with multi: MultiDiskHealthSnapshot) {
         guard let button = statusItem.button else { return }
 
-        let symbolName: String
-        switch multi.overallSeverity {
-        case .healthy:
-            symbolName = "externaldrive.fill.badge.checkmark"
-        case .warning:
-            symbolName = "externaldrive.trianglebadge.exclamationmark"
-        case .critical:
-            symbolName = "externaldrive.fill.badge.xmark"
-        }
-
-        if let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Disk Health") {
-            let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
-            let configured = img.withSymbolConfiguration(config) ?? img
-            configured.isTemplate = (multi.overallSeverity == .healthy)
+        if lastStatusSymbolSeverity != multi.overallSeverity,
+           let configured = cachedStatusImage(for: multi.overallSeverity) {
             button.image = configured
             button.imagePosition = .imageLeading
+            lastStatusSymbolSeverity = multi.overallSeverity
         }
 
+        var newTitle: String = ""
         if multi.disks.count > 1 {
-            let smartDisks = multi.disks.filter(\.smartValid)
-            let maxTemp = smartDisks.map(\.temperatureCelsius).max()
-            let tempStr = (maxTemp != nil && maxTemp! > 0) ? " \(maxTemp!)°C" : ""
+            var maxTemp = 0
+            for d in multi.disks where d.smartValid && d.temperatureCelsius > maxTemp {
+                maxTemp = d.temperatureCelsius
+            }
+            let tempStr = maxTemp > 0 ? " \(maxTemp)°C" : ""
             if multi.overallSeverity == .critical {
-                button.title = " \(multi.disks.count) Disks 🚨\(tempStr)"
+                newTitle = " \(multi.disks.count) Disks 🚨\(tempStr)"
             } else if multi.overallSeverity == .warning {
-                button.title = " \(multi.disks.count) Disks ⚠️\(tempStr)"
+                newTitle = " \(multi.disks.count) Disks ⚠️\(tempStr)"
             } else {
-                button.title = " \(multi.disks.count) Disks\(tempStr)"
+                newTitle = " \(multi.disks.count) Disks\(tempStr)"
             }
         } else if let snap = multi.primarySnapshot ?? multi.disks.first {
-            let shortName = snap.mountPoint.isEmpty ? (snap.bsdName.isEmpty ? "Disk" : snap.bsdName) : (snap.mountPoint as NSString).lastPathComponent
+            let rawName = snap.mountPoint.isEmpty ? (snap.bsdName.isEmpty ? "Disk" : snap.bsdName) : (snap.mountPoint as NSString).lastPathComponent
+            let shortName = rawName.count > 18 ? String(rawName.prefix(16)) + "…" : rawName
             if !snap.isMounted || !snap.hardwareFound {
-                button.title = " \(shortName) ❌"
+                newTitle = " \(shortName) ❌"
             } else if snap.overallSeverity == .critical {
-                button.title = " \(shortName) 🚨 \(snap.temperatureCelsius)°C"
+                newTitle = " \(shortName) 🚨 \(snap.temperatureCelsius)°C"
             } else if snap.overallSeverity == .warning {
-                button.title = " \(shortName) ⚠️ \(snap.temperatureCelsius)°C"
+                newTitle = " \(shortName) ⚠️ \(snap.temperatureCelsius)°C"
             } else if snap.smartValid {
-                button.title = " \(shortName) \(snap.temperatureCelsius)°C"
+                newTitle = " \(shortName) \(snap.temperatureCelsius)°C"
             } else {
-                button.title = " \(shortName) OK"
+                newTitle = " \(shortName) OK"
             }
+        }
+        if !newTitle.isEmpty && button.title != newTitle {
+            button.title = newTitle
+            lastStatusTitle = newTitle
         }
     }
 

@@ -13,16 +13,19 @@ final class DiagnosticExporter: @unchecked Sendable {
         let fileSize = lseek(fd, 0, SEEK_END)
         guard fileSize > 0 else { return [] }
 
-        let readSize = Int(min(off_t(maxTailBytes), fileSize))
+        // Read 1 extra leading byte when seeking mid-file to check if offset lands on a newline boundary
+        let readSize = Int(min(off_t(maxTailBytes) + 1, fileSize))
         let offset = fileSize - off_t(readSize)
         var buffer = [UInt8](repeating: 0, count: readSize)
         let bytesRead = pread(fd, &buffer, readSize, offset)
         guard bytesRead > 0 else { return [] }
 
-        let tailStr = String(decoding: buffer.prefix(bytesRead), as: UTF8.self)
+        let startsMidLine = (offset > 0) && (buffer[0] != UInt8(ascii: "\n"))
+        let payloadSlice = (offset > 0) ? buffer.dropFirst().prefix(bytesRead - 1) : buffer.prefix(bytesRead)
+        let tailStr = String(decoding: payloadSlice, as: UTF8.self)
         var lines = tailStr.components(separatedBy: .newlines).filter { !$0.isEmpty }
-        if offset > 0 && lines.count > maxLines {
-            lines.removeFirst() // Drop potentially truncated leading line
+        if startsMidLine && !lines.isEmpty {
+            lines.removeFirst() // Always drop truncated leading line fragment
         }
         let suffixLines = lines.suffix(maxLines).joined(separator: "\n")
         let token = ConfigManager.shared.resolvedTelegramBotToken

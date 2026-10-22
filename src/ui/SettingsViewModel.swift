@@ -40,8 +40,6 @@ final class SettingsViewModel: ObservableObject {
         self.botToken = ConfigManager.shared.resolvedTelegramBotToken
         self.webhookUrl = ConfigManager.shared.resolvedWebhookUrl
         self.keychainState = SecretStore.shared.keychainState
-        refreshDiskList()
-        checkLaunchAgent()
     }
 
     func checkLaunchAgent() {
@@ -181,9 +179,9 @@ final class SettingsViewModel: ObservableObject {
 
     func commitBotTokenNow(_ val: String) {
         debounceLock.lock()
+        defer { debounceLock.unlock() }
         tokenSaveWorkItem?.cancel()
         tokenSaveWorkItem = nil
-        debounceLock.unlock()
         if val.isEmpty {
             _ = SecretStore.shared.deleteSecret(forKey: "telegramBotToken", allowInteractiveKeychain: false)
             ConfigManager.shared.updateConfig { $0.telegramBotToken = "" }
@@ -209,9 +207,9 @@ final class SettingsViewModel: ObservableObject {
 
     func commitWebhookUrlNow(_ val: String) {
         debounceLock.lock()
+        defer { debounceLock.unlock() }
         webhookSaveWorkItem?.cancel()
         webhookSaveWorkItem = nil
-        debounceLock.unlock()
         let trimmed = val.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
             _ = SecretStore.shared.deleteSecret(forKey: "webhookUrl", allowInteractiveKeychain: false)
@@ -438,11 +436,19 @@ final class SettingsViewModel: ObservableObject {
 
 // MARK: - Settings Window Controller
 
-final class SettingsWindowController: NSWindowController {
+final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     static let shared = SettingsWindowController()
+    private static let sharedVM = SettingsViewModel()
 
     convenience init() {
-        let vm = SettingsWindowController.sharedVM
+        self.init(window: nil)
+    }
+
+    private func ensureWindowCreated() -> NSWindow {
+        if let existing = self.window {
+            return existing
+        }
+        let vm = Self.sharedVM
         let settingsView = SettingsView(viewModel: vm)
         let hostingController = NSHostingController(rootView: settingsView)
         let window = NSWindow(contentViewController: hostingController)
@@ -452,10 +458,10 @@ final class SettingsWindowController: NSWindowController {
         window.minSize = NSSize(width: 700, height: 650)
         window.center()
         window.isReleasedWhenClosed = false
-        self.init(window: window)
+        window.delegate = self
+        self.window = window
+        return window
     }
-
-    private static let sharedVM = SettingsViewModel()
 
     func showSettings(tab: Int? = nil) {
         if let tab = tab {
@@ -466,8 +472,17 @@ final class SettingsWindowController: NSWindowController {
         SettingsWindowController.sharedVM.botToken = ConfigManager.shared.resolvedTelegramBotToken
         SettingsWindowController.sharedVM.webhookUrl = ConfigManager.shared.resolvedWebhookUrl
         SettingsWindowController.sharedVM.keychainState = SecretStore.shared.keychainState
-        guard let window = self.window else { return }
+        let window = ensureWindowCreated()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        Self.sharedVM.commitBotTokenNow(Self.sharedVM.botToken)
+        Self.sharedVM.commitWebhookUrlNow(Self.sharedVM.webhookUrl)
+        Self.sharedVM.availableDisks.removeAll()
+        Self.sharedVM.surfaceScanProgress = nil
+        self.window?.contentViewController = nil
+        self.window = nil
     }
 }

@@ -291,11 +291,10 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
     if (hasEntryId) {
         pthread_mutex_lock(&sStaticCacheMutex);
         for (int i = 0; i < sStaticCacheCount; i++) {
-            if (sStaticCache[i].entryId == entryId && sStaticCache[i].bsdName[0] != '\0') {
+            if (sStaticCache[i].entryId == entryId) {
                 strlcpy(outMetrics->productName, sStaticCache[i].productName, sizeof(outMetrics->productName));
                 strlcpy(outMetrics->vendorName, sStaticCache[i].vendorName, sizeof(outMetrics->vendorName));
                 strlcpy(outMetrics->productRevision, sStaticCache[i].productRevision, sizeof(outMetrics->productRevision));
-                strlcpy(outMetrics->bsdName, sStaticCache[i].bsdName, sizeof(outMetrics->bsdName));
                 strlcpy(outMetrics->serialNumber, sStaticCache[i].serialNumber, sizeof(outMetrics->serialNumber));
                 strlcpy(outMetrics->usbSerialNumber, sStaticCache[i].serialNumber, sizeof(outMetrics->usbSerialNumber));
                 strlcpy(outMetrics->interconnectType, sStaticCache[i].interconnectType, sizeof(outMetrics->interconnectType));
@@ -396,7 +395,18 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
 
         if (hasEntryId && outMetrics->bsdName[0] != '\0') {
             pthread_mutex_lock(&sStaticCacheMutex);
-            StaticDeviceCacheEntry *slot = &sStaticCache[sStaticCacheNextIdx];
+            StaticDeviceCacheEntry *slot = NULL;
+            for (int i = 0; i < sStaticCacheCount; i++) {
+                if (sStaticCache[i].entryId == entryId) {
+                    slot = &sStaticCache[i];
+                    break;
+                }
+            }
+            if (!slot) {
+                slot = &sStaticCache[sStaticCacheNextIdx];
+                sStaticCacheNextIdx = (sStaticCacheNextIdx + 1) % MAX_STATIC_CACHE_ENTRIES;
+                if (sStaticCacheCount < MAX_STATIC_CACHE_ENTRIES) sStaticCacheCount++;
+            }
             slot->entryId = entryId;
             strlcpy(slot->productName, outMetrics->productName, sizeof(slot->productName));
             strlcpy(slot->vendorName, outMetrics->vendorName, sizeof(slot->vendorName));
@@ -407,8 +417,6 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
             slot->isInternal = outMetrics->isInternal;
             slot->isRemovable = outMetrics->isRemovable;
             slot->linkSpeedBps = outMetrics->linkSpeedBps;
-            sStaticCacheNextIdx = (sStaticCacheNextIdx + 1) % MAX_STATIC_CACHE_ENTRIES;
-            if (sStaticCacheCount < MAX_STATIC_CACHE_ENTRIES) sStaticCacheCount++;
             pthread_mutex_unlock(&sStaticCacheMutex);
         }
     }
@@ -670,20 +678,26 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
     io_service_t targetDev = findBlockStorageDeviceByBSDName(cleanTargetBsd);
     if (targetDev == 0) return false;
 
-    int numMounts = getfsstat(NULL, 0, MNT_NOWAIT);
-    if (numMounts <= 0) {
+    struct statfs stackFs[64];
+    struct statfs *fsList = stackFs;
+    int allocMounts = 64;
+    int count = getfsstat(fsList, (int)sizeof(stackFs), MNT_NOWAIT);
+    if (count >= allocMounts) {
+        int numMounts = getfsstat(NULL, 0, MNT_NOWAIT);
+        if (numMounts > allocMounts) {
+            allocMounts = numMounts + 4;
+            struct statfs *heapFs = calloc((size_t)allocMounts, sizeof(struct statfs));
+            if (heapFs) {
+                fsList = heapFs;
+                count = getfsstat(fsList, (int)(sizeof(struct statfs) * allocMounts), MNT_NOWAIT);
+            }
+        }
+    }
+    if (count <= 0) {
+        if (fsList != stackFs) free(fsList);
         IOObjectRelease(targetDev);
         return false;
     }
-
-    int allocMounts = numMounts + 4;
-    struct statfs *fsList = calloc((size_t)allocMounts, sizeof(struct statfs));
-    if (!fsList) {
-        IOObjectRelease(targetDev);
-        return false;
-    }
-
-    int count = getfsstat(fsList, (int)(sizeof(struct statfs) * allocMounts), MNT_NOWAIT);
     if (count > allocMounts) {
         count = allocMounts;
     }
@@ -747,7 +761,7 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
         }
     }
 
-    free(fsList);
+    if (fsList != stackFs) free(fsList);
     IOObjectRelease(targetDev);
     return found;
 }

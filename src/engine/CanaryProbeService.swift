@@ -67,17 +67,29 @@ final class CanaryProbeService: @unchecked Sendable {
         }
 
         let canaryPath = (effectiveDir as NSString).appendingPathComponent(".disk_health_canary_\(getuid())")
-        let token = "DISK_HEALTH_CANARY_\(UUID().uuidString)\n"
-        guard let data = token.data(using: .utf8) else {
+        let header = "DISK_HEALTH_CANARY_\(UUID().uuidString)\n"
+        guard var data = header.data(using: .utf8) else {
             return CanaryProbeResult(ok: false, latencyMs: 0, error: "Encoding error")
+        }
+        // Pad to 512-byte sector boundary so F_NOCACHE pwrite/pread never fails with EINVAL on exFAT/FAT32
+        if data.count < 512 {
+            data.append(Data(repeating: 0x20, count: 512 - data.count - 1))
+            data.append(0x0A)
         }
 
         let start = DispatchTime.now()
         // Use O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC for in-place verification without directory B-tree churn
-        let fd = open(canaryPath, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        var fd = open(canaryPath, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        var openErrno = (fd < 0) ? errno : 0
+        if fd < 0 && (openErrno == EACCES || openErrno == EPERM) {
+            // Self-heal if an orphaned canary file with 0400 permissions was left behind on a writable mount
+            if unlink(canaryPath) == 0 {
+                fd = open(canaryPath, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
+                openErrno = (fd < 0) ? errno : 0
+            }
+        }
         if fd < 0 {
-            let errCode = errno
-            if errCode == EPERM || errCode == EACCES || errCode == EROFS {
+            if openErrno == EPERM || openErrno == EACCES || openErrno == EROFS {
                 // Fallback to active read/directory probe on the mount directory itself
                 let readStart = DispatchTime.now()
                 guard let dir = opendir(targetMount) else {
@@ -97,15 +109,23 @@ final class CanaryProbeService: @unchecked Sendable {
                 let elapsedMs = Double(elapsedNs) / 1_000_000.0
                 return CanaryProbeResult(ok: true, latencyMs: elapsedMs, error: "")
             }
-            let errStr = String(cString: strerror(errCode))
+            let errStr = String(cString: strerror(openErrno))
             return CanaryProbeResult(ok: false, latencyMs: 0, error: "open write failed: \(errStr)")
         }
 
         _ = fcntl(fd, F_NOCACHE, 1)
 
-        let written = data.withUnsafeBytes { ptr -> Int in
+        var written = data.withUnsafeBytes { ptr -> Int in
             guard let base = ptr.baseAddress else { return -1 }
             return pwrite(fd, base, data.count, 0)
+        }
+        if written < 0 && errno == EINVAL {
+            // Filesystem driver rejected F_NOCACHE unaligned buffer; disable F_NOCACHE and retry pwrite
+            _ = fcntl(fd, F_NOCACHE, 0)
+            written = data.withUnsafeBytes { ptr -> Int in
+                guard let base = ptr.baseAddress else { return -1 }
+                return pwrite(fd, base, data.count, 0)
+            }
         }
         if written != data.count {
             let errStr = String(cString: strerror(errno))

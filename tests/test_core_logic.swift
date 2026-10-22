@@ -2475,6 +2475,185 @@ struct CoreLogicTestRunner {
             print("  [OK] Subpath isolation, tie-breaker selection, concurrent drive selection, and reverse log tailer verified")
         }
 
+        do {
+            print("=== Swift Unit Test 40: Pass 2 Edge-Case Remediations (UAT2, SYS2, and OPT2) ===")
+
+            // 40a. Sector-Aligned Canary Probe & Read-Only (0400) Orphan Self-Healing (UAT2-01 & UAT2-04)
+            let canaryTestDir = NSTemporaryDirectory() + "canary_orphan_test_\(UUID().uuidString)"
+            try? FileManager.default.createDirectory(atPath: canaryTestDir, withIntermediateDirectories: true)
+            let orphanCanaryPath = (canaryTestDir as NSString).appendingPathComponent(".disk_health_canary_\(getuid())")
+            let staleData = "OLD_STALE_CANARY_BEFORE_CRASH\n".data(using: .utf8)!
+            FileManager.default.createFile(atPath: orphanCanaryPath, contents: staleData, attributes: [.posixPermissions: 0o400])
+
+            let probeRes = CanaryProbeService.shared.runCanaryCheck(targetMount: canaryTestDir, force: true)
+            assertTrue(probeRes.ok, "Canary probe must self-heal 0400 orphaned file on writable mount, got error: \(probeRes.error)")
+
+            // Check file size is >= 512 bytes (sector-padded for FAT32/exFAT direct I/O alignment)
+            let fileAttrs = try? FileManager.default.attributesOfItem(atPath: orphanCanaryPath)
+            let fileSize = (fileAttrs?[.size] as? UInt64) ?? 0
+            assertTrue(fileSize >= 512, "Canary file size must be >= 512 bytes (sector-padded), got \(fileSize)")
+            try? FileManager.default.removeItem(atPath: canaryTestDir)
+
+            // 40b. Persistent Dashboard Drive Selection Across Polling Cycles (UAT2-02 & SYS2-02)
+            monitor.selectDashboardDrive(key: "SERIAL_TEST_DRIVE_PASS2")
+            assertTrue(monitor.selectedDashboardDriveKey == "SERIAL_TEST_DRIVE_PASS2", "selectDashboardDrive must immediately update selectedDashboardDriveKey on main thread")
+
+            // 40c. Brand-New Drive (powerOnHours == 0, smartValid == false) Edge Cases
+            let brandNewUsb = DiskHealthSnapshot(
+                timestamp: 1000,
+                formattedTime: "2026-10-22 12:00:00",
+                formattedShortTime: "12:00",
+                overallSeverity: .healthy,
+                healthScore: 100,
+                issues: [],
+                hardwareFound: true,
+                vendorName: "SanDisk",
+                productName: "Ultra USB 3.0",
+                productRevision: "1.0",
+                bsdName: "disk5",
+                serialNumber: "USB_FLASH_1",
+                usbSerialNumber: "USB_FLASH_1",
+                interconnectType: "USB",
+                protocolType: "USB-MassStorage",
+                isInternal: false,
+                isRemovable: true,
+                linkSpeedBps: 5_000_000_000,
+                linkSpeedFormatted: "5 Gbps",
+                isMounted: true,
+                mountPoint: "/Volumes/SANDISK",
+                filesystemType: "msdos",
+                isReadOnly: false,
+                totalBytes: 32_000_000_000,
+                freeBytes: 30_000_000_000,
+                purgeableBytes: 0,
+                usedBytes: 2_000_000_000,
+                usedPercent: 6.2,
+                subpathsStatus: [:],
+                canaryOk: true,
+                canaryLatencyMs: 2.1,
+                canaryError: "",
+                smartValid: false,
+                criticalWarning: 0,
+                temperatureCelsius: 0,
+                temperatureKelvin: 0,
+                peakTemperatureCelsius: 0,
+                availableSpare: 0,
+                availableSpareThreshold: 0,
+                percentageUsed: 0,
+                lifeRemainingPercent: 100,
+                dataUnitsRead: 0,
+                dataUnitsWritten: 0,
+                totalTerabytesRead: 0.0,
+                totalTerabytesWritten: 0.0,
+                hostReadCommands: 0,
+                hostWriteCommands: 0,
+                controllerBusyTime: 0,
+                powerCycles: 1,
+                powerOnHours: 0,
+                unsafeShutdowns: 0,
+                mediaErrors: 0,
+                errorInfoLogEntries: 0,
+                statsValid: false,
+                sessionBytesRead: 0,
+                sessionBytesWritten: 0,
+                operationsRead: 0,
+                operationsWritten: 0,
+                errorsRead: 0,
+                errorsWritten: 0,
+                retriesRead: 0,
+                retriesWritten: 0,
+                avgReadLatencyMs: 0.0,
+                avgWriteLatencyMs: 0.0,
+                readThroughputMBps: 0.0,
+                writeThroughputMBps: 0.0,
+                lastVerifyResult: "Not run yet",
+                lastVerifyOk: true
+            )
+            assertTrue(brandNewUsb.dailyTerabytesWritten == 0.0, "dailyTerabytesWritten must be 0.0 for USB drive with 0 POH")
+            assertTrue(brandNewUsb.estimatedRemainingLifeFormatted == "N/A", "estimatedRemainingLifeFormatted must be 'N/A' when smartValid is false")
+            assertTrue(!brandNewUsb.avgReadLatencyMs.isNaN && !brandNewUsb.avgReadLatencyMs.isInfinite, "avgReadLatencyMs must be finite")
+            assertTrue(!brandNewUsb.avgWriteLatencyMs.isNaN && !brandNewUsb.avgWriteLatencyMs.isInfinite, "avgWriteLatencyMs must be finite")
+
+            // Brand new NVMe with smartValid == true, powerOnHours == 0
+            let brandNewNvme = DiskHealthSnapshot(
+                timestamp: 1000,
+                formattedTime: "2026-10-22 12:00:00",
+                formattedShortTime: "12:00",
+                overallSeverity: .healthy,
+                healthScore: 100,
+                issues: [],
+                hardwareFound: true,
+                vendorName: "Apple",
+                productName: "APPLE SSD AP0512Z",
+                productRevision: "1.0",
+                bsdName: "disk0",
+                serialNumber: "NEW_NVME_0POH",
+                usbSerialNumber: "NEW_NVME_0POH",
+                interconnectType: "PCI-Express",
+                protocolType: "Apple Fabric / NVMe",
+                isInternal: true,
+                isRemovable: false,
+                linkSpeedBps: 0,
+                linkSpeedFormatted: "PCIe NVMe",
+                isMounted: true,
+                mountPoint: "/",
+                filesystemType: "apfs",
+                isReadOnly: false,
+                totalBytes: 500_000_000_000,
+                freeBytes: 400_000_000_000,
+                purgeableBytes: 0,
+                usedBytes: 100_000_000_000,
+                usedPercent: 20.0,
+                subpathsStatus: [:],
+                canaryOk: true,
+                canaryLatencyMs: 0.4,
+                canaryError: "",
+                smartValid: true,
+                criticalWarning: 0,
+                temperatureCelsius: 35,
+                temperatureKelvin: 308,
+                peakTemperatureCelsius: 35,
+                availableSpare: 100,
+                availableSpareThreshold: 10,
+                percentageUsed: 0,
+                lifeRemainingPercent: 100,
+                dataUnitsRead: 1000,
+                dataUnitsWritten: 1000,
+                totalTerabytesRead: 0.5,
+                totalTerabytesWritten: 0.5,
+                hostReadCommands: 1000,
+                hostWriteCommands: 1000,
+                controllerBusyTime: 10,
+                powerCycles: 2,
+                powerOnHours: 0,
+                unsafeShutdowns: 0,
+                mediaErrors: 0,
+                errorInfoLogEntries: 0,
+                statsValid: true,
+                sessionBytesRead: 1000,
+                sessionBytesWritten: 1000,
+                operationsRead: 10,
+                operationsWritten: 10,
+                errorsRead: 0,
+                errorsWritten: 0,
+                retriesRead: 0,
+                retriesWritten: 0,
+                avgReadLatencyMs: 0.1,
+                avgWriteLatencyMs: 0.1,
+                readThroughputMBps: 1.0,
+                writeThroughputMBps: 1.0,
+                lastVerifyResult: "Verified OK",
+                lastVerifyOk: true
+            )
+            assertTrue(brandNewNvme.dailyTerabytesWritten == 0.0, "dailyTerabytesWritten must be 0.0 for NVMe with 0 POH")
+            assertTrue(brandNewNvme.estimatedRemainingLifeFormatted == "Calibrating (< 24h POH)", "Brand new drive (<24h POH) must report Calibrating status, got \(brandNewNvme.estimatedRemainingLifeFormatted)")
+
+            // 40d. Subprocess Grandchild Termination Safety (SYS2-05)
+            VolumeVerifierService.terminateProcessAndChildren(pid: 0, signal: SIGTERM) // Must safely no-op for pid <= 0
+
+            print("  [OK] Canary sector-alignment, orphan self-healing, UI drive synchronization, brand-new drive metrics, and child termination verified")
+        }
+
         print("✅ All Swift Core Logic Unit Tests Passed!")
     }
 }

@@ -54,6 +54,12 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
     private var recentTemperatureSamples: [String: [(timestamp: TimeInterval, tempC: Int)]] = [:]
     private var defaultTelemetryProvider: any DiskTelemetryProvider = IOKitTelemetryProvider.shared
 
+    private let prettyJSONEncoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return encoder
+    }()
+
     private struct DriveThroughputSample {
         var bytesRead: UInt64 = 0
         var bytesWritten: UInt64 = 0
@@ -68,12 +74,34 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
     }
 
     func selectDashboardDrive(key: String) {
-        engineLock.lock()
-        selectedDashboardDriveKeyInternal = key
-        engineLock.unlock()
+        let applySelectionToLock = { [weak self] in
+            guard let self = self else { return }
+            self.engineLock.lock()
+            self.selectedDashboardDriveKeyInternal = key
+            let matchingSnap = self.latestMultiSnapshotInternal?.disks.first(where: { $0.driveKey == key })
+            if let matchingSnap = matchingSnap {
+                self.latestSnapshotInternal = matchingSnap
+            }
+            self.engineLock.unlock()
+            if let matchingSnap = matchingSnap {
+                if Thread.isMainThread {
+                    self.publishedSnapshot = matchingSnap
+                } else {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.publishedSnapshot = matchingSnap
+                    }
+                }
+            }
+        }
+
         if Thread.isMainThread {
             self.selectedDashboardDriveKey = key
+            if let matching = self.publishedMultiSnapshot?.disks.first(where: { $0.driveKey == key }) {
+                self.publishedSnapshot = matching
+            }
+            DispatchQueue.global(qos: .userInitiated).async(execute: applySelectionToLock)
         } else {
+            applySelectionToLock()
             DispatchQueue.main.async { [weak self] in
                 self?.selectedDashboardDriveKey = key
             }
@@ -155,9 +183,7 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         if !force, let last = lastSavedState, last == state, FileManager.default.fileExists(atPath: path) {
             return
         }
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? encoder.encode(state) {
+        if let data = try? prettyJSONEncoder.encode(state) {
             if AtomicFileWriter.writeRestricted(data: data, toPath: path, permissions: 0o600) {
                 lastSavedState = state
             }
@@ -620,10 +646,9 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         if cfg.monitorAllDisks {
             let all = provider.listAllDevices(maxCount: 32)
             var seenKeys = Set<String>()
-            let foundDevices = all.filter { $0.found }
-
             var enumeratedDevices: [DiskHardwareMetrics] = []
-            for dev in foundDevices {
+            enumeratedDevices.reserveCapacity(all.count)
+            for dev in all where dev.found {
                 let ser = cStringToSwift(dev.serialNumber)
                 let bsd = cStringToSwift(dev.bsdName)
                 let key = !ser.isEmpty ? ser : bsd
@@ -706,12 +731,21 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             snapshots.append(snap)
         }
 
-        let worstSeverity: HealthSeverity = snapshots.reduce(.healthy) { cur, snap in
-            snap.overallSeverity.rank > cur.rank ? snap.overallSeverity : cur
+        var worstSeverity: HealthSeverity = .healthy
+        var worstScore: Int = snapshots.isEmpty ? 100 : Int.max
+        var scoreSum: Int = 0
+        var totalIssues: Int = 0
+        for snap in snapshots {
+            if snap.overallSeverity.rank > worstSeverity.rank {
+                worstSeverity = snap.overallSeverity
+            }
+            if snap.healthScore < worstScore {
+                worstScore = snap.healthScore
+            }
+            scoreSum += snap.healthScore
+            totalIssues += snap.issues.count
         }
-        let worstScore = snapshots.map(\.healthScore).min() ?? 100
-        let avgScore = snapshots.isEmpty ? 100 : Int(snapshots.map(\.healthScore).reduce(0, +) / snapshots.count)
-        let totalIssues = snapshots.reduce(0) { $0 + $1.issues.count }
+        let avgScore = snapshots.isEmpty ? 100 : (scoreSum / snapshots.count)
 
         let multi = MultiDiskHealthSnapshot(
             timestamp: nowTs,
@@ -735,14 +769,12 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         self.latestSnapshotInternal = primary
 
         // Save latest_status.json (single disk writes primary for full backward compatibility, multi writes multi)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         if multi.disks.count > 1 {
-            if let jsonData = try? encoder.encode(multi) {
+            if let jsonData = try? prettyJSONEncoder.encode(multi) {
                 _ = AtomicFileWriter.writeRestricted(data: jsonData, toPath: ConfigManager.shared.latestJsonPath, permissions: 0o600)
             }
         } else {
-            if let jsonData = try? encoder.encode(primary) {
+            if let jsonData = try? prettyJSONEncoder.encode(primary) {
                 _ = AtomicFileWriter.writeRestricted(data: jsonData, toPath: ConfigManager.shared.latestJsonPath, permissions: 0o600)
             }
         }
@@ -893,20 +925,21 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
 
         // Daily Digest at 09:00 (Per-Drive Scoped)
         if state.dailySummaryEnabled {
-            let todayStr = dailyDigestDateFormatter.string(from: Date(timeIntervalSince1970: nowTs))
             let digestScopedKey = "\(driveKey):DAILY_DIGEST"
             let lastDigestTs = state.lastAlertTimestampByCode[digestScopedKey] ?? 0
-            let hour = Calendar.current.component(.hour, from: Date(timeIntervalSince1970: nowTs))
             if state.lastDailySummaryDate.isEmpty {
-                state.lastDailySummaryDate = todayStr
+                state.lastDailySummaryDate = dailyDigestDateFormatter.string(from: Date(timeIntervalSince1970: nowTs))
                 state.lastAlertTimestampByCode[digestScopedKey] = nowTs
-            } else if hour >= 9 && (nowTs - lastDigestTs) >= 20 * 3600 {
-                state.lastDailySummaryDate = todayStr
-                state.lastAlertTimestampByCode[digestScopedKey] = nowTs
-                let msg = TelegramNotifier.shared.formatReportHTML(snapshot: snapshot, title: "\(snapshot.productName) Daily Health Digest")
-                notificationGroup.enter()
-                TelegramNotifier.shared.sendMessageAsync(htmlText: msg, disableNotification: true) { [weak self] _ in
-                    self?.notificationGroup.leave()
+            } else if (nowTs - lastDigestTs) >= 20 * 3600 {
+                let nowDate = Date(timeIntervalSince1970: nowTs)
+                if Calendar.current.component(.hour, from: nowDate) >= 9 {
+                    state.lastDailySummaryDate = dailyDigestDateFormatter.string(from: nowDate)
+                    state.lastAlertTimestampByCode[digestScopedKey] = nowTs
+                    let msg = TelegramNotifier.shared.formatReportHTML(snapshot: snapshot, title: "\(snapshot.productName) Daily Health Digest")
+                    notificationGroup.enter()
+                    TelegramNotifier.shared.sendMessageAsync(htmlText: msg, disableNotification: true) { [weak self] _ in
+                        self?.notificationGroup.leave()
+                    }
                 }
             }
         }
@@ -1034,10 +1067,11 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
                     timeoutLock.lock()
                     timedOut = true
                     timeoutLock.unlock()
+                    VolumeVerifierService.terminateProcessAndChildren(pid: pid, signal: SIGTERM)
                     proc.terminate()
                     let escalation = DispatchWorkItem {
-                        if proc.isRunning && pid > 0 {
-                            kill(pid, SIGKILL)
+                        if pid > 0 {
+                            VolumeVerifierService.terminateProcessAndChildren(pid: pid, signal: SIGKILL)
                         }
                         try? readHandle.close()
                     }

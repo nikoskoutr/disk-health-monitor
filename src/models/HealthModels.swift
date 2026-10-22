@@ -285,13 +285,19 @@ func formatLinkSpeed(_ bps: UInt64, interconnect: String) -> String {
 func cStringToSwift<T>(_ tuple: T) -> String {
     var copy = tuple
     return withUnsafeBytes(of: &copy) { rawBuffer in
-        let slice: Slice<UnsafeRawBufferPointer>
-        if let nullIndex = rawBuffer.firstIndex(of: 0) {
-            slice = rawBuffer[..<nullIndex]
-        } else {
-            slice = rawBuffer[...]
+        let endIdx = rawBuffer.firstIndex(of: 0) ?? rawBuffer.endIndex
+        var start = rawBuffer.startIndex
+        var end = endIdx
+        while start < end {
+            let b = rawBuffer[start]
+            if b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D { start += 1 } else { break }
         }
-        return String(decoding: slice, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        while end > start {
+            let b = rawBuffer[end - 1]
+            if b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D { end -= 1 } else { break }
+        }
+        guard start < end else { return "" }
+        return String(decoding: rawBuffer[start..<end], as: UTF8.self)
     }
 }
 

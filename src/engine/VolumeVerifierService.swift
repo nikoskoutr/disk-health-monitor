@@ -46,6 +46,16 @@ final class VolumeVerifierService: @unchecked Sendable {
         return (false, false, "Failed (\(timeStr)): \(detail)")
     }
 
+    static func terminateProcessAndChildren(pid: pid_t, signal: Int32) {
+        guard pid > 0 else { return }
+        let pkill = Process()
+        pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        pkill.arguments = ["-\(signal)", "-P", "\(pid)"]
+        try? pkill.run()
+        pkill.waitUntilExit()
+        kill(pid, signal)
+    }
+
     func runVolumeVerification(
         target: String,
         timeoutSec: Double = 180.0,
@@ -77,11 +87,12 @@ final class VolumeVerifierService: @unchecked Sendable {
                         timedOut = true
                         timeoutLock.unlock()
                         let pid = proc.processIdentifier
+                        VolumeVerifierService.terminateProcessAndChildren(pid: pid, signal: SIGTERM)
                         proc.terminate()
                         // Escalate to SIGKILL after 2s if still alive
                         let escalation = DispatchWorkItem {
-                            if proc.isRunning && pid > 0 {
-                                kill(pid, SIGKILL)
+                            if pid > 0 {
+                                VolumeVerifierService.terminateProcessAndChildren(pid: pid, signal: SIGKILL)
                             }
                             try? readHandle.close()
                         }

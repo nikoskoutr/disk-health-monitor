@@ -282,7 +282,7 @@ struct StatisticsAndInsightsTab: View {
                                 }
                                 return monitor.selectedDashboardDriveKey
                             },
-                            set: { monitor.selectedDashboardDriveKey = $0 }
+                            set: { monitor.selectDashboardDrive(key: $0) }
                         )) {
                             ForEach(activeDisks) { d in
                                 Text(d.displayLabel).tag(d.driveKey)

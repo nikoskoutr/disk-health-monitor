@@ -14,7 +14,15 @@ struct SmartInspectorTab: View {
                         HStack {
                             Text("Inspect Drive:")
                                 .font(.system(size: 11, weight: .semibold))
-                            Picker("", selection: $monitor.selectedDashboardDriveKey) {
+                            Picker("", selection: Binding(
+                                get: {
+                                    if monitor.selectedDashboardDriveKey.isEmpty {
+                                        return multi.disks.first?.driveKey ?? ""
+                                    }
+                                    return monitor.selectedDashboardDriveKey
+                                },
+                                set: { monitor.selectDashboardDrive(key: $0) }
+                            )) {
                                 ForEach(multi.disks) { d in
                                     Text(d.displayLabel).tag(d.driveKey)
                                 }
