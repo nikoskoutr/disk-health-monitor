@@ -392,7 +392,10 @@ struct MultiDiskHealthSnapshot: Codable, Sendable, Equatable {
             if a.overallSeverity.rank != b.overallSeverity.rank {
                 return a.overallSeverity.rank < b.overallSeverity.rank
             }
-            return a.healthScore > b.healthScore
+            if a.healthScore != b.healthScore {
+                return a.healthScore > b.healthScore // Lower score is considered more degraded/worse
+            }
+            return a.driveKey < b.driveKey // Deterministic alphabetical tie-breaker
         }) ?? disks.first
     }
 }

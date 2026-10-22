@@ -4,6 +4,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
+#include <pthread.h>
 #include <sys/param.h>
 #include <sys/mount.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -13,6 +14,25 @@
 #include <IOKit/storage/IOBlockStorageDriver.h>
 #include <IOKit/storage/IOMedia.h>
 #include <IOKit/storage/nvme/NVMeSMARTLibExternal.h>
+
+typedef struct {
+    uint64_t entryId;
+    char productName[128];
+    char vendorName[128];
+    char productRevision[64];
+    char bsdName[64];
+    char serialNumber[128];
+    char interconnectType[64];
+    bool isInternal;
+    bool isRemovable;
+    uint64_t linkSpeedBps;
+} StaticDeviceCacheEntry;
+
+#define MAX_STATIC_CACHE_ENTRIES 32
+static StaticDeviceCacheEntry sStaticCache[MAX_STATIC_CACHE_ENTRIES];
+static int sStaticCacheCount = 0;
+static int sStaticCacheNextIdx = 0;
+static pthread_mutex_t sStaticCacheMutex = PTHREAD_MUTEX_INITIALIZER;
 
 static bool copyCFStringRefToBuffer(CFTypeRef strRef, char *buf, size_t bufLen) {
     if (!strRef || !buf || bufLen == 0) return false;
@@ -157,12 +177,14 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
         // Check if parent service name indicates bus type
         io_name_t className;
         if (IOObjectGetClass(parent, className) == KERN_SUCCESS) {
-            if (outMetrics->interconnectType[0] == '\0') {
-                if (strstr(className, "USB") != NULL) {
-                    strlcpy(outMetrics->interconnectType, "USB", sizeof(outMetrics->interconnectType));
-                } else if (strstr(className, "Thunderbolt") != NULL) {
-                    strlcpy(outMetrics->interconnectType, "Thunderbolt", sizeof(outMetrics->interconnectType));
-                } else if (strstr(className, "AHCI") != NULL || strstr(className, "SATA") != NULL) {
+            if (strstr(className, "USB") != NULL) {
+                strlcpy(outMetrics->interconnectType, "USB", sizeof(outMetrics->interconnectType));
+                outMetrics->isInternal = false;
+            } else if (strstr(className, "Thunderbolt") != NULL) {
+                strlcpy(outMetrics->interconnectType, "Thunderbolt", sizeof(outMetrics->interconnectType));
+                outMetrics->isInternal = false;
+            } else if (outMetrics->interconnectType[0] == '\0') {
+                if (strstr(className, "AHCI") != NULL || strstr(className, "SATA") != NULL) {
                     strlcpy(outMetrics->interconnectType, "SATA", sizeof(outMetrics->interconnectType));
                 } else if (strstr(className, "PCI") != NULL || strstr(className, "NVMe") != NULL) {
                     strlcpy(outMetrics->interconnectType, "PCI-Express", sizeof(outMetrics->interconnectType));
@@ -172,10 +194,6 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
 
         IOObjectRelease(current);
         current = parent;
-
-        if (outMetrics->linkSpeedBps > 0 && outMetrics->serialNumber[0] != '\0' && outMetrics->interconnectType[0] != '\0') {
-            break;
-        }
     }
     IOObjectRelease(current);
 }
@@ -266,84 +284,132 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
     memset(outMetrics, 0, sizeof(DiskHardwareMetrics));
     outMetrics->found = true;
 
-    // 1. Device Characteristics
-    CFTypeRef charsRef = IORegistryEntryCreateCFProperty(service, CFSTR("Device Characteristics"), kCFAllocatorDefault, 0);
-    if (charsRef) {
-        if (CFGetTypeID(charsRef) == CFDictionaryGetTypeID()) {
-            CFDictionaryRef chars = (CFDictionaryRef)charsRef;
-            getCFString(chars, CFSTR("Product Name"), outMetrics->productName, sizeof(outMetrics->productName));
-            getCFString(chars, CFSTR("Vendor Name"), outMetrics->vendorName, sizeof(outMetrics->vendorName));
-            getCFString(chars, CFSTR("Product Revision Level"), outMetrics->productRevision, sizeof(outMetrics->productRevision));
-            getCFString(chars, CFSTR("Serial Number"), outMetrics->serialNumber, sizeof(outMetrics->serialNumber));
-            strlcpy(outMetrics->usbSerialNumber, outMetrics->serialNumber, sizeof(outMetrics->usbSerialNumber));
+    uint64_t entryId = 0;
+    bool hasEntryId = (IORegistryEntryGetRegistryEntryID(service, &entryId) == KERN_SUCCESS && entryId != 0);
+    bool cacheHit = false;
 
-            char removableStr[32] = {0};
-            if (getCFString(chars, CFSTR("Removable Media"), removableStr, sizeof(removableStr))) {
-                if (strcasecmp(removableStr, "Yes") == 0 || strcasecmp(removableStr, "True") == 0) {
-                    outMetrics->isRemovable = true;
+    if (hasEntryId) {
+        pthread_mutex_lock(&sStaticCacheMutex);
+        for (int i = 0; i < sStaticCacheCount; i++) {
+            if (sStaticCache[i].entryId == entryId && sStaticCache[i].bsdName[0] != '\0') {
+                strlcpy(outMetrics->productName, sStaticCache[i].productName, sizeof(outMetrics->productName));
+                strlcpy(outMetrics->vendorName, sStaticCache[i].vendorName, sizeof(outMetrics->vendorName));
+                strlcpy(outMetrics->productRevision, sStaticCache[i].productRevision, sizeof(outMetrics->productRevision));
+                strlcpy(outMetrics->bsdName, sStaticCache[i].bsdName, sizeof(outMetrics->bsdName));
+                strlcpy(outMetrics->serialNumber, sStaticCache[i].serialNumber, sizeof(outMetrics->serialNumber));
+                strlcpy(outMetrics->usbSerialNumber, sStaticCache[i].serialNumber, sizeof(outMetrics->usbSerialNumber));
+                strlcpy(outMetrics->interconnectType, sStaticCache[i].interconnectType, sizeof(outMetrics->interconnectType));
+                outMetrics->isInternal = sStaticCache[i].isInternal;
+                outMetrics->isRemovable = sStaticCache[i].isRemovable;
+                outMetrics->linkSpeedBps = sStaticCache[i].linkSpeedBps;
+                outMetrics->usbLinkSpeedBps = sStaticCache[i].linkSpeedBps;
+                cacheHit = true;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&sStaticCacheMutex);
+    }
+
+    if (!cacheHit) {
+        // 1. Device Characteristics
+        CFTypeRef charsRef = IORegistryEntryCreateCFProperty(service, CFSTR("Device Characteristics"), kCFAllocatorDefault, 0);
+        if (charsRef) {
+            if (CFGetTypeID(charsRef) == CFDictionaryGetTypeID()) {
+                CFDictionaryRef chars = (CFDictionaryRef)charsRef;
+                getCFString(chars, CFSTR("Product Name"), outMetrics->productName, sizeof(outMetrics->productName));
+                getCFString(chars, CFSTR("Vendor Name"), outMetrics->vendorName, sizeof(outMetrics->vendorName));
+                getCFString(chars, CFSTR("Product Revision Level"), outMetrics->productRevision, sizeof(outMetrics->productRevision));
+                getCFString(chars, CFSTR("Serial Number"), outMetrics->serialNumber, sizeof(outMetrics->serialNumber));
+                strlcpy(outMetrics->usbSerialNumber, outMetrics->serialNumber, sizeof(outMetrics->usbSerialNumber));
+
+                char removableStr[32] = {0};
+                if (getCFString(chars, CFSTR("Removable Media"), removableStr, sizeof(removableStr))) {
+                    if (strcasecmp(removableStr, "Yes") == 0 || strcasecmp(removableStr, "True") == 0) {
+                        outMetrics->isRemovable = true;
+                    }
+                }
+            }
+            CFRelease(charsRef);
+        }
+
+        // 2. Protocol Characteristics
+        CFTypeRef protoRef = IORegistryEntryCreateCFProperty(service, CFSTR("Protocol Characteristics"), kCFAllocatorDefault, 0);
+        if (protoRef) {
+            if (CFGetTypeID(protoRef) == CFDictionaryGetTypeID()) {
+                CFDictionaryRef proto = (CFDictionaryRef)protoRef;
+                getCFString(proto, CFSTR("Physical Interconnect"), outMetrics->interconnectType, sizeof(outMetrics->interconnectType));
+                char location[64] = {0};
+                if (getCFString(proto, CFSTR("Physical Interconnect Location"), location, sizeof(location))) {
+                    if (strcasecmp(location, "Internal") == 0) {
+                        outMetrics->isInternal = true;
+                    } else if (strcasecmp(location, "External") == 0) {
+                        outMetrics->isInternal = false;
+                    }
+                }
+            }
+            CFRelease(protoRef);
+        }
+
+        // Class name check for internal NVMe / Apple fabric / VirtIO VM disks
+        io_name_t deviceClassName;
+        if (IOObjectGetClass(service, deviceClassName) == KERN_SUCCESS) {
+            if (strstr(deviceClassName, "AppleANS") != NULL ||
+                strstr(deviceClassName, "EmbeddedNVMe") != NULL ||
+                strstr(deviceClassName, "VirtIO") != NULL) {
+                outMetrics->isInternal = true;
+                if (outMetrics->interconnectType[0] == '\0') {
+                    strlcpy(outMetrics->interconnectType, "PCI-Express", sizeof(outMetrics->interconnectType));
                 }
             }
         }
-        CFRelease(charsRef);
-    }
 
-    // 2. Protocol Characteristics
-    CFTypeRef protoRef = IORegistryEntryCreateCFProperty(service, CFSTR("Protocol Characteristics"), kCFAllocatorDefault, 0);
-    if (protoRef) {
-        if (CFGetTypeID(protoRef) == CFDictionaryGetTypeID()) {
-            CFDictionaryRef proto = (CFDictionaryRef)protoRef;
-            getCFString(proto, CFSTR("Physical Interconnect"), outMetrics->interconnectType, sizeof(outMetrics->interconnectType));
-            char location[64] = {0};
-            if (getCFString(proto, CFSTR("Physical Interconnect Location"), location, sizeof(location))) {
-                if (strcasecmp(location, "Internal") == 0) {
-                    outMetrics->isInternal = true;
-                } else if (strcasecmp(location, "External") == 0) {
-                    outMetrics->isInternal = false;
-                }
-            }
-        }
-        CFRelease(protoRef);
+        // 3. Inspect parents for bus speed, serial number, and interconnect fallback
+        inspectParentsForBusProperties(service, outMetrics);
     }
-
-    // Class name check for internal NVMe / Apple fabric / VirtIO VM disks
-    io_name_t deviceClassName;
-    if (IOObjectGetClass(service, deviceClassName) == KERN_SUCCESS) {
-        if (strstr(deviceClassName, "AppleANS") != NULL ||
-            strstr(deviceClassName, "EmbeddedNVMe") != NULL ||
-            strstr(deviceClassName, "VirtIO") != NULL) {
-            outMetrics->isInternal = true;
-            if (outMetrics->interconnectType[0] == '\0') {
-                strlcpy(outMetrics->interconnectType, "PCI-Express", sizeof(outMetrics->interconnectType));
-            }
-        }
-    }
-
-    // 3. Inspect parents for bus speed, serial number, and interconnect fallback
-    inspectParentsForBusProperties(service, outMetrics);
 
     // 4. Inspect children for driver statistics and BSD Name
     inspectChildrenForDriverStats(service, outMetrics);
 
-    // If interconnectType is still unset, default based on known clues
-    if (outMetrics->interconnectType[0] == '\0') {
-        if (outMetrics->linkSpeedBps > 0) {
-            strlcpy(outMetrics->interconnectType, "USB", sizeof(outMetrics->interconnectType));
-        } else if (outMetrics->isInternal) {
-            strlcpy(outMetrics->interconnectType, "PCI-Express", sizeof(outMetrics->interconnectType));
-        } else {
-            strlcpy(outMetrics->interconnectType, "Storage", sizeof(outMetrics->interconnectType));
+    if (!cacheHit) {
+        // If interconnectType is still unset, default based on known clues
+        if (outMetrics->interconnectType[0] == '\0') {
+            if (outMetrics->linkSpeedBps > 0) {
+                strlcpy(outMetrics->interconnectType, "USB", sizeof(outMetrics->interconnectType));
+            } else if (outMetrics->isInternal) {
+                strlcpy(outMetrics->interconnectType, "PCI-Express", sizeof(outMetrics->interconnectType));
+            } else {
+                strlcpy(outMetrics->interconnectType, "Storage", sizeof(outMetrics->interconnectType));
+            }
         }
-    }
 
-    // Default isInternal if still unset
-    if (!outMetrics->isInternal) {
-        if (strcasecmp(outMetrics->interconnectType, "USB") == 0 ||
-            strcasecmp(outMetrics->interconnectType, "Thunderbolt") == 0 ||
-            outMetrics->isRemovable) {
-            outMetrics->isInternal = false;
-        } else if (strcasecmp(outMetrics->interconnectType, "Virtual Interface") == 0 ||
-                   strcmp(outMetrics->bsdName, "disk0") == 0) {
-            outMetrics->isInternal = true;
+        // Default isInternal if still unset
+        if (!outMetrics->isInternal) {
+            if (strcasecmp(outMetrics->interconnectType, "USB") == 0 ||
+                strcasecmp(outMetrics->interconnectType, "Thunderbolt") == 0 ||
+                outMetrics->isRemovable) {
+                outMetrics->isInternal = false;
+            } else if (strcasecmp(outMetrics->interconnectType, "Virtual Interface") == 0 ||
+                       strcmp(outMetrics->bsdName, "disk0") == 0) {
+                outMetrics->isInternal = true;
+            }
+        }
+
+        if (hasEntryId && outMetrics->bsdName[0] != '\0') {
+            pthread_mutex_lock(&sStaticCacheMutex);
+            StaticDeviceCacheEntry *slot = &sStaticCache[sStaticCacheNextIdx];
+            slot->entryId = entryId;
+            strlcpy(slot->productName, outMetrics->productName, sizeof(slot->productName));
+            strlcpy(slot->vendorName, outMetrics->vendorName, sizeof(slot->vendorName));
+            strlcpy(slot->productRevision, outMetrics->productRevision, sizeof(slot->productRevision));
+            strlcpy(slot->bsdName, outMetrics->bsdName, sizeof(slot->bsdName));
+            strlcpy(slot->serialNumber, outMetrics->serialNumber, sizeof(slot->serialNumber));
+            strlcpy(slot->interconnectType, outMetrics->interconnectType, sizeof(slot->interconnectType));
+            slot->isInternal = outMetrics->isInternal;
+            slot->isRemovable = outMetrics->isRemovable;
+            slot->linkSpeedBps = outMetrics->linkSpeedBps;
+            sStaticCacheNextIdx = (sStaticCacheNextIdx + 1) % MAX_STATIC_CACHE_ENTRIES;
+            if (sStaticCacheCount < MAX_STATIC_CACHE_ENTRIES) sStaticCacheCount++;
+            pthread_mutex_unlock(&sStaticCacheMutex);
         }
     }
 
@@ -639,6 +705,25 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
         // 1. Exact partition slice or snapshot name match takes absolute priority (score 10)
         bool isExactSliceMatch = (strcmp(cleanFrom, cleanTargetBsd) == 0);
         bool isSameDevice = false;
+        const char *mountPath = fsList[i].f_mntonname;
+
+        int candidateScore = 1;
+        if (isExactSliceMatch) {
+            candidateScore = 10;
+        } else if (strcmp(mountPath, "/") == 0) {
+            candidateScore = 4; // Root filesystem is highest priority
+        } else if (strncmp(mountPath, "/Volumes/", 9) == 0 && strcmp(mountPath, "/Volumes/Recovery") != 0) {
+            candidateScore = 3; // External user volume
+        } else if (strcmp(mountPath, "/System/Volumes/Data") == 0) {
+            candidateScore = 2; // Data volume
+        } else if (strncmp(mountPath, "/System/Volumes/", 16) == 0 || strcmp(mountPath, "/Volumes/Recovery") == 0) {
+            candidateScore = 0; // Hidden internal / recovery volumes
+        }
+
+        // Skip expensive IOKit parent traversal if this mount cannot beat our current bestScore
+        if (candidateScore <= bestScore) {
+            continue;
+        }
 
         if (isExactSliceMatch) {
             isSameDevice = true;
@@ -651,32 +736,11 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
         }
 
         if (isExactSliceMatch || isSameDevice) {
-                const char *mountPath = fsList[i].f_mntonname;
-                // Prioritize mounts:
-                // Exact slice match = 10 (target was a partition slice like disk3s5 or disk7s1)
-                // / = 4 (system root)
-                // /Volumes/* = 3 (external disk volume)
-                // /System/Volumes/Data = 2
-                // Other mounts = 1
-                // Hidden /System/Volumes/* or /Volumes/Recovery = 0
-                int score = 1;
-                if (isExactSliceMatch) {
-                    score = 10;
-                } else if (strcmp(mountPath, "/") == 0) {
-                    score = 4; // Root filesystem is highest priority
-                } else if (strncmp(mountPath, "/Volumes/", 9) == 0 && strcmp(mountPath, "/Volumes/Recovery") != 0) {
-                    score = 3; // External user volume
-                } else if (strcmp(mountPath, "/System/Volumes/Data") == 0) {
-                    score = 2; // Data volume
-                } else if (strncmp(mountPath, "/System/Volumes/", 16) == 0 || strcmp(mountPath, "/Volumes/Recovery") == 0) {
-                    score = 0; // Hidden internal / recovery volumes
-                }
-
-            if (score > bestScore) {
-                bestScore = score;
+            if (candidateScore > bestScore) {
+                bestScore = candidateScore;
                 strlcpy(outMountPoint, mountPath, maxLen);
                 found = true;
-                if (score == 10) {
+                if (candidateScore == 10) {
                     break;
                 }
             }

@@ -197,7 +197,8 @@ struct UsbLinkSpeedRule: HealthRule {
         let cfg = context.config
         let hw = context.hardware
 
-        if hw.found && cfg.minExpectedUsbSpeedBps > 0 && hw.linkSpeedBps > 0 && hw.linkSpeedBps < cfg.minExpectedUsbSpeedBps {
+        let isUsbOrThunderbolt = context.interconnect.lowercased().contains("usb") || context.interconnect.lowercased().contains("thunderbolt")
+        if hw.found && isUsbOrThunderbolt && cfg.minExpectedUsbSpeedBps > 0 && hw.linkSpeedBps > 0 && hw.linkSpeedBps < cfg.minExpectedUsbSpeedBps {
             outcome.issues.append(HealthIssue(
                 code: "USB_LINK_DEGRADED",
                 severity: .warning,

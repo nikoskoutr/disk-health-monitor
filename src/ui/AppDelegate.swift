@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var mountDebounceWorkItem: DispatchWorkItem?
     private var wakeWorkItem: DispatchWorkItem?
     private var configRefreshWorkItem: DispatchWorkItem?
+    private var isRefreshingHealth: Bool = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -294,8 +295,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let item = NSMenuItem(title: "  📂 \(m.displayName)", action: #selector(selectDiskTarget(_:)), keyEquivalent: "")
                 item.target = self
                 item.representedObject = m.path
-                if cfg.targetVolumePath == m.path ||
-                   (cfg.targetVolumePath == nil && cfg.targetDeviceQuery == nil && currentMount == m.path) {
+                if !cfg.monitorAllDisks && (cfg.targetVolumePath == m.path ||
+                   (cfg.targetVolumePath == nil && cfg.targetDeviceQuery == nil && currentMount == m.path)) {
                     item.state = .on
                 }
                 selectDiskMenu.addItem(item)
@@ -359,6 +360,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         dailyDigestItem.state = DiskHealthMonitor.shared.dailySummaryEnabled ? .on : .off
+        updateDiskCache()
         populateSelectDiskMenu()
         refreshHealth(forceCanary: false)
         if let hostingView = menu.items.first?.view {
@@ -433,17 +435,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refreshHealth(forceCanary: Bool) {
+        cacheLock.lock()
+        if isRefreshingHealth && !forceCanary {
+            cacheLock.unlock()
+            return
+        }
+        isRefreshingHealth = true
+        cacheLock.unlock()
+
         DispatchQueue.global(qos: .utility).async {
-            self.updateDiskCache()
+            defer {
+                self.cacheLock.lock()
+                self.isRefreshingHealth = false
+                self.cacheLock.unlock()
+            }
             let multi = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: forceCanary, allowNotifications: true)
             DispatchQueue.main.async {
                 self.updateStatusBarButton(with: multi)
-                self.populateSelectDiskMenu()
-                if let hostingView = self.statusItem.menu?.items.first?.view {
-                    hostingView.invalidateIntrinsicContentSize()
-                    let fitting = hostingView.fittingSize
-                    hostingView.frame = NSRect(x: 0, y: 0, width: 385, height: max(310, fitting.height))
-                }
             }
         }
     }
@@ -470,8 +478,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         if multi.disks.count > 1 {
-            let maxTemp = multi.disks.map(\.temperatureCelsius).max() ?? 0
-            let tempStr = maxTemp > 0 ? " \(maxTemp)°C" : ""
+            let smartDisks = multi.disks.filter(\.smartValid)
+            let maxTemp = smartDisks.map(\.temperatureCelsius).max()
+            let tempStr = (maxTemp != nil && maxTemp! > 0) ? " \(maxTemp!)°C" : ""
             if multi.overallSeverity == .critical {
                 button.title = " \(multi.disks.count) Disks 🚨\(tempStr)"
             } else if multi.overallSeverity == .warning {

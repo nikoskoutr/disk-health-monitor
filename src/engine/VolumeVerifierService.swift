@@ -83,6 +83,7 @@ final class VolumeVerifierService: @unchecked Sendable {
                             if proc.isRunning && pid > 0 {
                                 kill(pid, SIGKILL)
                             }
+                            try? readHandle.close()
                         }
                         timeoutLock.lock()
                         killWorkItem = escalation

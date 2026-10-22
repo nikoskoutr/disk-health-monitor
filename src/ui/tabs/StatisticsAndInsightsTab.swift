@@ -53,7 +53,8 @@ struct StatisticsAndInsightsTab: View {
             let worstScore = currentMulti?.worstHealthScore ?? (disks.first?.healthScore ?? 100)
             let avgScore = currentMulti?.averageHealthScore ?? (disks.first?.healthScore ?? 100)
             let totalTBW = disks.reduce(0.0) { $0 + $1.totalTerabytesWritten }
-            let maxTemp = disks.map(\.temperatureCelsius).max() ?? 0
+            let smartDisks = disks.filter(\.smartValid)
+            let maxTemp = smartDisks.map(\.temperatureCelsius).max()
 
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .center) {
@@ -96,8 +97,8 @@ struct StatisticsAndInsightsTab: View {
                     )
                     insightStatPill(
                         title: "PEAK FLEET TEMP",
-                        value: "\(maxTemp) °C",
-                        color: maxTemp >= configMgr.config.tempCriticalCelsius ? .red : (maxTemp >= configMgr.config.tempWarningCelsius ? .orange : .teal)
+                        value: maxTemp != nil ? "\(maxTemp!) °C" : "N/A",
+                        color: (maxTemp ?? 0) >= configMgr.config.tempCriticalCelsius ? .red : ((maxTemp ?? 0) >= configMgr.config.tempWarningCelsius ? .orange : .teal)
                     )
                 }
             }

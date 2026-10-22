@@ -275,6 +275,9 @@ final class SurfaceScannerService: @unchecked Sendable {
                 let n = read(fd, buffer, toRead)
                 if n < 0 {
                     let err = errno
+                    if err == EINTR {
+                        continue
+                    }
                     if err == EIO || err == ENXIO || err == ETIMEDOUT {
                         readErrors += 1
                     }

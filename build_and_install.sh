@@ -49,7 +49,7 @@ if [[ "${1:-}" == "--package" ]] || [[ "${1:-}" == "--universal" ]]; then
     echo "🌐 Building Universal Binary (arm64 + x86_64)..."
     ARCH_FLAGS+=(-arch arm64 -arch x86_64)
 fi
-clang -O2 -Wall -Wextra "${ARCH_FLAGS[@]}" -c "${SCRIPT_DIR}/src/bridge/DiskHealthBridge.c" -o "${BUILD_CACHE_DIR}/DiskHealthBridge.o"
+clang -O2 -ffunction-sections -fdata-sections -Wall -Wextra "${ARCH_FLAGS[@]}" -c "${SCRIPT_DIR}/src/bridge/DiskHealthBridge.c" -o "${BUILD_CACHE_DIR}/DiskHealthBridge.o"
 
 # 2. Compile App Icon if needed
 if [[ ! -f "${SCRIPT_DIR}/assets/AppIcon.icns" ]] || [[ "${1:-}" == "--regenerate-icon" ]]; then
@@ -90,7 +90,7 @@ done < <(find "${SCRIPT_DIR}/src" -name "*.swift" -print0 | sort -z)
 
 # 4. Compile Swift App + Link with C Bridge and macOS Frameworks
 if [[ "${1:-}" == "--package" ]] || [[ "${1:-}" == "--universal" ]]; then
-    swiftc -O -target arm64-apple-macos13.0 \
+    swiftc -O -whole-module-optimization -Xlinker -dead_strip -target arm64-apple-macos13.0 \
         -module-cache-path "${BUILD_CACHE_DIR}/ModuleCache-arm64" \
         -import-objc-header "${SCRIPT_DIR}/src/bridge/DiskHealthBridge.h" \
         "${SWIFT_SOURCES[@]}" \
@@ -98,7 +98,7 @@ if [[ "${1:-}" == "--package" ]] || [[ "${1:-}" == "--universal" ]]; then
         -framework Cocoa -framework SwiftUI -framework IOKit -framework CoreFoundation -framework UserNotifications -framework Security \
         -o "${BUILD_CACHE_DIR}/${APP_NAME}-arm64"
 
-    swiftc -O -target x86_64-apple-macos13.0 \
+    swiftc -O -whole-module-optimization -Xlinker -dead_strip -target x86_64-apple-macos13.0 \
         -module-cache-path "${BUILD_CACHE_DIR}/ModuleCache-x86_64" \
         -import-objc-header "${SCRIPT_DIR}/src/bridge/DiskHealthBridge.h" \
         "${SWIFT_SOURCES[@]}" \
@@ -111,7 +111,7 @@ if [[ "${1:-}" == "--package" ]] || [[ "${1:-}" == "--universal" ]]; then
         rm -f "${BUILD_CACHE_DIR}/${APP_NAME}-arm64" "${BUILD_CACHE_DIR}/${APP_NAME}-x86_64"
     fi
 else
-    swiftc -O \
+    swiftc -O -whole-module-optimization -Xlinker -dead_strip \
         -module-cache-path "${BUILD_CACHE_DIR}/ModuleCache" \
         -import-objc-header "${SCRIPT_DIR}/src/bridge/DiskHealthBridge.h" \
         "${SWIFT_SOURCES[@]}" \
@@ -145,9 +145,9 @@ cat << EOF > "${CONTENTS_DIR}/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.3.0</string>
+    <string>2.4.0</string>
     <key>CFBundleVersion</key>
-    <string>6</string>
+    <string>7</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>NSPrincipalClass</key>

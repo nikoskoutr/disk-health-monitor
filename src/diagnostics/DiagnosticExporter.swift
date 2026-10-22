@@ -5,6 +5,33 @@ import Foundation
 final class DiagnosticExporter: @unchecked Sendable {
     static let shared = DiagnosticExporter()
 
+    private static func readLastLogLines(path: String, maxLines: Int = 100, maxTailBytes: Int = 65_536) -> [String] {
+        let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { return [] }
+        defer { close(fd) }
+
+        let fileSize = lseek(fd, 0, SEEK_END)
+        guard fileSize > 0 else { return [] }
+
+        let readSize = Int(min(off_t(maxTailBytes), fileSize))
+        let offset = fileSize - off_t(readSize)
+        var buffer = [UInt8](repeating: 0, count: readSize)
+        let bytesRead = pread(fd, &buffer, readSize, offset)
+        guard bytesRead > 0 else { return [] }
+
+        let tailStr = String(decoding: buffer.prefix(bytesRead), as: UTF8.self)
+        var lines = tailStr.components(separatedBy: .newlines).filter { !$0.isEmpty }
+        if offset > 0 && lines.count > maxLines {
+            lines.removeFirst() // Drop potentially truncated leading line
+        }
+        let suffixLines = lines.suffix(maxLines).joined(separator: "\n")
+        let token = ConfigManager.shared.resolvedTelegramBotToken
+        let webhook = ConfigManager.shared.resolvedWebhookUrl
+        let sanitizedToken = TelegramNotifier.redactToken(suffixLines, token: token)
+        let sanitized = WebhookNotifier.redactWebhookUrl(sanitizedToken, webhookUrl: webhook)
+        return sanitized.components(separatedBy: .newlines).filter { !$0.isEmpty }
+    }
+
     func generateDiagnosticReport(snapshot: DiskHealthSnapshot? = nil) -> [String: Any] {
         let snap = snapshot ?? DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: false)
         let cfg = ConfigManager.shared.currentConfig
@@ -34,15 +61,7 @@ final class DiagnosticExporter: @unchecked Sendable {
         }
 
         // Capture up to the last 100 lines of health.log
-        var recentLogLines: [String] = []
-        if let logContent = try? String(contentsOfFile: ConfigManager.shared.logFilePath, encoding: .utf8) {
-            let token = ConfigManager.shared.resolvedTelegramBotToken
-            let webhook = ConfigManager.shared.resolvedWebhookUrl
-            let sanitizedToken = TelegramNotifier.redactToken(logContent, token: token)
-            let sanitized = WebhookNotifier.redactWebhookUrl(sanitizedToken, webhookUrl: webhook)
-            let allLines = sanitized.components(separatedBy: .newlines).filter { !$0.isEmpty }
-            recentLogLines = Array(allLines.suffix(100))
-        }
+        let recentLogLines = DiagnosticExporter.readLastLogLines(path: ConfigManager.shared.logFilePath, maxLines: 100)
 
         let report: [String: Any] = [
             "reportVersion": kAppVersion,

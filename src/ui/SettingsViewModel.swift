@@ -164,20 +164,26 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
+    private let debounceLock = NSLock()
     private var tokenSaveWorkItem: DispatchWorkItem?
 
     func updateBotToken(_ newValue: String) {
         self.botToken = newValue
+        debounceLock.lock()
         tokenSaveWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             self?.commitBotTokenNow(newValue)
         }
         tokenSaveWorkItem = work
+        debounceLock.unlock()
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3, execute: work)
     }
 
     func commitBotTokenNow(_ val: String) {
+        debounceLock.lock()
         tokenSaveWorkItem?.cancel()
+        tokenSaveWorkItem = nil
+        debounceLock.unlock()
         if val.isEmpty {
             _ = SecretStore.shared.deleteSecret(forKey: "telegramBotToken", allowInteractiveKeychain: false)
             ConfigManager.shared.updateConfig { $0.telegramBotToken = "" }
@@ -191,16 +197,21 @@ final class SettingsViewModel: ObservableObject {
 
     func updateWebhookUrl(_ newValue: String) {
         self.webhookUrl = newValue
+        debounceLock.lock()
         webhookSaveWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             self?.commitWebhookUrlNow(newValue)
         }
         webhookSaveWorkItem = work
+        debounceLock.unlock()
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3, execute: work)
     }
 
     func commitWebhookUrlNow(_ val: String) {
+        debounceLock.lock()
         webhookSaveWorkItem?.cancel()
+        webhookSaveWorkItem = nil
+        debounceLock.unlock()
         let trimmed = val.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
             _ = SecretStore.shared.deleteSecret(forKey: "webhookUrl", allowInteractiveKeychain: false)

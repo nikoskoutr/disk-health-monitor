@@ -73,8 +73,8 @@ final class CanaryProbeService: @unchecked Sendable {
         }
 
         let start = DispatchTime.now()
-        // Use O_NOFOLLOW to prevent symlink truncation attacks and O_CLOEXEC to prevent fd inheritance
-        let fd = open(canaryPath, O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        // Use O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC for in-place verification without directory B-tree churn
+        let fd = open(canaryPath, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
         if fd < 0 {
             let errCode = errno
             if errCode == EPERM || errCode == EACCES || errCode == EROFS {
@@ -101,9 +101,11 @@ final class CanaryProbeService: @unchecked Sendable {
             return CanaryProbeResult(ok: false, latencyMs: 0, error: "open write failed: \(errStr)")
         }
 
+        _ = fcntl(fd, F_NOCACHE, 1)
+
         let written = data.withUnsafeBytes { ptr -> Int in
             guard let base = ptr.baseAddress else { return -1 }
-            return write(fd, base, data.count)
+            return pwrite(fd, base, data.count, 0)
         }
         if written != data.count {
             let errStr = String(cString: strerror(errno))
@@ -118,14 +120,19 @@ final class CanaryProbeService: @unchecked Sendable {
             unlink(canaryPath)
             return CanaryProbeResult(ok: false, latencyMs: 0, error: "fsync failed: \(errStr)")
         }
+
+        var readBuf = [UInt8](repeating: 0, count: data.count)
+        let bytesRead = readBuf.withUnsafeMutableBytes { ptr -> Int in
+            guard let base = ptr.baseAddress else { return -1 }
+            return pread(fd, base, data.count, 0)
+        }
         close(fd)
 
-        guard let readBack = try? String(contentsOfFile: canaryPath, encoding: .utf8), readBack == token else {
+        guard bytesRead == data.count, readBuf.elementsEqual(data) else {
             unlink(canaryPath)
             return CanaryProbeResult(ok: false, latencyMs: 0, error: "readback verification mismatch")
         }
 
-        unlink(canaryPath)
         let elapsedNs = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
         let elapsedMs = Double(elapsedNs) / 1_000_000.0
         return CanaryProbeResult(ok: true, latencyMs: elapsedMs, error: "")

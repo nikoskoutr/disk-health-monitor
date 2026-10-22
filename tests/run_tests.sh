@@ -38,7 +38,7 @@ while IFS= read -r -d '' file; do
     fi
 done < <(find "${ROOT_DIR}/src" -name "*.swift" -print0 | sort -z)
 
-swiftc -O \
+swiftc -O -whole-module-optimization -Xlinker -dead_strip \
     -module-cache-path "${BUILD_CACHE}/ModuleCache" \
     -import-objc-header "${ROOT_DIR}/src/bridge/DiskHealthBridge.h" \
     "${TEST_SWIFT_SOURCES[@]}" \
@@ -56,6 +56,10 @@ rm -f "${BUILD_CACHE}/DiskHealthBridge_test.o"
 
 # 3. Test CLI binary commands
 echo "--- [3/5] Testing CLI Binary Options ---"
+if [[ ! -x "${ROOT_DIR}/disk-health" ]]; then
+    echo "  [INFO] Building disk-health binary for CLI integration tests..."
+    "${ROOT_DIR}/build_and_install.sh" > /dev/null
+fi
 "${ROOT_DIR}/disk-health" --help > /dev/null
 echo "  [OK] disk-health --help"
 

@@ -21,7 +21,7 @@ struct DashboardMenuView: View {
                                 let isSelected = (disk.driveKey == monitor.selectedDashboardDriveKey) ||
                                                  (monitor.selectedDashboardDriveKey.isEmpty && disk.driveKey == multi.primarySnapshot?.driveKey)
                                 Button(action: {
-                                    monitor.selectedDashboardDriveKey = disk.driveKey
+                                    monitor.selectDashboardDrive(key: disk.driveKey)
                                 }) {
                                     HStack(spacing: 5) {
                                         Circle()

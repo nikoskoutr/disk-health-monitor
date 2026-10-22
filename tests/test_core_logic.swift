@@ -2290,6 +2290,191 @@ struct CoreLogicTestRunner {
             print("  [OK] Multi-disk configuration, simultaneous fleet evaluation, canary isolation, and dynamic ejection verified")
         }
 
+        // =========================================================================
+        // Unit Test 39: Argon Hardening Verification (UAT Edge Cases, Concurrency & Optimizations)
+        // =========================================================================
+        print("=== Swift Unit Test 39: Argon Hardening Verification (Subpath Isolation, Tie-Breaker & Reverse Log Tailer) ===")
+        do {
+            let monitor = DiskHealthMonitor.shared
+
+            // 39a. Multi-Disk Subpaths Scoping (UAT-02): Subpaths must not bleed onto unrelated fleet disks
+            let mockHardening = MockTelemetryProvider()
+            let internalDev = makeMockDiskHardwareMetrics(
+                found: true,
+                bsdName: "disk0",
+                serialNumber: "APPLE_INTERNAL_NVME",
+                vendorName: "Apple",
+                productName: "APPLE SSD AP0256Z",
+                isInternal: true,
+                smartValid: true
+            )
+            let externalDev = makeMockDiskHardwareMetrics(
+                found: true,
+                bsdName: "disk5",
+                serialNumber: "SAMSUNG_T7_DATA",
+                vendorName: "Samsung",
+                productName: "Samsung PSSD T7",
+                isInternal: false,
+                smartValid: true
+            )
+            mockHardening.allDevices = [internalDev, externalDev]
+            mockHardening.hardwareMetricsByQuery["disk0"] = internalDev
+            mockHardening.hardwareMetricsByQuery["disk5"] = externalDev
+            mockHardening.mountPointByBsd["disk0"] = "/"
+            mockHardening.mountPointByBsd["disk5"] = "/Volumes/BackupTarget"
+
+            var fsRoot = FilesystemMountMetrics()
+            fsRoot.isMounted = true
+            fsRoot.mountPoint = "/"
+            fsRoot.totalBytes = 250_000_000_000
+            fsRoot.freeBytes = 150_000_000_000
+
+            var fsExt = FilesystemMountMetrics()
+            fsExt.isMounted = true
+            fsExt.mountPoint = "/Volumes/BackupTarget"
+            fsExt.totalBytes = 1_000_000_000_000
+            fsExt.freeBytes = 800_000_000_000
+
+            mockHardening.filesystemMetricsByMount["/"] = fsRoot
+            mockHardening.filesystemMetricsByMount["/Volumes/BackupTarget"] = fsExt
+            mockHardening.canaryResultOverride = CanaryProbeResult(ok: true, latencyMs: 1.0, error: "")
+
+            ConfigManager.shared.updateConfig {
+                $0.monitorAllDisks = true
+                $0.targetVolumePath = "/Volumes/BackupTarget"
+                $0.requiredSubpaths = ["DedicatedBackups"]
+            }
+
+            let fleetSnap = monitor.evaluateAllMonitoredDisks(forceCanary: false, allowNotifications: false, telemetryProvider: mockHardening)
+            let rootSnap = fleetSnap.disks.first(where: { $0.bsdName == "disk0" })
+            let rootHasSubpathIssue = rootSnap?.issues.contains(where: { $0.code == "REQUIRED_PATH_MISSING" }) ?? false
+            assertTrue(!rootHasSubpathIssue, "Root volume '/' must NOT be evaluated for external volume's requiredSubpaths")
+
+            // 39b. Primary Snapshot Tie-Breaker (UAT-03): Lower score wins tie on identical severity
+            func makeArgonTestSnapshot(score: Int, key: String) -> DiskHealthSnapshot {
+                return DiskHealthSnapshot(
+                    timestamp: 1000,
+                    formattedTime: "2026-10-22 10:00:00",
+                    formattedShortTime: "10:00",
+                    overallSeverity: .warning,
+                    healthScore: score,
+                    issues: [HealthIssue(code: "TEST_WARN", severity: .warning, title: "Test Warning", detail: "Detail")],
+                    hardwareFound: true,
+                    vendorName: "Vendor",
+                    productName: "Product",
+                    productRevision: "1.0",
+                    bsdName: "disk1",
+                    serialNumber: key,
+                    usbSerialNumber: key,
+                    interconnectType: "USB",
+                    protocolType: "NVMe",
+                    isInternal: false,
+                    isRemovable: true,
+                    linkSpeedBps: 5_000_000_000,
+                    linkSpeedFormatted: "5 Gbps",
+                    isMounted: true,
+                    mountPoint: "/Volumes/\(key)",
+                    filesystemType: "apfs",
+                    isReadOnly: false,
+                    totalBytes: 500_000_000_000,
+                    freeBytes: 100_000_000_000,
+                    purgeableBytes: 0,
+                    usedBytes: 400_000_000_000,
+                    usedPercent: 80.0,
+                    subpathsStatus: [:],
+                    canaryOk: true,
+                    canaryLatencyMs: 1.0,
+                    canaryError: "",
+                    smartValid: true,
+                    criticalWarning: 0,
+                    temperatureCelsius: 35,
+                    temperatureKelvin: 308,
+                    peakTemperatureCelsius: 35,
+                    availableSpare: 100,
+                    availableSpareThreshold: 10,
+                    percentageUsed: 5,
+                    lifeRemainingPercent: 95,
+                    dataUnitsRead: 100,
+                    dataUnitsWritten: 100,
+                    totalTerabytesRead: 0.05,
+                    totalTerabytesWritten: 0.05,
+                    hostReadCommands: 1000,
+                    hostWriteCommands: 1000,
+                    controllerBusyTime: 10,
+                    powerCycles: 10,
+                    powerOnHours: 100,
+                    unsafeShutdowns: 1,
+                    mediaErrors: 0,
+                    errorInfoLogEntries: 0,
+                    statsValid: true,
+                    sessionBytesRead: 1000,
+                    sessionBytesWritten: 1000,
+                    operationsRead: 10,
+                    operationsWritten: 10,
+                    errorsRead: 0,
+                    errorsWritten: 0,
+                    retriesRead: 0,
+                    retriesWritten: 0,
+                    avgReadLatencyMs: 0.5,
+                    avgWriteLatencyMs: 0.5,
+                    readThroughputMBps: 10.0,
+                    writeThroughputMBps: 10.0,
+                    lastVerifyResult: "Verified OK",
+                    lastVerifyOk: true
+                )
+            }
+
+            let mockSnapA = makeArgonTestSnapshot(score: 85, key: "SN_A")
+            let mockSnapB = makeArgonTestSnapshot(score: 60, key: "SN_B")
+
+            let multiTest = MultiDiskHealthSnapshot(
+                timestamp: 1000,
+                formattedTime: "2026-10-22 10:00:00",
+                formattedShortTime: "10:00",
+                overallSeverity: .warning,
+                worstHealthScore: 60,
+                averageHealthScore: 72,
+                totalIssuesCount: 0,
+                disks: [mockSnapA, mockSnapB]
+            )
+            assertTrue(multiTest.primarySnapshot?.driveKey == "SN_B", "primarySnapshot must select DiskB (score 60) over DiskA (score 85) on tie")
+
+            // 39c. Thread-Safe Drive Selection (SYS-01)
+            let dispatchGroup = DispatchGroup()
+            for i in 0..<10 {
+                dispatchGroup.enter()
+                DispatchQueue.global(qos: .utility).async {
+                    monitor.selectDashboardDrive(key: "KEY_\(i)")
+                    dispatchGroup.leave()
+                }
+            }
+            _ = dispatchGroup.wait(timeout: .now() + 2.0)
+            assertTrue(!monitor.selectedDashboardDriveKey.isEmpty, "selectedDashboardDriveKey must be updated safely")
+
+            // 39d. In-Place Canary Probe (OPT-04)
+            let canaryProbePass = CanaryProbeService.shared.runCanaryCheck(targetMount: NSTemporaryDirectory(), force: true)
+            assertTrue(canaryProbePass.ok, "In-place canary probe on temporary directory must succeed")
+
+            // 39e. Bounded Reverse-Seek Log Tailer (OPT-05)
+            let testLogPath = ConfigManager.shared.logFilePath
+            var testLines: [String] = []
+            for i in 1...250 {
+                testLines.append("2026-10-22T10:00:\(String(format: "%02d", i % 60))Z [INFO] Line \(i) payload data")
+            }
+            let fullLogData = testLines.joined(separator: "\n").data(using: .utf8)!
+            _ = AtomicFileWriter.writeRestricted(data: fullLogData, toPath: testLogPath, permissions: 0o600)
+
+            let diagReport = DiagnosticExporter.shared.generateDiagnosticReport(snapshot: mockSnapA)
+            if let recent = diagReport["recentLogLines"] as? [String] {
+                assertTrue(recent.count == 100, "Diagnostic exporter must capture exactly last 100 lines, got \(recent.count)")
+                assertTrue(recent.last?.contains("Line 250") == true, "Last line must be Line 250")
+            } else {
+                assertTrue(false, "recentLogLines must be an array of strings in diagnostic report")
+            }
+
+            print("  [OK] Subpath isolation, tie-breaker selection, concurrent drive selection, and reverse log tailer verified")
+        }
+
         print("✅ All Swift Core Logic Unit Tests Passed!")
     }
 }

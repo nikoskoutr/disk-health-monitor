@@ -237,7 +237,8 @@ func parseCommandLine() {
     if args.contains("--json") {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if args.contains("--all") || ConfigManager.shared.currentConfig.monitorAllDisks {
+        let isMultiJson = args.contains("--all") || ConfigManager.shared.currentConfig.monitorAllDisks || ConfigManager.shared.currentConfig.monitoredTargets.count > 1
+        if isMultiJson {
             let multi = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: true, allowNotifications: false)
             if let data = try? encoder.encode(multi), let str = String(data: data, encoding: .utf8) {
                 print(str)
@@ -252,7 +253,7 @@ func parseCommandLine() {
         }
     }
 
-    let isCheckMode = args.contains("--cli") || args.contains("--status") || args.contains("--check") || args.contains("--watch-mounts") || args.contains("--deep")
+    let isCheckMode = args.contains("--cli") || args.contains("--status") || args.contains("--check") || args.contains("--watch-mounts") || args.contains("--deep") || args.contains("--all")
     if isCheckMode {
         let notify = args.contains("--notify") || args.contains("--notify-if-unhealthy") || args.contains("--check") || args.contains("--watch-mounts")
         if args.contains("--deep") {
@@ -263,7 +264,7 @@ func parseCommandLine() {
             sem.wait()
         }
 
-        let isMulti = ConfigManager.shared.currentConfig.monitorAllDisks || ConfigManager.shared.currentConfig.monitoredTargets.count > 1
+        let isMulti = args.contains("--all") || ConfigManager.shared.currentConfig.monitorAllDisks || ConfigManager.shared.currentConfig.monitoredTargets.count > 1
         if isMulti {
             let multi = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: true, allowNotifications: notify)
             print("============================================================")
@@ -384,7 +385,7 @@ func isHeadlessCLIMode(args: [String]) -> Bool {
         "--export-config", "--import-config",
         "--export-diagnostics", "--export-html",
         "--surface-scan", "--test-alert-script", "--list-disks", "--json",
-        "--cli", "--status", "--check", "--watch-mounts", "--deep",
+        "--cli", "--status", "--check", "--watch-mounts", "--deep", "--all",
         "--send-report", "--verify", "--verify-volume", "--verify-apfs"
     ]
     for arg in args.dropFirst() {
