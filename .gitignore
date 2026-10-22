@@ -28,11 +28,10 @@ disk-health
 *.swp
 *~
 
-# Runtime Logs & Telemetry State (keep logs/README.md tracked)
-logs/*.log
-logs/*.json
-logs/*.html
-!logs/README.md
+# Project Directories Ignored from Version Control
+scripts/
+logs/
+docs/
 
 # Secrets & Environment Overrides
 .secrets.json
