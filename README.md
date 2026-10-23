@@ -36,7 +36,7 @@ Directly built on **IOKit**, **DiskArbitration**, **CoreFoundation**, and **Secu
 ## System Architecture
 
 > [!TIP]
-> For the comprehensive, production-grade architectural specification including arc42 sections, C4 Model-as-Code diagrams, runtime sequence diagrams, lock hierarchies, and ADRs, consult the authoritative [System Architecture Specification](docs/ARCHITECTURE.md).
+> For the comprehensive architectural specification including arc42 sections, C4 Model-as-Code diagrams, runtime sequence diagrams, lock hierarchies, and ADRs, consult the [System Architecture Specification](ARCHITECTURE.md).
 
 ```text
 disk-health-monitor/
@@ -45,7 +45,7 @@ disk-health-monitor/
 ├── assets/                       # AppIcon.png (1024x1024), AppIcon.icns, and UI previews
 ├── scripts/                      # CoreGraphics vector icon generator
 ├── logs/                         # Runtime logs, latest JSON telemetry snapshot, and state persistence
-├── tests/                        # C11/IOKit unit tests (14) and Swift engine unit tests (33)
+├── tests/                        # C11/IOKit unit tests (16) and Swift engine unit tests (48)
 └── src/                          # Modular C11 + Swift source tree
     ├── main.swift                # CLI router, argument parser, and NSApplication bootstrap
     ├── bridge/                   # Low-level C11 IOKit / NVMe SMART bridge
@@ -55,7 +55,7 @@ disk-health-monitor/
     ├── notifications/            # Notification Center, Telegram, Webhook, and Script dispatchers
     ├── diagnostics/              # JSON diagnostic bundle and standalone HTML report generator
     ├── engine/                   # 12-rule health evaluation engine, canary probe, and surface scanner
-    └── ui/                       # Menu bar controller, dashboard card, and 5-tab Settings window
+    └── ui/                       # Menu bar controller, dashboard card, and 6-tab Settings window
 ```
 
 ```mermaid
@@ -101,9 +101,9 @@ flowchart TD
 | [`src/notifications/`](src/notifications/README.md) | Notification Center, Telegram Bot, Webhooks (Discord/Slack/HA), and script hooks |
 | [`src/diagnostics/`](src/diagnostics/README.md) | Sanitized JSON diagnostic exporter and standalone HTML RMA report generator |
 | [`src/engine/`](src/engine/README.md) | 12-rule evaluation engine, canary I/O probe, multi-tier surface scanner |
-| [`src/ui/`](src/ui/README.md) | Menu bar status controller, telemetry card, and 5-tab Settings window (`⌘,`) |
-| [`tests/`](tests/README.md) | 14 C11/IOKit unit tests, 33 Swift engine unit tests, and CLI test stages |
-| [`scripts/`](scripts/README.md) | CoreGraphics vector application icon generator |
+| [`src/ui/`](src/ui/README.md) | Menu bar status controller, telemetry card, and 6-tab Settings window (`⌘,`) |
+| [`tests/`](tests/run_tests.sh) | 16 C11/IOKit unit tests, 48 Swift engine unit tests, and CLI test stages |
+| [`scripts/`](scripts/generate_app_icon.swift) | CoreGraphics vector application icon generator |
 | [`assets/`](assets/README.md) | Application branding and icon assets |
 | [`logs/`](logs/README.md) | Runtime log files, telemetry snapshots, and state persistence |
 
@@ -153,7 +153,7 @@ $$\text{Daily Burn Rate} = \frac{\text{Total TBW}}{\max(1, \text{POH} / 24)} \qu
 # Compile and create DiskHealthMonitor.app + ./disk-health CLI
 ./build_and_install.sh
 
-# Run the automated test suite (14 C tests + 33 Swift tests + CLI integration)
+# Run the automated test suite (16 C tests + 48 Swift tests + CLI integration)
 ./build_and_install.sh --test
 
 # Cross-compile release DMGs, ZIPs, and standalone CLI binaries in dist/
@@ -221,6 +221,9 @@ Parameters resolve in descending priority:
 | :--- | :--- | :--- | :--- | :--- |
 | `targetVolumePath` | `DISK_HEALTH_VOLUME` | `String` | `""` (Auto) | Explicit mount point to monitor (empty auto-selects primary external or `/`) |
 | `targetDeviceQuery` | `DISK_HEALTH_DEVICE` | `String` | `""` | Target device match by BSD name (`disk4`), model, or serial |
+| `monitorAllDisks` | `MONITOR_ALL_DISKS` | `Bool` | `false` | Simultaneously monitor all connected internal and external physical drives |
+| `monitoredTargets` | `DISK_HEALTH_TARGETS` | `[String]` | `[]` | Explicit list of mount points or BSD names to monitor in multi-disk mode |
+| `useKeychainStorage` | — | `Bool` | `false` | Opt-in flag enabling macOS Keychain storage for interactive desktop sessions |
 | `requiredSubpaths` | `DISK_HEALTH_REQUIRED_SUBPATHS` | `[String]` | `[]` | Comma-separated relative paths that must exist on mounted target |
 | `enableActiveCanary` | `ENABLE_ACTIVE_CANARY` | `Bool` | `true` | Periodic write, `fsync()`, read-back, and unlink probe |
 | `pollIntervalSeconds` | `POLL_INTERVAL_SECONDS` | `Double` | `30.0` | Background polling interval in seconds (`10`–`3600`) |

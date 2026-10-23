@@ -758,7 +758,8 @@ struct CoreLogicTestRunner {
         assertTrue(!kAppArchitecture.isEmpty, "kAppArchitecture must not be empty")
         assertTrue(!kAppArchShort.isEmpty, "kAppArchShort must not be empty")
         assertTrue(kAppArchShort == "arm64" || kAppArchShort == "x86_64", "kAppArchShort must be either arm64 or x86_64")
-        assertTrue(kAppVersion == "2.5.0", "kAppVersion must match 2.5.0")
+        assertTrue(kAppVersion == "2.6.0", "kAppVersion must match 2.6.0")
+        assertTrue(kAppBuildNumber == "9", "kAppBuildNumber must match 9")
 
         let diag = DiagnosticExporter.shared.generateDiagnosticReport()
         guard let sys = diag["system"] as? [String: Any] else {
@@ -2936,6 +2937,240 @@ struct CoreLogicTestRunner {
             }
 
             print("  [OK] Interval delta latency calculation and read-only state invariance verified")
+        }
+
+        // ====================================================================
+        // Test 46: Composite driveKey Baseline Reset, Placeholder Serials & Virtual Disk Exclusion (STATE-03, BRIDGE-04)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 46: Composite driveKey Baseline Reset & Virtual Disk Filtering (STATE-03, BRIDGE-04) ===")
+            let mock = MockTelemetryProvider()
+            let monitor = DiskHealthMonitor.shared
+
+            // 46a. Unified placeholder serial check (case-insensitive)
+            assertTrue(DiskHealthSnapshot.isPlaceholderSerial("unknown"), "'unknown' must be treated as placeholder serial")
+            assertTrue(DiskHealthSnapshot.isPlaceholderSerial("None"), "'None' must be treated as placeholder serial")
+            assertTrue(DiskHealthSnapshot.isPlaceholderSerial("00000000"), "'00000000' must be treated as placeholder serial")
+            assertTrue(!DiskHealthMonitor.isValidUniqueSerial("unknown"), "isValidUniqueSerial must agree with !isPlaceholderSerial")
+            assertTrue(DiskHealthMonitor.isValidUniqueSerial("S699NJ0R123456"), "Real hardware serial must be valid")
+
+            // 46b. Drive with placeholder serial ("000000000000") uses composite driveKey ("000000000000#disk15")
+            var placeholderDev = makeMockDiskHardwareMetrics(
+                found: true,
+                bsdName: "disk15",
+                serialNumber: "000000000000",
+                vendorName: "Generic",
+                productName: "USB Enclosure",
+                isInternal: false,
+                smartValid: true,
+                temperatureCelsius: 49,
+                unsafeShutdowns: 7,
+                mediaErrors: 1
+            )
+            placeholderDev.statsValid = true
+            placeholderDev.errorsRead = 4
+
+            // Virtual Disk Image device that should be filtered out in monitorAllDisks mode
+            var dmgDev = makeMockDiskHardwareMetrics(
+                found: true,
+                bsdName: "disk19",
+                serialNumber: "",
+                vendorName: "Apple",
+                productName: "Apple Disk Image Media",
+                interconnectType: "Virtual Interface",
+                isInternal: false,
+                smartValid: false
+            )
+            _ = "Virtual Interface".withCString { strlcpy(&dmgDev.interconnectType.0, $0, 64) }
+
+            mock.allDevices = [placeholderDev, dmgDev]
+            mock.hardwareMetricsByQuery["disk15"] = placeholderDev
+            mock.hardwareMetrics = placeholderDev
+
+            ConfigManager.shared.updateConfig {
+                $0.monitorAllDisks = true
+                $0.monitoredTargets = []
+                $0.enableActiveCanary = false
+            }
+
+            let fleet = monitor.evaluateAllMonitoredDisks(forceCanary: false, allowNotifications: false, persistState: false, telemetryProvider: mock)
+            assertTrue(fleet.disks.count == 1, "Virtual Disk Image must be excluded in monitorAllDisks mode, got \(fleet.disks.count)")
+            let snap = fleet.disks[0]
+            assertTrue(snap.driveKey == "000000000000#disk15", "Expected composite driveKey '000000000000#disk15', got '\(snap.driveKey)'")
+
+            // Mutate baseline to stale value, then call resetBaselines() and verify composite driveKey is updated
+            monitor.mutateStateForTesting { s in
+                s.updateDriveState(key: snap.driveKey) { d in
+                    d.baselineUnsafeShutdowns = 1
+                }
+            }
+            monitor.resetBaselines()
+            let updatedState = monitor.persistentState.getDriveState(key: snap.driveKey)
+            assertTrue(updatedState.baselineUnsafeShutdowns == 7, "resetBaselines() must update state under snap.driveKey ('\(snap.driveKey)'), got \(String(describing: updatedState.baselineUnsafeShutdowns))")
+            print("  [OK] Composite driveKey baseline reset, unified placeholder serials, and virtual DMG exclusion verified")
+        }
+
+        // ====================================================================
+        // Test 47: Automatic Log Secret Redaction & Burst Deduplication (LOG-01)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 47: Automatic Log Secret Redaction & Burst Deduplication (LOG-01) ===")
+            let rawMsg = "Telegram error for https://api.telegram.org/bot123456789:AAH_SecretBotToken_9876543210/sendMessage and webhook https://discord.com/api/webhooks/112233/ secretTokenXYZ"
+            let redacted = ConfigManager.redactSensitiveLogText(rawMsg)
+            assertTrue(!redacted.contains("AAH_SecretBotToken_9876543210"), "Telegram bot token must be redacted on log write")
+            assertTrue(redacted.contains("bot<REDACTED_TOKEN>"), "Telegram bot token must be replaced with bot<REDACTED_TOKEN>")
+            assertTrue(!redacted.contains("webhooks/112233"), "Webhook URL path must be redacted on log write")
+
+            // Verify burst deduplication within 2s window
+            let burstToken = "BURST_DEDUP_MARKER_\(UUID().uuidString)"
+            ConfigManager.shared.log(burstToken, deduplicateBurstWindow: 2.0)
+            ConfigManager.shared.log(burstToken, deduplicateBurstWindow: 2.0)
+            ConfigManager.shared.log(burstToken, deduplicateBurstWindow: 2.0)
+
+            let logContents = (try? String(contentsOfFile: ConfigManager.shared.logFilePath, encoding: .utf8)) ?? ""
+            let occurrences = logContents.components(separatedBy: burstToken).count - 1
+            assertTrue(occurrences == 1, "Identical log messages within 2s burst window must be deduplicated to 1 entry, got \(occurrences)")
+            print("  [OK] Automatic credential redaction on log write and 2s burst deduplication verified")
+        }
+
+        // ====================================================================
+        // Test 48: Transient Alert Poll Hysteresis & Scoped Host Thermal / Apple Internal SMART Rules (ALERT-01, RULE-06, RULE-07)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 48: Transient Alert Poll Hysteresis & Scoped Host/Internal Rules (ALERT-01, RULE-06, RULE-07) ===")
+            let mock = MockTelemetryProvider()
+            let monitor = DiskHealthMonitor.shared
+
+            // 48a. HostThermalAndVerifyRule must NOT penalize external USB drives for Mac CPU thermal pressure
+            var extHw = makeMockDiskHardwareMetrics(found: true, bsdName: "disk12", serialNumber: "EXT_USB_THERM", interconnectType: "USB", isInternal: false)
+            _ = "USB".withCString { strlcpy(&extHw.interconnectType.0, $0, 64) }
+            let extCtx = HealthEvaluationContext(
+                nowTs: 1000.0,
+                config: DiskHealthConfig(),
+                hardware: extHw,
+                linkSpeedFormatted: "10 Gbps",
+                interconnect: "USB",
+                mountToInspect: "/Volumes/ExtDrive",
+                filesystem: FilesystemMountMetrics(isMounted: true, mountPoint: "/Volumes/ExtDrive", filesystemType: "apfs", isReadOnly: false, totalBytes: 500_000_000_000, freeBytes: 400_000_000_000, purgeableBytes: 0, usedBytes: 100_000_000_000, usedPercent: 20.0),
+                subpathsStatus: [:],
+                canaryOk: true,
+                canaryLatencyMs: 2.0,
+                canaryError: "",
+                avgReadLatMs: 1.0,
+                avgWriteLatMs: 1.0,
+                inWakeGrace: false,
+                hostThermalState: .critical,
+                driveState: DriveBaselineState(),
+                recentTemperatureSamples: []
+            )
+            let extThermalOut = HostThermalAndVerifyRule().evaluate(context: extCtx)
+            assertTrue(extThermalOut.issues.isEmpty, "External drive must not be penalized for internal Mac CPU thermal pressure")
+
+            // Internal drive MUST still report HOST_THERMAL_CRITICAL when hostThermalState == .critical
+            var intHw = extHw
+            intHw.isInternal = true
+            let intCtx = HealthEvaluationContext(
+                nowTs: 1000.0,
+                config: DiskHealthConfig(),
+                hardware: intHw,
+                linkSpeedFormatted: "PCI-Express",
+                interconnect: "PCI-Express",
+                mountToInspect: "/",
+                filesystem: extCtx.filesystem,
+                subpathsStatus: [:],
+                canaryOk: true,
+                canaryLatencyMs: 2.0,
+                canaryError: "",
+                avgReadLatMs: 1.0,
+                avgWriteLatMs: 1.0,
+                inWakeGrace: false,
+                hostThermalState: .critical,
+                driveState: DriveBaselineState(),
+                recentTemperatureSamples: []
+            )
+            let intThermalOut = HostThermalAndVerifyRule().evaluate(context: intCtx)
+            assertTrue(intThermalOut.issues.contains(where: { $0.code == "HOST_THERMAL_CRITICAL" }), "Internal drive must report HOST_THERMAL_CRITICAL under critical host thermal pressure")
+
+            // 48b. Internal NVMe minor errorInfoLogEntries (+1) without mediaErrors/criticalWarning must not false-alarm
+            var baseDriveState = DriveBaselineState()
+            baseDriveState.baselineErrorLogEntries = 10
+            baseDriveState.baselineMediaErrors = 0
+            var intSmartHw = makeMockDiskHardwareMetrics(found: true, bsdName: "disk0", serialNumber: "INT_ANS2", isInternal: true, smartValid: true, criticalWarning: 0, mediaErrors: 0, errorInfoLogEntries: 11)
+            let intSmartCtx1 = HealthEvaluationContext(
+                nowTs: 1000.0,
+                config: DiskHealthConfig(),
+                hardware: intSmartHw,
+                linkSpeedFormatted: "Apple Fabric",
+                interconnect: "Apple Fabric",
+                mountToInspect: "/",
+                filesystem: extCtx.filesystem,
+                subpathsStatus: [:],
+                canaryOk: true,
+                canaryLatencyMs: 1.0,
+                canaryError: "",
+                avgReadLatMs: 0.5,
+                avgWriteLatMs: 0.5,
+                inWakeGrace: false,
+                hostThermalState: .nominal,
+                driveState: baseDriveState,
+                recentTemperatureSamples: []
+            )
+            let smartOutMinor = SMARTIntegrityAndShutdownRule().evaluate(context: intSmartCtx1)
+            assertTrue(!smartOutMinor.issues.contains(where: { $0.code == "ERROR_LOG_INCREASED" }), "Single routine telemetry log increment on healthy internal SSD must be ignored")
+
+            intSmartHw.errorInfoLogEntries = 16 // +6 delta (>= 5)
+            let intSmartCtxMajor = HealthEvaluationContext(
+                nowTs: 1000.0,
+                config: DiskHealthConfig(),
+                hardware: intSmartHw,
+                linkSpeedFormatted: "Apple Fabric",
+                interconnect: "Apple Fabric",
+                mountToInspect: "/",
+                filesystem: extCtx.filesystem,
+                subpathsStatus: [:],
+                canaryOk: true,
+                canaryLatencyMs: 1.0,
+                canaryError: "",
+                avgReadLatMs: 0.5,
+                avgWriteLatMs: 0.5,
+                inWakeGrace: false,
+                hostThermalState: .nominal,
+                driveState: baseDriveState,
+                recentTemperatureSamples: []
+            )
+            let smartOutMajor = SMARTIntegrityAndShutdownRule().evaluate(context: intSmartCtxMajor)
+            assertTrue(smartOutMajor.issues.contains(where: { $0.code == "ERROR_LOG_INCREASED" }), "Delta >= 5 on internal SSD must trigger ERROR_LOG_INCREASED")
+
+            // 48c. Poll hysteresis: 1st poll of transient CANARY_HIGH_LATENCY defers alert; 2nd consecutive poll triggers alert
+            let hystSerial = "HYST_DRIVE_\(UUID().uuidString)"
+            let hystHw = makeMockDiskHardwareMetrics(found: true, bsdName: "disk28", serialNumber: hystSerial, isInternal: false, smartValid: true)
+            mock.hardwareMetrics = hystHw
+            mock.mountPointByBsd["disk28"] = "/Volumes/HystDrive"
+            mock.filesystemMetrics = FilesystemMountMetrics(isMounted: true, mountPoint: "/Volumes/HystDrive", filesystemType: "apfs", isReadOnly: false, totalBytes: 500_000_000_000, freeBytes: 400_000_000_000, purgeableBytes: 0, usedBytes: 100_000_000_000, usedPercent: 20.0)
+            mock.canaryResultOverride = CanaryProbeResult(ok: true, latencyMs: 420.0, error: "") // Transient CANARY_HIGH_LATENCY
+
+            ConfigManager.shared.updateConfig {
+                $0.monitorAllDisks = false
+                $0.monitoredTargets = []
+                $0.targetVolumePath = "/Volumes/HystDrive"
+                $0.targetDeviceQuery = "disk28"
+                $0.enableActiveCanary = true
+                $0.enableNativeNotifications = false
+            }
+
+            // Poll 1: consecutiveUnhealthyPolls becomes 1 -> alert deferred
+            _ = monitor.evaluateHealth(forceCanary: true, allowNotifications: true, persistState: false, telemetryProvider: mock)
+            let statePoll1 = monitor.persistentState.getDriveState(key: hystSerial)
+            assertTrue(statePoll1.consecutiveUnhealthyPolls == 1, "Poll 1 must increment consecutiveUnhealthyPolls to 1")
+            assertTrue(statePoll1.lastNotifiedSeverity == HealthSeverity.healthy.rawValue, "Poll 1 of transient latency warning must defer notification")
+
+            // Poll 2: consecutiveUnhealthyPolls becomes 2 -> alert dispatched
+            _ = monitor.evaluateHealth(forceCanary: true, allowNotifications: true, persistState: false, telemetryProvider: mock)
+            let statePoll2 = monitor.persistentState.getDriveState(key: hystSerial)
+            assertTrue(statePoll2.consecutiveUnhealthyPolls == 2, "Poll 2 must increment consecutiveUnhealthyPolls to 2")
+            assertTrue(statePoll2.lastNotifiedSeverity == HealthSeverity.warning.rawValue, "Poll 2 of persistent latency warning must dispatch alert")
+
+            print("  [OK] Transient alert 2-poll hysteresis, external host thermal isolation, and internal NVMe log threshold verified")
         }
 
         print("✅ All Swift Core Logic Unit Tests Passed!")

@@ -58,7 +58,7 @@ struct SmartInspectorTab: View {
                             Spacer()
                             Button(action: {
                                 DispatchQueue.global(qos: .userInitiated).async {
-                                    _ = DiskHealthMonitor.shared.evaluateHealth(forceCanary: false, allowNotifications: false)
+                                    _ = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: false, allowNotifications: false)
                                 }
                             }) {
                                 Label("Refresh SMART", systemImage: "arrow.clockwise")

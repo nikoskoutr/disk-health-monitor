@@ -152,14 +152,16 @@ struct IOKitTelemetryProvider: DiskTelemetryProvider {
         let rawFreeBytes = UInt64(sfs.f_bavail) * bsize
         var effectiveFreeBytes = rawFreeBytes
 
-        let mountURL = URL(fileURLWithPath: metrics.mountPoint)
-        if let vals = try? mountURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
-           let importantFree = vals.volumeAvailableCapacityForImportantUsage,
-           importantFree > 0 {
-            let importantU64 = UInt64(importantFree)
-            if importantU64 > rawFreeBytes && importantU64 <= metrics.totalBytes {
-                metrics.purgeableBytes = importantU64 - rawFreeBytes
-                effectiveFreeBytes = importantU64
+        if fsType.lowercased() == "apfs" {
+            let mountURL = URL(fileURLWithPath: metrics.mountPoint)
+            if let vals = try? mountURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+               let importantFree = vals.volumeAvailableCapacityForImportantUsage,
+               importantFree > 0 {
+                let importantU64 = UInt64(importantFree)
+                if importantU64 > rawFreeBytes && importantU64 <= metrics.totalBytes {
+                    metrics.purgeableBytes = importantU64 - rawFreeBytes
+                    effectiveFreeBytes = importantU64
+                }
             }
         }
 

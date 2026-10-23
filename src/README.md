@@ -45,13 +45,13 @@ flowchart TD
 | :--- | :--- | :--- |
 | [`main.swift`](main.swift) | `main.swift` | CLI flag routing, argument parsing, headless command execution, and `NSApplication` launch |
 | [`bridge/`](bridge/README.md) | `DiskHealthBridge.h`, `DiskHealthBridge.c` | Low-level C11 IOKit registry traversal, APFS container physical store resolution, 128-bit NVMe SMART queries |
-| [`models/`](models/README.md) | `HealthModels.swift` | `Codable` domain models (`DiskHealthSnapshot`), SSD wear/endurance forecasting, synchronized formatters |
+| [`models/`](models/README.md) | `HealthModels.swift`, `DiskHealthError.swift` | `Codable` domain models (`DiskHealthSnapshot`, `MultiDiskHealthSnapshot`), SSD wear/endurance forecasting, synchronized formatters |
 | [`security/`](security/README.md) | `SecretStore.swift`, `SingleInstanceLock.swift` | macOS Keychain (`Security.framework`) storage, restricted `0600` fallback, POSIX single-instance lock |
-| [`config/`](config/README.md) | `ConfigManager.swift` | Multi-source configuration resolution (`.env`, `config.json`), secret redaction, thread-safe file logger |
+| [`config/`](config/README.md) | `ConfigManager.swift` | Multi-source configuration resolution (23 keys across `.env` & `config.json`), secret redaction, thread-safe file logger |
 | [`notifications/`](notifications/README.md) | `MacOSNotifier.swift`, `TelegramNotifier.swift`, `WebhookNotifier.swift` | Native Notification Center alerts, Telegram Bot client, universal webhooks, and shell script hooks |
 | [`diagnostics/`](diagnostics/README.md) | `DiagnosticExporter.swift` | Sanitized JSON diagnostic exporter and standalone responsive HTML RMA report generator |
-| [`engine/`](engine/README.md) | `DiskHealthMonitor.swift` | 12-rule evaluation engine, canary I/O probe, multi-tier surface scanner, scheduled volume verification |
-| [`ui/`](ui/README.md) | `AppDelegate.swift`, `DashboardMenuView.swift`, `SettingsView.swift` | Menu bar `NSStatusItem`, live dashboard card, and 5-tab Settings window (`⌘,`) |
+| [`engine/`](engine/README.md) | `DiskHealthMonitor.swift`, `HealthRules.swift`, `TelemetryProvider.swift`, `CanaryProbeService.swift`, `SurfaceScannerService.swift`, `VolumeVerifierService.swift` | 12-rule pure evaluation engine, 4096B page-aligned canary I/O probe, multi-tier surface scanner, scheduled volume verification |
+| [`ui/`](ui/README.md) | `AppDelegate.swift`, `DashboardMenuView.swift`, `SettingsView.swift`, `SettingsViewModel.swift`, `tabs/*.swift` | Menu bar `NSStatusItem`, live dashboard card, and 6-tab Settings window (`⌘,`) |
 
 ---
 

@@ -2,10 +2,9 @@
 
 **Standard:** arc42 Architecture Template (v8.2) & C4 Model-as-Code (Mermaid)  
 **System:** Universal macOS Disk Health Monitor & Telemetry Agent  
-**Version:** `v2.4.0` (Build 7)  
+**Version:** `v2.6.0` (Build 9)  
 **Target Architectures:** Universal Binary (`arm64` Apple Silicon & `x86_64` Intel)  
 **Target Platform:** macOS 13.0 (Ventura) through macOS 15+ (Sequoia)  
-**Lead Systems Architect:** Gemini 4 Argon  
 
 ---
 
@@ -299,7 +298,7 @@ flowchart TD
     Start(["runCanaryCheck(targetMount, force, nowTs)"]) --> CacheCheck{"!force && cached < 300s?"}
     CacheCheck -- Yes --> ReturnCached(["Return Cached CanaryProbeResult"])
     CacheCheck -- No --> RootCheck{"targetMount == '/'?"}
-    RootCheck -- Yes --> DataTmp["Path: /System/Volumes/Data/private/tmp"]
+    RootCheck -- Yes --> DataTmp["Path: ~/.config/disk-health-monitor/.disk_health_canary_<uid>"]
     RootCheck -- No --> DirectMount["Path: targetMount/.disk_health_canary_<uid>"]
     DataTmp & DirectMount --> OpenFile["open(path, O_CREAT|O_RDWR|O_NOFOLLOW|O_CLOEXEC, 0600)"]
     OpenFile --> OpenOk{"fd >= 0?"}
@@ -308,19 +307,19 @@ flowchart TD
     OpenOk -- "No (EROFS)" --> ReadFallback["Fallback: opendir() + readdir() directory probe"]
     OpenOk2 -- "No (EPERM/EACCES/EROFS)" --> ReadFallback
     OpenOk2 -- "No (Other errno)" --> FailOpen(["Return ok: false, open failed"])
-    OpenOk -- Yes --> SetNoCache["fcntl(fd, F_NOCACHE, 1)<br/>Pad payload to 512-byte sector boundary"]
+    OpenOk -- Yes --> SetNoCache["fcntl(fd, F_NOCACHE, 1)<br/>Allocate 4096-byte page-aligned buffer"]
     OpenOk2 -- Yes --> SetNoCache
-    SetNoCache --> PWrite["pwrite(fd, buf, 512, offset 0)"]
+    SetNoCache --> PWrite["pwrite(fd, alignedWriteBuf, 4096, offset 0)"]
     PWrite --> EinvalCheck{"written < 0 && errno == EINVAL?"}
     EinvalCheck -- "Yes (FAT32/exFAT)" --> DisableNoCache["fcntl(fd, F_NOCACHE, 0) & retry pwrite()"]
-    EinvalCheck -- No --> CheckWrite{"written == 512?"}
+    EinvalCheck -- No --> CheckWrite{"written == 4096?"}
     DisableNoCache --> CheckWrite
     CheckWrite -- No --> FailWrite(["close(fd), unlink(), Return write failed"])
-    CheckWrite -- Yes --> Fsync["fsync(fd)"]
-    Fsync --> CheckFsync{"fsync == 0?"}
+    CheckWrite -- Yes --> Fsync["fcntl(fd, F_FULLFSYNC) (fallback: fsync(fd))"]
+    Fsync --> CheckFsync{"sync == 0?"}
     CheckFsync -- No --> FailFsync(["close(fd), unlink(), Return fsync failed"])
-    CheckFsync -- Yes --> PRead["pread(fd, readBuf, 512, offset 0) & close(fd)"]
-    PRead --> Verify{"readBuf == buf?"}
+    CheckFsync -- Yes --> PRead["pread(fd, alignedReadBuf, 4096, offset 0) & close(fd)"]
+    PRead --> Verify{"memcmp(alignedWriteBuf, alignedReadBuf, 4096) == 0?"}
     Verify -- No --> FailVerify(["unlink(), Return readback mismatch"])
     Verify -- Yes --> CheckSpike{"!ok || latencyMs > 300ms?"}
     ReadFallback --> CheckSpike
@@ -389,9 +388,9 @@ flowchart TD
 
 ### 7.2 Release Artifacts Pipeline (`build_and_install.sh`)
 When executed with the `--package` flag, `build_and_install.sh` produces verified distribution artifacts in `dist/`:
-- `DiskHealthMonitor-v2.4.0-macOS-universal.dmg`: Apple Disk Image containing `DiskHealthMonitor.app` and `/Applications` symlink.
-- `DiskHealthMonitor-v2.4.0-macOS-universal.zip`: Compressed application bundle.
-- `disk-health-v2.4.0-cli-universal.tar.gz`: Standalone universal Mach-O CLI binary and installation helper.
+- `DiskHealthMonitor-v2.6.0-macOS-universal.dmg`: Apple Disk Image containing `DiskHealthMonitor.app` and `/Applications` symlink.
+- `DiskHealthMonitor-v2.6.0-macOS-universal.zip`: Compressed application bundle.
+- `disk-health-v2.6.0-cli-universal.tar.gz`: Standalone universal Mach-O CLI binary and installation helper.
 - `SHA256SUMS.txt`: Cryptographic SHA-256 checksums of all release packages.
 
 ---
@@ -492,8 +491,8 @@ The system architecture is verified across 5 distinct testing tiers certifying e
 ```mermaid
 flowchart TD
     subgraph TestSuite["Automated Verification Suite (tests/run_tests.sh)"]
-        T1["[1/5] C11 / IOKit Bridge Unit Tests<br/>(15 C Tests in test_disk_health_bridge.c)"]
-        T2["[2/5] Swift Core Engine & Domain Unit Tests<br/>(40 Swift Tests in test_core_logic.swift)"]
+        T1["[1/5] C11 / IOKit Bridge Unit Tests<br/>(16 C Tests in test_disk_health_bridge.c)"]
+        T2["[2/5] Swift Core Engine & Domain Unit Tests<br/>(48 Swift Tests in test_core_logic.swift)"]
         T3["[3/5] CLI Integration & Detachment Tests<br/>(14 Command-Line Flags & Session Checks)"]
         T4["[4/5] Exporters & Surface Scanner Verification<br/>(JSON, Standalone HTML, Quick F_NOCACHE Scan)"]
         T5["[5/5] Bundle Assets & Layout Integrity<br/>(AppIcon.icns, Info.plist, Logs Directory)"]
@@ -518,8 +517,8 @@ flowchart TD
 
 | Verification Stage | Test Target | Key Assertions & Scenarios | Architectural Guarantee |
 | :---: | :--- | :--- | :--- |
-| **Stage 1** | `test_disk_health_bridge` | Tests 1–15: Registry traversal, APFS pruning, SATA link speed parsing, NVMe 128-bit saturation, temperature clamping (-40°C to 150°C), static cache hit/miss. | Zero memory leaks in C, balanced `CFRelease`/`IOObjectRelease`. |
-| **Stage 2** | `test_core_logic` | Tests 1–40: Pure health rules, atomic 0600 file writes, SecretStore state machine, 512B canary alignment, orphan self-healing, reverse-seek log tailer, grandchild `pkill -P` termination. | Deterministic domain evaluation, acyclic lock hierarchy, thread safety. |
+| **Stage 1** | `test_disk_health_bridge` | Tests 1–16: Registry traversal, APFS pruning, SATA/USB vs PCIe link speed parsing, NVMe 128-bit saturation, temperature clamping (-40°C to 150°C), 64-entry static cache hit/miss. | Zero memory leaks in C, balanced `CFRelease`/`IOObjectRelease`. |
+| **Stage 2** | `test_core_logic` | Tests 1–48: Pure health rules, atomic 0600 file writes, SecretStore state machine, 4096B page-aligned canary with `F_FULLFSYNC`, orphan self-healing, log secret redaction & burst deduplication, transient alert hysteresis. | Deterministic domain evaluation, acyclic lock hierarchy, thread safety. |
 | **Stage 3** | CLI Integration | `--help`, `--version`, `--list-disks`, `--status`, `--all`, `--json`, `--check`, `--watch-mounts`, `--deep`, `POSIX_SPAWN_SETSID` detachment. | Dual-mode bootstrap correctness, deterministic exit status codes (`0`, `1`, `2`). |
 | **Stage 4** | Exporters & Scanners | `--export-config`, `--import-config`, `--export-diagnostics`, `--export-html`, `--surface-scan quick`. | Credential masking, valid HTML/SVG generation, non-destructive media read verification. |
 | **Stage 5** | Packaging Integrity | Directory structure, `assets/AppIcon.icns`, `Info.plist` bundle identifiers. | Clean macOS bundle structure and LaunchAgent compatibility. |
@@ -572,21 +571,6 @@ flowchart TD
 ### 11.9 Pitfall 9: macOS 15+ (Sequoia) Local Network Privacy & TCC Enforcement
 - **Vulnerability Mechanism**: Beginning in macOS 15, processes communicating with local network endpoints (`.local` or LAN IP addresses for Webhooks/Prometheus) may trigger TCC security prompts if invoked outside the `.app` bundle or missing explicit descriptions.
 - **Mitigation**: Add `NSLocalNetworkUsageDescription` to `Info.plist` in `build_and_install.sh`.
-
----
-
-## 12. Formal Lead Architect Sign-Off & Verdict
-
-Following an exhaustive two-pass review of the complete codebase (~12.7k lines) and the arc42 + C4 architectural specification:
-1. **Documentation Excellence**: `docs/ARCHITECTURE.md` satisfies all arc42 (v8.2) sections and C4 Model-as-Code standards with full source file and test traceability.
-2. **Code Coherence & Readability**: Standardized file header banners, Doxygen function documentation, Swift DocC comments, and documented hardware/kernel invariants have been established across all 25 source files.
-3. **Verification Rigor**: 100% test pass rate across all 15 C/IOKit unit tests, 40 Swift engine unit tests, and 5 CLI integration stages.
-
-> ### **ARCHITECTURAL VERDICT: UNCONDITIONALLY APPROVED FOR PRODUCTION (`v2.4.0`)**
-> *Signed,*  
-> **Gemini 4 Argon**  
-> *Lead Systems Architect & Principal Reviewer*  
-> *(Detailed audit: [ARGON_ARCHITECTURAL_ASSESSMENT.md](ARGON_ARCHITECTURAL_ASSESSMENT.md))*
 
 ---
 

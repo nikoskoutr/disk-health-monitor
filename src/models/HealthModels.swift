@@ -21,8 +21,8 @@ public let kAppArchitecture = "unknown"
 public let kAppArchShort = "unknown"
 #endif
 
-public let kAppVersion = "2.5.0"
-public let kAppBuildNumber = "8"
+public let kAppVersion = "2.6.0"
+public let kAppBuildNumber = "9"
 
 // MARK: - Data Models
 
@@ -368,20 +368,23 @@ extension DiskHealthSnapshot: Identifiable {
     static func isPlaceholderSerial(_ serial: String) -> Bool {
         let s = serial.trimmingCharacters(in: .whitespacesAndNewlines)
         if s.isEmpty { return true }
+        let lower = s.lowercased()
         let placeholders: Set<String> = [
+            "00000000",
             "000000000000",
             "0000000000000000",
-            "0123456789ABCDEF",
             "0123456789abcdef",
             "1234567890",
-            "None",
-            "N/A",
-            "UNKNOWN",
-            "Generic",
+            "none",
+            "n/a",
+            "na",
+            "unknown",
+            "generic",
+            "default",
             "0"
         ]
-        if placeholders.contains(s) { return true }
-        if s.count >= 4 && Set(s).count == 1 { return true }
+        if placeholders.contains(lower) { return true }
+        if lower.count >= 4 && Set(lower).count == 1 { return true }
         return false
     }
 

@@ -410,13 +410,19 @@ struct SMARTIntegrityAndShutdownRule: HealthRule {
         }
 
         if let baseErr = driveState.baselineErrorLogEntries, hw.errorInfoLogEntries > baseErr {
-            outcome.issues.append(HealthIssue(
-                code: "ERROR_LOG_INCREASED",
-                severity: .warning,
-                title: "NVMe Error Log Entries Increased",
-                detail: "Error log count increased from \(baseErr) to \(hw.errorInfoLogEntries)."
-            ))
-            outcome.scorePenalty += 15
+            let errDelta = hw.errorInfoLogEntries - baseErr
+            // Apple Silicon internal ANS2 controllers increment errorInfoLogEntries during routine telemetry
+            // even when mediaErrors == 0 and criticalWarning == 0. Require >= 5 delta on healthy internal drives.
+            let isHealthyInternal = hw.isInternal && hw.mediaErrors == 0 && hw.criticalWarning == 0
+            if !isHealthyInternal || errDelta >= 5 {
+                outcome.issues.append(HealthIssue(
+                    code: "ERROR_LOG_INCREASED",
+                    severity: .warning,
+                    title: "NVMe Error Log Entries Increased",
+                    detail: "Error log count increased from \(baseErr) to \(hw.errorInfoLogEntries)."
+                ))
+                outcome.scorePenalty += 15
+            }
         }
 
         if let baseUnsafe = driveState.baselineUnsafeShutdowns, hw.unsafeShutdowns > baseUnsafe {
@@ -526,10 +532,14 @@ struct HostThermalAndVerifyRule: HealthRule {
     func evaluate(context: HealthEvaluationContext) -> HealthRuleOutcome {
         var outcome = HealthRuleOutcome()
 
-        let (thermalIssue, thermalPenalty) = HostThermalAndVerifyRule.evaluateHostThermal(thermalState: context.hostThermalState)
-        if let issue = thermalIssue {
-            outcome.issues.append(issue)
-            outcome.scorePenalty += thermalPenalty
+        // Scope host CPU thermal throttling warning to internal system drives so external USB/TB drives
+        // are not penalized or alerted across a multi-disk fleet for an internal Mac thermal event.
+        if context.hardware.isInternal {
+            let (thermalIssue, thermalPenalty) = HostThermalAndVerifyRule.evaluateHostThermal(thermalState: context.hostThermalState)
+            if let issue = thermalIssue {
+                outcome.issues.append(issue)
+                outcome.scorePenalty += thermalPenalty
+            }
         }
 
         if !context.driveState.lastVerifyOk {

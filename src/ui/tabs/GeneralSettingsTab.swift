@@ -67,6 +67,30 @@ struct GeneralSettingsTab: View {
                             .labelsHidden()
                             .frame(width: 260)
                         }
+
+                        if viewModel.availableDisks.count > 1 {
+                            Divider()
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Monitored Drive Checklist (Multi-Select)")
+                                    .font(.system(size: 12, weight: .semibold))
+                                Text("Select one or more specific physical drives or mounted volumes to monitor simultaneously.")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.secondary)
+
+                                ForEach(viewModel.availableDisks, id: \.id) { disk in
+                                    Toggle(isOn: Binding(
+                                        get: { viewModel.isTargetSelected(disk.id) },
+                                        set: { _ in viewModel.toggleDiskSelection(disk.id) }
+                                    )) {
+                                        Text(disk.name)
+                                            .font(.system(size: 11.5, design: .monospaced))
+                                    }
+                                    .toggleStyle(.checkbox)
+                                }
+                            }
+                            .padding(.top, 4)
+                        }
                     }
                 }
 

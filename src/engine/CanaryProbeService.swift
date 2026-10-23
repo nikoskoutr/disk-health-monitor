@@ -87,18 +87,20 @@ final class CanaryProbeService: @unchecked Sendable {
 
     // MARK: - Internal I/O Execution
 
-    /// Executes a single in-place 512B write/fsync/readback pass.
+    /// Executes a single in-place 4096B page-aligned write/sync/readback pass.
     ///
     /// Invariants:
-    /// 1. Sealed Root Redirection: If targetMount == "/", probes via `/System/Volumes/Data/private/tmp`
-    ///    to avoid guaranteed EROFS on macOS sealed system snapshot volumes.
-    /// 2. Sector Alignment (UAT2-01): Buffer is padded to 512 bytes so `fcntl(F_NOCACHE)`
-    ///    never fails with EINVAL on FAT32/exFAT kernel drivers.
-    /// 3. In-Place I/O: Uses `O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC` to mutate the same
+    /// 1. Sealed Root Redirection: If targetMount == "/", probes via `ConfigManager.shared.configDir`
+    ///    on the Data volume to avoid EROFS on macOS sealed system snapshot volumes.
+    /// 2. Page & Sector Alignment (UAT2-01 / CANARY-02): Uses a 4096-byte page-aligned buffer so
+    ///    `fcntl(F_NOCACHE)` performs direct DMA without EINVAL on 4K-sector drivers.
+    /// 3. Physical Media Flush: Attempts `fcntl(fd, F_FULLFSYNC)` to flush drive volatile cache to
+    ///    non-volatile NAND, falling back to `fsync(fd)` on filesystems that do not support `F_FULLFSYNC`.
+    /// 4. In-Place I/O: Uses `O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC` to mutate the same
     ///    hidden `.disk_health_canary_<uid>` file, eliminating APFS B-tree directory node churn.
-    /// 4. Orphan Self-Healing (UAT2-04): If an orphaned canary file with 0400 permissions was left
+    /// 5. Orphan Self-Healing (UAT2-04): If an orphaned canary file with 0400 permissions was left
     ///    behind from an interrupted pass, attempts `unlink()` and retries `open()`.
-    /// 5. Read-Only Fallback: On write-restricted or read-only mounts (EROFS/EACCES), falls back
+    /// 6. Read-Only Fallback: On write-restricted or read-only mounts (EROFS/EACCES), falls back
     ///    to active `opendir()` + `readdir()` directory traversal.
     private func performSingleCanaryPass(targetMount: String) -> CanaryProbeResult {
         let effectiveDir: String
@@ -113,11 +115,23 @@ final class CanaryProbeService: @unchecked Sendable {
         guard var data = header.data(using: .utf8) else {
             return CanaryProbeResult(ok: false, latencyMs: 0, error: "Encoding error")
         }
-        // Pad to 4096-byte boundary so F_NOCACHE pwrite/pread succeeds on 4K sectors without driver EINVAL
-        if data.count < 4096 {
-            data.append(Data(repeating: 0x20, count: 4096 - data.count - 1))
+        let blockSize = 4096
+        // Pad to 4096-byte page boundary so F_NOCACHE pwrite/pread succeeds on 4K sectors without driver EINVAL
+        if data.count < blockSize {
+            data.append(Data(repeating: 0x20, count: blockSize - data.count - 1))
             data.append(0x0A)
+        } else if data.count > blockSize {
+            data = data.prefix(blockSize)
         }
+
+        let alignedWriteBuf = UnsafeMutableRawPointer.allocate(byteCount: blockSize, alignment: 4096)
+        let alignedReadBuf = UnsafeMutableRawPointer.allocate(byteCount: blockSize, alignment: 4096)
+        defer {
+            alignedWriteBuf.deallocate()
+            alignedReadBuf.deallocate()
+        }
+        data.copyBytes(to: alignedWriteBuf.assumingMemoryBound(to: UInt8.self), count: blockSize)
+        memset(alignedReadBuf, 0, blockSize)
 
         let start = DispatchTime.now()
         var fd = open(canaryPath, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
@@ -156,40 +170,32 @@ final class CanaryProbeService: @unchecked Sendable {
 
         _ = fcntl(fd, F_NOCACHE, 1)
 
-        var written = data.withUnsafeBytes { ptr -> Int in
-            guard let base = ptr.baseAddress else { return -1 }
-            return pwrite(fd, base, data.count, 0)
-        }
+        var written = pwrite(fd, alignedWriteBuf, blockSize, 0)
         if written < 0 && errno == EINVAL {
-            // Filesystem driver rejected F_NOCACHE unaligned buffer; disable F_NOCACHE and retry pwrite
+            // Filesystem driver rejected F_NOCACHE; disable F_NOCACHE and retry pwrite
             _ = fcntl(fd, F_NOCACHE, 0)
-            written = data.withUnsafeBytes { ptr -> Int in
-                guard let base = ptr.baseAddress else { return -1 }
-                return pwrite(fd, base, data.count, 0)
-            }
+            written = pwrite(fd, alignedWriteBuf, blockSize, 0)
         }
-        if written != data.count {
+        if written != blockSize {
             let errStr = String(cString: strerror(errno))
             close(fd)
             unlink(canaryPath)
             return CanaryProbeResult(ok: false, latencyMs: 0, error: "write failed: \(errStr)")
         }
 
-        if fsync(fd) != 0 {
-            let errStr = String(cString: strerror(errno))
-            close(fd)
-            unlink(canaryPath)
-            return CanaryProbeResult(ok: false, latencyMs: 0, error: "fsync failed: \(errStr)")
+        if fcntl(fd, F_FULLFSYNC) != 0 {
+            if fsync(fd) != 0 {
+                let errStr = String(cString: strerror(errno))
+                close(fd)
+                unlink(canaryPath)
+                return CanaryProbeResult(ok: false, latencyMs: 0, error: "fsync failed: \(errStr)")
+            }
         }
 
-        var readBuf = [UInt8](repeating: 0, count: data.count)
-        let bytesRead = readBuf.withUnsafeMutableBytes { ptr -> Int in
-            guard let base = ptr.baseAddress else { return -1 }
-            return pread(fd, base, data.count, 0)
-        }
+        let bytesRead = pread(fd, alignedReadBuf, blockSize, 0)
         close(fd)
 
-        guard bytesRead == data.count, readBuf.elementsEqual(data) else {
+        guard bytesRead == blockSize, memcmp(alignedWriteBuf, alignedReadBuf, blockSize) == 0 else {
             unlink(canaryPath)
             return CanaryProbeResult(ok: false, latencyMs: 0, error: "readback verification mismatch")
         }

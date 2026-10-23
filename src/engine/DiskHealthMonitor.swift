@@ -325,7 +325,7 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         }()
         if !activeSnapshots.isEmpty {
             for snap in activeSnapshots {
-                let key = !snap.serialNumber.isEmpty ? snap.serialNumber : (!snap.bsdName.isEmpty ? snap.bsdName : (snap.mountPoint.isEmpty ? "default" : snap.mountPoint))
+                let key = snap.driveKey
                 self.state.updateDriveState(key: key) { d in
                     d.bsdName = snap.bsdName
                     d.serialNumber = snap.serialNumber
@@ -731,10 +731,20 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
     }
 
     static func isValidUniqueSerial(_ s: String) -> Bool {
-        let clean = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty, clean != "0", clean != "N/A", clean != "None", clean != "0123456789ABCDEF" else { return false }
-        if clean.allSatisfy({ $0 == "0" || $0 == " " || $0 == "-" || $0 == "_" }) { return false }
-        return true
+        return !DiskHealthSnapshot.isPlaceholderSerial(s)
+    }
+
+    static func isVirtualDiskMetrics(_ dev: DiskHardwareMetrics) -> Bool {
+        let interconnect = cStringToSwift(dev.interconnectType).lowercased()
+        let product = cStringToSwift(dev.productName).lowercased()
+        let vendor = cStringToSwift(dev.vendorName).lowercased()
+        if interconnect.contains("virtual") || interconnect.contains("file") {
+            return true
+        }
+        if product.contains("disk image") || vendor.contains("disk image") {
+            return true
+        }
+        return false
     }
 
     /// Evaluates health, performance, and SMART telemetry across all monitored physical storage devices.
@@ -768,7 +778,7 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         if cfg.monitorAllDisks {
             let all = provider.listAllDevices(maxCount: 32)
             var serialCounts: [String: Int] = [:]
-            for dev in all where dev.found {
+            for dev in all where dev.found && !DiskHealthMonitor.isVirtualDiskMetrics(dev) {
                 let ser = cStringToSwift(dev.serialNumber).trimmingCharacters(in: .whitespacesAndNewlines)
                 if DiskHealthMonitor.isValidUniqueSerial(ser) {
                     serialCounts[ser, default: 0] += 1
@@ -778,7 +788,7 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             var seenKeys = Set<String>()
             var enumeratedDevices: [DiskHardwareMetrics] = []
             enumeratedDevices.reserveCapacity(all.count)
-            for dev in all where dev.found {
+            for dev in all where dev.found && !DiskHealthMonitor.isVirtualDiskMetrics(dev) {
                 let ser = cStringToSwift(dev.serialNumber).trimmingCharacters(in: .whitespacesAndNewlines)
                 let bsd = cStringToSwift(dev.bsdName).trimmingCharacters(in: .whitespacesAndNewlines)
                 let key: String
@@ -983,23 +993,47 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         return self.latestSnapshotInternal ?? multi.primarySnapshot ?? multi.disks[0]
     }
 
+    private static let transientWarningCodes: Set<String> = [
+        "IO_LATENCY_WARNING",
+        "CANARY_HIGH_LATENCY",
+        "TEMP_RAPID_RISE"
+    ]
+
     private func processAlertsAndDigestLocked(snapshot: DiskHealthSnapshot, rawMetrics hw: DiskHardwareMetrics, driveKey: String) {
         let nowTs = snapshot.timestamp
         let cfg = ConfigManager.shared.currentConfig
         let cooldown = cfg.alertCooldownSeconds
         var shouldSendAlert = false
+        var deferSeverityUpdateForHysteresis = false
 
-        for issue in snapshot.issues {
-            let scopedKey = "\(driveKey):\(issue.code)"
-            if let legacyTs = state.lastAlertTimestampByCode.removeValue(forKey: issue.code) {
-                if state.lastAlertTimestampByCode[scopedKey] == nil {
-                    state.lastAlertTimestampByCode[scopedKey] = legacyTs
-                }
+        if snapshot.overallSeverity != .healthy && !snapshot.issues.isEmpty {
+            var currentUnhealthyPolls = 1
+            self.state.updateDriveState(key: driveKey) {
+                $0.consecutiveUnhealthyPolls += 1
+                $0.consecutiveHealthyPolls = 0
+                currentUnhealthyPolls = $0.consecutiveUnhealthyPolls
             }
-            let lastSent = state.lastAlertTimestampByCode[scopedKey] ?? 0
-            if (nowTs - lastSent) >= cooldown {
-                shouldSendAlert = true
-                state.lastAlertTimestampByCode[scopedKey] = nowTs
+
+            let isPurelyTransientSpike = snapshot.overallSeverity == .warning &&
+                snapshot.issues.allSatisfy { DiskHealthMonitor.transientWarningCodes.contains($0.code) }
+
+            if isPurelyTransientSpike && currentUnhealthyPolls < 2 {
+                // Defer single-poll transient latency/thermal spike alert until confirmed on 2nd consecutive poll
+                deferSeverityUpdateForHysteresis = true
+            } else {
+                for issue in snapshot.issues {
+                    let scopedKey = "\(driveKey):\(issue.code)"
+                    if let legacyTs = state.lastAlertTimestampByCode.removeValue(forKey: issue.code) {
+                        if state.lastAlertTimestampByCode[scopedKey] == nil {
+                            state.lastAlertTimestampByCode[scopedKey] = legacyTs
+                        }
+                    }
+                    let lastSent = state.lastAlertTimestampByCode[scopedKey] ?? 0
+                    if (nowTs - lastSent) >= cooldown {
+                        shouldSendAlert = true
+                        state.lastAlertTimestampByCode[scopedKey] = nowTs
+                    }
+                }
             }
         }
 
@@ -1053,8 +1087,6 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             }
 
             self.state.updateDriveState(key: driveKey) {
-                $0.consecutiveUnhealthyPolls += 1
-                $0.consecutiveHealthyPolls = 0
                 $0.lastNotifiedSeverity = snapshot.overallSeverity.rawValue
             }
 
@@ -1113,8 +1145,10 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             state.drives[driveKey] = driveState
         }
 
-        state.updateDriveState(key: driveKey) {
-            $0.lastOverallSeverity = snapshot.overallSeverity.rawValue
+        if !deferSeverityUpdateForHysteresis {
+            state.updateDriveState(key: driveKey) {
+                $0.lastOverallSeverity = snapshot.overallSeverity.rawValue
+            }
         }
 
         // Daily Digest at 09:00 (Per-Drive Scoped)
@@ -1159,9 +1193,7 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         let snapMount = snap.mountPoint
         let cfgVol = ConfigManager.shared.currentConfig.targetVolumePath ?? ""
         let target = targetMountOverride ?? (!snapMount.isEmpty ? snapMount : (!cfgVol.isEmpty ? cfgVol : (!snap.bsdName.isEmpty ? "/dev/\(snap.bsdName)" : "/")))
-        let capturedDriveKey = driveKeyOverride ?? (!snap.serialNumber.isEmpty
-            ? snap.serialNumber
-            : (!snap.bsdName.isEmpty ? snap.bsdName : (target.isEmpty ? "default" : target)))
+        let capturedDriveKey = driveKeyOverride ?? snap.driveKey
         isVerifyingInternal = true
         engineLock.unlock()
 

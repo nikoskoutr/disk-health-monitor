@@ -603,7 +603,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func sendTelegramReportNow() {
         DispatchQueue.global(qos: .userInitiated).async {
-            let snap = DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: false)
+            let multi = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: true, allowNotifications: false)
+            let selectedKey = DiskHealthMonitor.shared.selectedDashboardDriveKey
+            let snap = multi.disks.first(where: { $0.driveKey == selectedKey })
+                ?? DiskHealthMonitor.shared.currentSnapshot
+                ?? multi.primarySnapshot
+                ?? multi.disks[0]
             let html = TelegramNotifier.shared.formatReportHTML(snapshot: snap, title: "On-Demand Disk Health Report")
             TelegramNotifier.shared.sendMessage(htmlText: html, disableNotification: false)
         }

@@ -253,7 +253,7 @@ struct DiagnosticsAndExportTab: View {
                     ) {
                         Button(action: {
                             DiskHealthMonitor.shared.resetBaselines()
-                            _ = DiskHealthMonitor.shared.evaluateHealth(forceCanary: false, allowNotifications: false)
+                            _ = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: false, allowNotifications: false)
                             viewModel.diagnosticsStatusMsg = "Baselines and persistent state reset to clean defaults."
                         }) {
                             Text("Reset Baselines")

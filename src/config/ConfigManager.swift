@@ -589,32 +589,75 @@ final class ConfigManager: ObservableObject, @unchecked Sendable {
     }
 
     private let logLock = NSLock()
-    private let maxLogFileBytes: UInt64 = 5 * 1024 * 1024 // 5 MB
+    private let maxLogFileBytes: Int64 = 5 * 1024 * 1024 // 5 MB
+    private var lastLoggedMessage: String = ""
+    private var lastLoggedTimestamp: Date = .distantPast
+    private var isParentDirVerified: Bool = false
 
-    func log(_ message: String) {
+    static func redactSensitiveLogText(_ text: String) -> String {
+        var sanitized = text
+        sanitized = sanitized.replacingOccurrences(
+            of: "bot[0-9]{5,}:[A-Za-z0-9_-]{15,}",
+            with: "bot<REDACTED_TOKEN>",
+            options: .regularExpression
+        )
+        sanitized = sanitized.replacingOccurrences(
+            of: "(?<![A-Za-z0-9])[0-9]{6,}:[A-Za-z0-9_-]{20,}",
+            with: "<REDACTED_TOKEN>",
+            options: .regularExpression
+        )
+        sanitized = sanitized.replacingOccurrences(
+            of: "https?://[^\\s\"']+/webhooks/[^\\s\"']+",
+            with: "https://<REDACTED_WEBHOOK_URL>",
+            options: .regularExpression
+        )
+        sanitized = sanitized.replacingOccurrences(
+            of: "https?://hooks\\.slack\\.com/services/[^\\s\"']+",
+            with: "https://hooks.slack.com/services/<REDACTED>",
+            options: .regularExpression
+        )
+        return sanitized
+    }
+
+    func log(_ message: String, deduplicateBurstWindow: TimeInterval = 2.0) {
         logLock.lock()
         defer { logLock.unlock() }
 
-        let line = "[\(isoTimestampFormatter.string(from: Date()))] \(message)\n"
+        let redactedMessage = ConfigManager.redactSensitiveLogText(message)
+        let now = Date()
+        if deduplicateBurstWindow > 0,
+           redactedMessage == lastLoggedMessage,
+           now.timeIntervalSince(lastLoggedTimestamp) < deduplicateBurstWindow {
+            return
+        }
+        lastLoggedMessage = redactedMessage
+        lastLoggedTimestamp = now
+
+        let line = "[\(isoTimestampFormatter.string(from: now))] \(redactedMessage)\n"
         guard let data = line.data(using: .utf8) else { return }
 
-        let fm = FileManager.default
-        let parentDir = (logFilePath as NSString).deletingLastPathComponent
-        if !fm.fileExists(atPath: parentDir) {
-            try? fm.createDirectory(atPath: parentDir, withIntermediateDirectories: true)
+        if !isParentDirVerified {
+            let fm = FileManager.default
+            let parentDir = (logFilePath as NSString).deletingLastPathComponent
+            if !fm.fileExists(atPath: parentDir) {
+                try? fm.createDirectory(atPath: parentDir, withIntermediateDirectories: true)
+            }
+            isParentDirVerified = true
         }
 
-        if fm.fileExists(atPath: logFilePath) {
-            if let attrs = try? fm.attributesOfItem(atPath: logFilePath),
-               let fileSize = attrs[.size] as? UInt64,
-               fileSize > maxLogFileBytes {
+        var fd = open(logFilePath, O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        if fd >= 0 {
+            let currentSize = lseek(fd, 0, SEEK_END)
+            if currentSize > maxLogFileBytes {
+                close(fd)
+                let fm = FileManager.default
                 let rotatedPath = "\(logFilePath).1"
                 try? fm.removeItem(atPath: rotatedPath)
                 try? fm.moveItem(atPath: logFilePath, toPath: rotatedPath)
+                fd = open(logFilePath, O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
             }
         }
 
-        let fd = open(logFilePath, O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
         if fd >= 0 {
             fchmod(fd, 0o600)
             data.withUnsafeBytes { ptr in

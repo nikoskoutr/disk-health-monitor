@@ -9,10 +9,10 @@ This directory manages configuration resolution, user preferences, environment o
 ### [`ConfigManager.swift`](ConfigManager.swift)
 
 #### 1. `DiskHealthConfig`
-Codable schema managing 20 runtime parameters and alert thresholds:
-- **Targeting & Probing**: `targetVolumePath`, `targetDeviceQuery`, `requiredSubpaths`, `enableActiveCanary`, `pollIntervalSeconds`.
+Codable schema managing 23 runtime parameters and alert thresholds:
+- **Targeting & Probing**: `targetVolumePath`, `targetDeviceQuery`, `monitorAllDisks`, `monitoredTargets`, `requiredSubpaths`, `enableActiveCanary`, `pollIntervalSeconds`.
 - **Thresholds**: `tempWarningCelsius` (58°C), `tempCriticalCelsius` (68°C), `diskUsedWarningPercent` (85%), `diskUsedCriticalPercent` (93%), `minFreeSpaceWarningGB` (30 GB), `minFreeSpaceCriticalGB` (15 GB), `minExpectedUsbSpeedBps` (5 Gbps).
-- **Notifications & Integrations**: `enableNativeNotifications`, `enableCriticalSoundAlert`, `telegramBotToken`, `telegramChatId`, `webhookUrl`, `alertScriptPath`, `alertCooldownSeconds` (3600s).
+- **Notifications & Security**: `enableNativeNotifications`, `enableCriticalSoundAlert`, `useKeychainStorage`, `telegramBotToken`, `telegramChatId`, `webhookUrl`, `alertScriptPath`, `alertCooldownSeconds` (3600s).
 - **Diagnostics**: `scheduledVerifyIntervalHours` (0 = manual).
 
 #### 2. Configuration Precedence Hierarchy
@@ -29,6 +29,6 @@ Configuration values resolve in strict priority order (highest to lowest):
 - **Profile Import**: `importConfigFile(at:)` validates and merges external configuration JSON profiles without overwriting Keychain credentials.
 
 #### 4. Thread-Safe Structured Logging
-- Appends timestamped events (`[YYYY-MM-DD HH:MM:SS] message`) to `logs/health.log`.
+- Appends timestamped events (`[YYYY-MM-DD HH:MM:SS] message`) to `logs/health.log` after automatically redacting Telegram bot tokens and webhook URLs and deduplicating identical burst messages within a 2-second window.
 - Uses atomic POSIX flags `O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC` with `0600` permissions protected by `NSLock`.
-- Automatically rotates log files when exceeding 5 MB, maintaining a single compressed backup (`health.log.1`).
+- Checks file size via `lseek(fd, 0, SEEK_END)` on the open file descriptor and rotates log files when exceeding 5 MB (`health.log.1`).

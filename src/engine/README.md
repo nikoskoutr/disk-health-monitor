@@ -12,10 +12,10 @@ This directory contains the central monitoring engine (`DiskHealthMonitor`) that
 - All state reads, telemetry evaluations, baseline updates, and file updates are synchronized via an internal `engineLock` (`NSRecursiveLock`).
 - Observes `NSWorkspace.willSleepNotification` and `didWakeNotification`: pauses background evaluation during sleep and applies an 8-second dark-wake settle grace period on wake before querying external storage buses.
 
-#### 2. Active Canary I/O Probe
-- On mounted writable volumes, writes a unique probe payload to `<mountPath>/.disk_health_canary_<uid>` with POSIX flags `O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC` and permissions `0600`.
-- Forces an `fsync(2)` to reach physical media, verifies data integrity on read-back, unlinks the probe, and measures round-trip latency (`canaryLatencyMs`).
-- Features a 50 ms settle retry on transient external bus hiccups and directs probes to `/System/Volumes/Data/private/tmp` when monitoring the sealed APFS root (`/`).
+#### 2. Active Canary I/O Probe (`CanaryProbeService.swift`)
+- On mounted writable volumes, writes a 4096-byte page-aligned payload to `<mountPath>/.disk_health_canary_<uid>` in-place with POSIX flags `O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC`, permissions `0600`, and `fcntl(fd, F_NOCACHE, 1)`.
+- Flushes volatile drive cache to physical media via `fcntl(fd, F_FULLFSYNC)` (with automatic fallback to `fsync(2)`), verifies data integrity on read-back, unlinks external mount probes, and measures round-trip latency (`canaryLatencyMs`).
+- Features a 50 ms settle retry on transient external bus hiccups and directs probes to `~/.config/disk-health-monitor` when monitoring the sealed APFS root (`/`).
 
 #### 3. Multi-Tier Physical Surface Scanner (`runSurfaceReadScan`)
 Performs non-destructive direct media read verification with unbuffered I/O:

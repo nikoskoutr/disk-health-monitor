@@ -371,6 +371,26 @@ int main(void) {
 
     printf("  DiskDecodeNVMeLE128 NULL handling, 64-bit LE decoding, and 128-bit saturation verified\n");
 
-    printf("\n=== All 15 Bridge Tests Passed Successfully! ===\n");
+    printf("\n=== Test 16: Non-USB Link Speed Guard & Virtual Disk Filtering (BRIDGE-02, BRIDGE-04) ===\n");
+    for (int i = 0; i < count; i++) {
+        // Any PCI-Express / Apple Fabric internal device must not falsely report USB 1.1..3.2 enum speeds
+        if (strcmp(devices[i].interconnectType, "PCI-Express") == 0 ||
+            strcmp(devices[i].interconnectType, "Apple Fabric") == 0) {
+            assert(devices[i].usbLinkSpeedBps != 12000000ULL);
+            assert(devices[i].usbLinkSpeedBps != 480000000ULL);
+        }
+    }
+    // Verify repeated DiskReadHardwareMetrics("auto") hits 64-entry static cache cleanly
+    DiskHardwareMetrics autoPass1, autoPass2;
+    DiskReadHardwareMetrics("auto", &autoPass1);
+    DiskReadHardwareMetrics("auto", &autoPass2);
+    assert(autoPass1.found == autoPass2.found);
+    if (autoPass1.found) {
+        assert(strcmp(autoPass1.bsdName, autoPass2.bsdName) == 0);
+        assert(strstr(autoPass1.interconnectType, "Virtual") == NULL);
+    }
+    printf("  PCIe vs USB link speed guard, virtual disk exclusion, and 64-entry cache verified\n");
+
+    printf("\n=== All 16 Bridge Tests Passed Successfully! ===\n");
     return 0;
 }

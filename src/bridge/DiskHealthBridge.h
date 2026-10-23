@@ -79,13 +79,14 @@ typedef struct {
 /**
  * @brief Reads low-level hardware telemetry and SMART health metrics for a target drive.
  * 
- * If @p targetIdentifier is NULL or "auto", the bridge queries the root filesystem ("/")
- * to resolve the primary system boot drive. Otherwise, it accepts a BSD name (e.g. "disk0",
+ * If @p targetIdentifier is NULL or "auto", the bridge selects the first connected external
+ * physical disk, falling back to the primary internal system disk if no external drive is attached.
+ * Otherwise, it accepts a mount path (e.g. "/Volumes/MySSD"), a BSD name (e.g. "disk0",
  * "/dev/disk0"), a product model substring, or a serial number.
  * 
- * @param targetIdentifier Targeted drive identifier, or NULL for auto-detection.
+ * @param targetIdentifier Targeted drive identifier, or NULL/"auto" for auto-detection.
  * @param outMetrics Pointer to pre-allocated DiskHardwareMetrics struct to populate.
- * @note Thread-safe. Uses an internal 32-entry static cache for invariant hardware strings.
+ * @note Thread-safe. Uses an internal 64-entry static cache for invariant hardware strings.
  */
 void DiskReadHardwareMetrics(const char *targetIdentifier, DiskHardwareMetrics *outMetrics);
 

@@ -29,7 +29,8 @@ disk-health
 *~
 
 # Project Directories Ignored from Version Control
-scripts/
+scripts/*
+!scripts/generate_app_icon.swift
 logs/
 
 # Secrets & Environment Overrides

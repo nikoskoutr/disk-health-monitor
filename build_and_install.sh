@@ -145,9 +145,9 @@ cat << EOF > "${CONTENTS_DIR}/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.5.0</string>
+    <string>2.6.0</string>
     <key>CFBundleVersion</key>
-    <string>8</string>
+    <string>9</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>NSPrincipalClass</key>
@@ -158,6 +158,8 @@ cat << EOF > "${CONTENTS_DIR}/Info.plist"
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Disk Health Monitor sends optional storage health webhook notifications to local network endpoints configured by the user.</string>
 </dict>
 </plist>
 EOF
@@ -207,7 +209,9 @@ echo "   CLI symlink: ${SCRIPT_DIR}/disk-health"
 # 6. Service Installation
 if [[ "${1:-}" == "--install-service" ]] || [[ "${1:-}" == "--service" ]]; then
     echo "📦 Installing LaunchAgent into ${LAUNCH_AGENTS_DIR}..."
+    CONFIG_LOG_DIR="${HOME}/.config/disk-health-monitor/logs"
     mkdir -p "${LAUNCH_AGENTS_DIR}"
+    mkdir -p "${CONFIG_LOG_DIR}"
     mkdir -p "${SCRIPT_DIR}/logs"
 
     cat << EOF > "${SERVICE_PLIST}"
@@ -223,7 +227,7 @@ if [[ "${1:-}" == "--install-service" ]] || [[ "${1:-}" == "--service" ]]; then
         <string>--menubar</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>${SCRIPT_DIR}</string>
+    <string>${CONFIG_LOG_DIR}</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -232,9 +236,9 @@ if [[ "${1:-}" == "--install-service" ]] || [[ "${1:-}" == "--service" ]]; then
         <false/>
     </dict>
     <key>StandardOutPath</key>
-    <string>${SCRIPT_DIR}/logs/launchd.out.log</string>
+    <string>${CONFIG_LOG_DIR}/launchd.out.log</string>
     <key>StandardErrorPath</key>
-    <string>${SCRIPT_DIR}/logs/launchd.err.log</string>
+    <string>${CONFIG_LOG_DIR}/launchd.err.log</string>
     <key>ProcessType</key>
     <string>Interactive</string>
 </dict>

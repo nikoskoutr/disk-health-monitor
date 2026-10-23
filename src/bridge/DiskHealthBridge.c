@@ -48,15 +48,29 @@ typedef struct {
     uint64_t linkSpeedBps;          ///< Normalized interconnect bandwidth in bits per second.
 } StaticDeviceCacheEntry;
 
-#define MAX_STATIC_CACHE_ENTRIES 32
+#define MAX_STATIC_CACHE_ENTRIES 64
 
-/** Ring buffer storing static hardware descriptors for up to 32 block storage devices. */
+/** Ring buffer storing static hardware descriptors for up to 64 block storage devices. */
 static StaticDeviceCacheEntry sStaticCache[MAX_STATIC_CACHE_ENTRIES];
 static int sStaticCacheCount = 0;
 static int sStaticCacheNextIdx = 0;
 
 /** Mutex synchronizing access to sStaticCache across concurrent engine / CLI threads. */
 static pthread_mutex_t sStaticCacheMutex = PTHREAD_MUTEX_INITIALIZER;
+
+/** Returns true if the device represents a virtual disk image or file-backed volume. */
+static bool isVirtualDiskDevice(const DiskHardwareMetrics *metrics) {
+    if (!metrics) return false;
+    if (strcasestr(metrics->interconnectType, "Virtual") != NULL ||
+        strcasestr(metrics->interconnectType, "File") != NULL) {
+        return true;
+    }
+    if (strcasestr(metrics->productName, "Disk Image") != NULL ||
+        strcasestr(metrics->vendorName, "Disk Image") != NULL) {
+        return true;
+    }
+    return false;
+}
 
 // ============================================================================
 // MARK: - CoreFoundation Safe Extraction Helpers
@@ -203,25 +217,59 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
             break;
         }
 
+        // Parent service class name check for bus type classification (evaluated before LinkSpeed)
+        bool isUSBParent = false;
+        io_name_t className;
+        if (IOObjectGetClass(parent, className) == KERN_SUCCESS) {
+            if (strstr(className, "USB") != NULL) {
+                strlcpy(outMetrics->interconnectType, "USB", sizeof(outMetrics->interconnectType));
+                outMetrics->isInternal = false;
+                isUSBParent = true;
+            } else if (strstr(className, "Thunderbolt") != NULL) {
+                strlcpy(outMetrics->interconnectType, "Thunderbolt", sizeof(outMetrics->interconnectType));
+                outMetrics->isInternal = false;
+            } else if (strstr(className, "DiskImage") != NULL || strstr(className, "HDIX") != NULL) {
+                strlcpy(outMetrics->interconnectType, "Virtual Interface", sizeof(outMetrics->interconnectType));
+                outMetrics->isInternal = false;
+            } else if (outMetrics->interconnectType[0] == '\0') {
+                if (strstr(className, "AHCI") != NULL || strstr(className, "SATA") != NULL) {
+                    strlcpy(outMetrics->interconnectType, "SATA", sizeof(outMetrics->interconnectType));
+                } else if (strstr(className, "PCI") != NULL || strstr(className, "NVMe") != NULL) {
+                    strlcpy(outMetrics->interconnectType, "PCI-Express", sizeof(outMetrics->interconnectType));
+                }
+            }
+        }
+
         // Interconnect Link Speed
+        bool isExplicitUSBProperty = false;
         CFTypeRef linkSpeedRef = IORegistryEntryCreateCFProperty(parent, CFSTR("UsbLinkSpeed"), kCFAllocatorDefault, 0);
+        if (linkSpeedRef) {
+            isExplicitUSBProperty = true;
+        } else {
+            linkSpeedRef = IORegistryEntryCreateCFProperty(parent, CFSTR("Device Speed"), kCFAllocatorDefault, 0);
+            if (linkSpeedRef) {
+                isExplicitUSBProperty = true;
+            }
+        }
         if (!linkSpeedRef) {
             linkSpeedRef = IORegistryEntryCreateCFProperty(parent, CFSTR("LinkSpeed"), kCFAllocatorDefault, 0);
         }
         if (!linkSpeedRef) {
             linkSpeedRef = IORegistryEntryCreateCFProperty(parent, CFSTR("Link Speed"), kCFAllocatorDefault, 0);
         }
-        if (!linkSpeedRef) {
-            linkSpeedRef = IORegistryEntryCreateCFProperty(parent, CFSTR("Device Speed"), kCFAllocatorDefault, 0);
-        }
         if (linkSpeedRef) {
             if (CFGetTypeID(linkSpeedRef) == CFNumberGetTypeID() && outMetrics->linkSpeedBps == 0) {
                 int64_t signedSpeed = 0;
                 if (CFNumberGetValue((CFNumberRef)linkSpeedRef, kCFNumberSInt64Type, &signedSpeed) && signedSpeed > 0) {
-                    uint64_t bps = DiskNormalizeLinkSpeedToBps((uint64_t)signedSpeed);
-                    if (bps > 0) {
-                        outMetrics->linkSpeedBps = bps;
-                        outMetrics->usbLinkSpeedBps = bps;
+                    bool isUSBContext = isExplicitUSBProperty || isUSBParent ||
+                                        (strcasecmp(outMetrics->interconnectType, "USB") == 0);
+                    // Only apply 1..5 USB enum code table when in a USB context; raw bps (>= 1 Mbps) always pass through
+                    if (isUSBContext || signedSpeed >= 1000000LL) {
+                        uint64_t bps = DiskNormalizeLinkSpeedToBps((uint64_t)signedSpeed);
+                        if (bps > 0) {
+                            outMetrics->linkSpeedBps = bps;
+                            outMetrics->usbLinkSpeedBps = bps;
+                        }
                     }
                 }
             }
@@ -242,24 +290,6 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
                     strlcpy(outMetrics->usbSerialNumber, outMetrics->serialNumber, sizeof(outMetrics->usbSerialNumber));
                 }
                 CFRelease(serialRef);
-            }
-        }
-
-        // Parent service class name check for bus type classification
-        io_name_t className;
-        if (IOObjectGetClass(parent, className) == KERN_SUCCESS) {
-            if (strstr(className, "USB") != NULL) {
-                strlcpy(outMetrics->interconnectType, "USB", sizeof(outMetrics->interconnectType));
-                outMetrics->isInternal = false;
-            } else if (strstr(className, "Thunderbolt") != NULL) {
-                strlcpy(outMetrics->interconnectType, "Thunderbolt", sizeof(outMetrics->interconnectType));
-                outMetrics->isInternal = false;
-            } else if (outMetrics->interconnectType[0] == '\0') {
-                if (strstr(className, "AHCI") != NULL || strstr(className, "SATA") != NULL) {
-                    strlcpy(outMetrics->interconnectType, "SATA", sizeof(outMetrics->interconnectType));
-                } else if (strstr(className, "PCI") != NULL || strstr(className, "NVMe") != NULL) {
-                    strlcpy(outMetrics->interconnectType, "PCI-Express", sizeof(outMetrics->interconnectType));
-                }
             }
         }
 
@@ -493,7 +523,7 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
             }
         }
 
-        if (hasEntryId && outMetrics->bsdName[0] != '\0') {
+        if (hasEntryId && outMetrics->bsdName[0] != '\0' && !isVirtualDiskDevice(outMetrics)) {
             pthread_mutex_lock(&sStaticCacheMutex);
             StaticDeviceCacheEntry *slot = NULL;
             for (int i = 0; i < sStaticCacheCount; i++) {
@@ -743,14 +773,15 @@ void DiskReadHardwareMetrics(const char *targetIdentifier, DiskHardwareMetrics *
         populateMetricsFromBlockStorageDevice(service, &metrics);
 
         if (metrics.found) {
-            if (!foundFirst) {
+            bool isVirtual = isVirtualDiskDevice(&metrics);
+            if (!foundFirst && !isVirtual) {
                 firstDevice = metrics;
                 foundFirst = true;
             }
 
             if (isAuto) {
-                // In auto mode, prefer external device
-                if (!metrics.isInternal) {
+                // In auto mode, prefer physical external device (skip virtual DMGs)
+                if (!metrics.isInternal && !isVirtual) {
                     *outMetrics = metrics;
                     IOObjectRelease(service);
                     break;

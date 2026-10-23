@@ -1,8 +1,9 @@
 ---
 doc: code-review-and-roadmap
 project: disk-health-monitor
-reviewed_version: 2.4.0 (build 7)
+reviewed_version: 2.6.0 (build 9)
 reviewed_at: 2026-10-23
+status: All P0–P3 findings remediated & verified in v2.6.0 (16 C tests + 48 Swift tests + 5 CLI stages)
 scope: all files in src/, tests/, build_and_install.sh, .github/workflows, README.md, ARCHITECTURE.md, logs/ (runtime evidence)
 format: each finding = {id, severity, area, files, evidence, impact, fix, acceptance}
 severity_scale: P0 (correctness/security, fix first) > P1 (wrong results/noisy alerts) > P2 (robustness/UX) > P3 (polish/docs)
