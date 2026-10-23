@@ -36,3 +36,11 @@ Wraps `DateFormatter` with an internal `NSLock` and `en_US_POSIX` locale to prev
 - `isoTimestampFormatter`: `yyyy-MM-dd HH:mm:ss`
 - `shortTimeFormatter`: `HH:mm:ss`
 - `shortMonthDateFormatter`: `MMM d, HH:mm`
+
+#### 6. Fleet Aggregation (`MultiDiskHealthSnapshot`)
+Aggregates simultaneous per-drive `DiskHealthSnapshot` evaluations with fleet-wide `overallSeverity`, `worstHealthScore`, `averageHealthScore`, `totalIssuesCount`, and deterministic `primarySnapshot` selection (highest severity, tie-broken by lowest health score).
+
+---
+
+### [`DiskHealthError.swift`](DiskHealthError.swift)
+Defines the structured `DiskHealthError` (`LocalizedError`, `Equatable`, `Sendable`) enum covering hardware discovery, mount inspection, canary probes, surface scans, volume verification, configuration validation, Keychain status codes, atomic file writes, and alert script execution.

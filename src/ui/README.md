@@ -36,25 +36,28 @@ Renders the visual telemetry popover card in the status bar menu:
 
 ---
 
-### 3. [`SettingsView.swift`](SettingsView.swift)
-Implements the 5-tab native macOS Preferences window (`⌘,`, 700×650 pt):
+### 3. [`SettingsView.swift`](SettingsView.swift), [`SettingsViewModel.swift`](SettingsViewModel.swift) & [`tabs/`](tabs/)
+Implements the 6-tab native macOS Preferences window (`⌘,`, 720×660 pt):
 
-1. **General Tab**:
-   - Drive selector (mounted volumes, physical BSD devices, or automatic detection).
+1. **General Tab ([`GeneralSettingsTab.swift`](tabs/GeneralSettingsTab.swift))**:
+   - Monitor All Connected Disks toggle, single-drive selector, and multi-disk target checklist.
    - LaunchAgent background service toggle with clean `launchctl` state synchronization.
-   - Polling frequency slider (`10s` to `3600s`).
-2. **Thresholds Tab**:
+   - Polling frequency slider (`10s` to `300s`), active canary toggle, and scheduled verification interval.
+2. **Thresholds Tab ([`ThresholdsSettingsTab.swift`](tabs/ThresholdsSettingsTab.swift))**:
    - Temperature warning/critical thresholds (°C).
    - Capacity usage ceiling (%) and minimum free space floors (GB).
    - Minimum expected USB bus speed selector and alert cooldown duration.
-3. **Notifications Tab**:
+3. **Notifications Tab ([`NotificationsSettingsTab.swift`](tabs/NotificationsSettingsTab.swift))**:
    - Native Notification Center toggle and audible critical audio beeps.
+   - Opt-in macOS Keychain storage onboarding and status indicator.
    - Telegram Bot API configuration with `SecureField` token entry and live test message dispatcher.
    - Universal Webhook URL (Discord, Slack, Mattermost, Home Assistant) with live test button.
    - Custom alert shell script hook path with validation runner.
-4. **S.M.A.R.T. Tab (`⌘I`)**:
+4. **S.M.A.R.T. Tab ([`SmartInspectorTab.swift`](tabs/SmartInspectorTab.swift), `⌘I`)**:
    - Dedicated hardware inspector displaying all raw NVMe registers, normalized attributes, composite temperatures, critical warning bits, daily write burn rate ($\text{TB/day}$), and projected remaining lifespan.
-5. **Diagnostics Tab**:
+5. **Statistics & Insights Tab ([`StatisticsTab.swift`](tabs/StatisticsTab.swift))**:
+   - Multi-disk fleet comparison cards, endurance projections, I/O latency & throughput metrics, and capacity breakdown across all monitored drives.
+6. **Diagnostics Tab ([`DiagnosticsAndExportTab.swift`](tabs/DiagnosticsAndExportTab.swift))**:
    - **Multi-Tier Surface Scan**: Selectable modes (`quick`, `standard`, `full`) with live progress, file counts, throughput ($\text{MB/s}$), and cancel support.
-   - **Volume Verification**: Manual `diskutil verifyVolume` execution and periodic scheduling interval picker (Off, 6h, 12h, 24h, 48h, 7 days).
+   - **Volume Verification**: Manual `diskutil verifyVolume` execution and baseline reset actions.
    - **Profiles & Reports**: One-click actions to Export HTML Report (`⌘H`), Export Diagnostic JSON, Export Sanitized Config, and Import Config Profile.
