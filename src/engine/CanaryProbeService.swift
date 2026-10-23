@@ -1,13 +1,33 @@
+// ============================================================================
+// File: CanaryProbeService.swift
+// Module: Layer 3 (Telemetry & Domain Engine)
+// Purpose: Non-destructive active I/O verification executing sector-aligned (512B)
+//          in-place pwrite, fsync, and pread probes with F_NOCACHE.
+// Concurrency: Thread-safe via NSLock; memoizes results in a 300s cache per mount.
+// ============================================================================
+
 import Foundation
 import Darwin
 
+// MARK: - Canary Models
+
+/// Outcome of an active write/read canary probe on a storage volume.
 struct CanaryProbeResult: Sendable, Equatable {
+    /// True if the write-fsync-readback cycle completed successfully.
     let ok: Bool
+
+    /// End-to-end I/O latency in milliseconds.
     let latencyMs: Double
+
+    /// Descriptive error string if probe failed, or empty string on success.
     let error: String
 }
 
+// MARK: - Canary Probe Service
+
+/// Service managing non-destructive active media health verification.
 final class CanaryProbeService: @unchecked Sendable {
+    /// Shared singleton instance.
     static let shared = CanaryProbeService()
 
     private let lock = NSLock()
@@ -15,12 +35,20 @@ final class CanaryProbeService: @unchecked Sendable {
 
     init() {}
 
+    /// Clears the 300-second per-mount canary result cache.
     func resetCache() {
         lock.lock()
         cacheByMount.removeAll()
         lock.unlock()
     }
 
+    /// Executes an active canary probe on target volume, using 300s cache unless forced.
+    ///
+    /// - Parameters:
+    ///   - targetMount: Filesystem mount path (e.g. "/" or "/Volumes/T7").
+    ///   - force: If true, bypasses the 300s cache and executes live I/O immediately.
+    ///   - nowTs: Current Unix epoch timestamp for cache expiration.
+    /// - Returns: `CanaryProbeResult` indicating probe health and I/O latency.
     func runCanaryCheck(targetMount: String, force: Bool, nowTs: TimeInterval = Date().timeIntervalSince1970) -> CanaryProbeResult {
         let key = targetMount.isEmpty ? "/" : targetMount
         lock.lock()
@@ -33,7 +61,7 @@ final class CanaryProbeService: @unchecked Sendable {
 
         var result = performSingleCanaryPass(targetMount: targetMount)
         if !result.ok || result.latencyMs > 300.0 {
-            usleep(50_000) // 50ms settle before retry pass
+            usleep(50_000) // 50ms settle before retry pass to filter transient scheduler spikes
             let secondPass = performSingleCanaryPass(targetMount: targetMount)
             if secondPass.ok || !result.ok {
                 result = secondPass
@@ -47,6 +75,7 @@ final class CanaryProbeService: @unchecked Sendable {
         return result
     }
 
+    /// Synchronous variant returning a Result type for CLI or export callers.
     func runCanaryCheckResult(targetMount: String, force: Bool, nowTs: TimeInterval = Date().timeIntervalSince1970) -> Result<CanaryProbeResult, DiskHealthError> {
         let res = runCanaryCheck(targetMount: targetMount, force: force, nowTs: nowTs)
         if res.ok {
@@ -56,9 +85,22 @@ final class CanaryProbeService: @unchecked Sendable {
         }
     }
 
+    // MARK: - Internal I/O Execution
+
+    /// Executes a single in-place 512B write/fsync/readback pass.
+    ///
+    /// Invariants:
+    /// 1. Sealed Root Redirection: If targetMount == "/", probes via `/System/Volumes/Data/private/tmp`
+    ///    to avoid guaranteed EROFS on macOS sealed system snapshot volumes.
+    /// 2. Sector Alignment (UAT2-01): Buffer is padded to 512 bytes so `fcntl(F_NOCACHE)`
+    ///    never fails with EINVAL on FAT32/exFAT kernel drivers.
+    /// 3. In-Place I/O: Uses `O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC` to mutate the same
+    ///    hidden `.disk_health_canary_<uid>` file, eliminating APFS B-tree directory node churn.
+    /// 4. Orphan Self-Healing (UAT2-04): If an orphaned canary file with 0400 permissions was left
+    ///    behind from an interrupted pass, attempts `unlink()` and retries `open()`.
+    /// 5. Read-Only Fallback: On write-restricted or read-only mounts (EROFS/EACCES), falls back
+    ///    to active `opendir()` + `readdir()` directory traversal.
     private func performSingleCanaryPass(targetMount: String) -> CanaryProbeResult {
-        // On sealed macOS root volume ("/"), probe via /System/Volumes/Data/private/tmp if writable,
-        // avoiding guaranteed EROFS on "/.disk_health_canary"
         let effectiveDir: String
         if targetMount == "/" && FileManager.default.isWritableFile(atPath: "/System/Volumes/Data/private/tmp") {
             effectiveDir = "/System/Volumes/Data/private/tmp"
@@ -78,7 +120,6 @@ final class CanaryProbeService: @unchecked Sendable {
         }
 
         let start = DispatchTime.now()
-        // Use O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC for in-place verification without directory B-tree churn
         var fd = open(canaryPath, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
         var openErrno = (fd < 0) ? errno : 0
         if fd < 0 && (openErrno == EACCES || openErrno == EPERM) {

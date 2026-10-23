@@ -1,3 +1,11 @@
+// ============================================================================
+// File: SettingsViewModel.swift
+// Module: Layer 4 (Presentation / Settings UI)
+// Purpose: Observable view model coordinating two-way SwiftUI state bindings,
+//          launchd plist generation, alert testing, and ephemeral window lifecycle.
+// Concurrency: Main thread (@MainActor / ObservableObject); debounced async sync.
+// ============================================================================
+
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
@@ -5,6 +13,7 @@ import Darwin
 
 // MARK: - Native macOS Settings Window Controller & ViewModel (Cmd+,)
 
+/// Coordinates user settings state, credential changes, and hardware actions.
 final class SettingsViewModel: ObservableObject {
     @Published var selectedTab: Int = 0
     @Published var availableDisks: [(id: String, name: String)] = []

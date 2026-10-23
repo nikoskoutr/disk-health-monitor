@@ -1,8 +1,17 @@
+// ============================================================================
+// File: SingleInstanceLock.swift
+// Module: Layer 2 (Infrastructure & Security)
+// Purpose: Single-instance menu bar coordinator utilizing non-blocking POSIX flock
+//          with O_NOFOLLOW symlink attack protection and process PID recording.
+// Concurrency: Thread-safe via NSLock (stateLock).
+// ============================================================================
+
 import Foundation
 import Darwin
 
 // MARK: - Single-Instance Menu Bar Lock (POSIX flock)
 
+/// Enforces exclusive single-instance menu bar execution while allowing concurrent CLI operations.
 final class SingleInstanceLock: @unchecked Sendable {
     static let shared = SingleInstanceLock()
     private var lockFd: Int32 = -1

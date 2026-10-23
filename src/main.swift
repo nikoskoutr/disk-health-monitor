@@ -1,8 +1,15 @@
+// ============================================================================
+// File: main.swift
+// Module: Layer 4 (Presentation / CLI Router & Entrypoint)
+// Purpose: Main Mach-O entrypoint providing dual-mode routing: synchronous headless
+//          CLI command execution or POSIX_SPAWN_SETSID terminal detachment into Menu Bar.
+// Concurrency: Main thread; signal handlers trap SIGINT and SIGTERM.
+// ============================================================================
+
 import Foundation
 import AppKit
 import SwiftUI
 import Darwin
-
 
 // MARK: - CLI Argument Processing & Entry Point
 

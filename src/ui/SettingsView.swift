@@ -1,8 +1,17 @@
+// ============================================================================
+// File: SettingsView.swift
+// Module: Layer 4 (Presentation / Settings UI)
+// Purpose: Multi-tab macOS settings container hosting the 6 modular configuration
+//          and inspection views with custom native toolbar navigation.
+// Concurrency: Main thread (@MainActor / SwiftUI view graph).
+// ============================================================================
+
 import SwiftUI
 import AppKit
 
 // MARK: - Native macOS Settings Window Container (Cmd+,)
 
+/// Primary Settings window container hosting 6 modular preference tabs.
 struct SettingsView: View {
     @ObservedObject var configMgr = ConfigManager.shared
     @ObservedObject var viewModel: SettingsViewModel

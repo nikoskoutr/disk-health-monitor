@@ -1,8 +1,17 @@
+// ============================================================================
+// File: SettingsComponents.swift
+// Module: Layer 4 (Presentation / Settings UI)
+// Purpose: Reusable SwiftUI styling components (SettingsCard, MetricPill, FormRow)
+//          providing consistent macOS design language across all preference tabs.
+// Concurrency: Main thread (@MainActor / SwiftUI view graph).
+// ============================================================================
+
 import SwiftUI
 import AppKit
 
 // MARK: - Reusable Settings UI Components
 
+/// Standardized card container grouping related preference controls.
 struct SettingsCard<Content: View>: View {
     let title: String
     let icon: String

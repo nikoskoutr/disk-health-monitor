@@ -1,7 +1,16 @@
+// ============================================================================
+// File: TelegramNotifier.swift
+// Module: Layer 3 (Telemetry & Domain Engine / Notifications)
+// Purpose: Dispatches asynchronous HTML alert messages and diagnostic summaries
+//          via Telegram Bot API with token redaction and ephemeral URLSession.
+// Concurrency: Thread-safe singleton using asynchronous URLSession tasks.
+// ============================================================================
+
 import Foundation
 
 // MARK: - Telegram Notifier
 
+/// Asynchronous notification adapter for dispatching alerts via the Telegram Bot API.
 final class TelegramNotifier {
     static let shared = TelegramNotifier()
     private let session: URLSession

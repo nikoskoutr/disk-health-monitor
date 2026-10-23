@@ -1,7 +1,16 @@
+// ============================================================================
+// File: HealthRules.swift
+// Module: Layer 3 (Telemetry & Domain Engine)
+// Purpose: Pure functional domain health rules evaluating storage reliability,
+//          SMART metrics, thermal boundaries, driver latency, and canary I/O.
+// Concurrency: Thread-safe, side-effect-free Sendable value types.
+// ============================================================================
+
 import Foundation
 
 // MARK: - Health Evaluation Context & Outcome
 
+/// Immutable snapshot of telemetry and environmental context passed to each HealthRule.
 struct HealthEvaluationContext: Sendable {
     let nowTs: TimeInterval
     let config: DiskHealthConfig

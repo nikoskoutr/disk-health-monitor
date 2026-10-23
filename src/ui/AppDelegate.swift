@@ -1,3 +1,11 @@
+// ============================================================================
+// File: AppDelegate.swift
+// Module: Layer 4 (Presentation / Menu Bar UI)
+// Purpose: NSApplicationDelegate managing NSStatusItem, status bar badge caching,
+//          sleep/wake power notifications, mount listeners, and background timers.
+// Concurrency: Main AppKit run loop (@MainActor); background I/O decoupled.
+// ============================================================================
+
 import AppKit
 import SwiftUI
 import Darwin
@@ -5,6 +13,7 @@ import Combine
 
 // MARK: - AppKit Menu Bar Controller & Dynamic Drive Selection
 
+/// Coordinates the NSStatusItem lifecycle, menu popups, and hardware event listeners.
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var pollTimer: Timer?

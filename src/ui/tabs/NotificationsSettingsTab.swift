@@ -1,6 +1,15 @@
+// ============================================================================
+// File: NotificationsSettingsTab.swift
+// Module: Layer 4 (Presentation / Settings Tabs)
+// Purpose: Notification preferences tab configuring macOS banners, sound alerts,
+//          Telegram bot credentials, Webhook endpoints, and custom alert scripts.
+// Concurrency: Main thread (@MainActor / SwiftUI view graph).
+// ============================================================================
+
 import SwiftUI
 import AppKit
 
+/// Preference tab managing alerting channels (macOS notifications, Telegram, Webhooks, Scripts).
 struct NotificationsSettingsTab: View {
     @ObservedObject var configMgr: ConfigManager
     @ObservedObject var viewModel: SettingsViewModel

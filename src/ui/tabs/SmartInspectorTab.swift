@@ -1,6 +1,15 @@
+// ============================================================================
+// File: SmartInspectorTab.swift
+// Module: Layer 4 (Presentation / Settings Tabs)
+// Purpose: Hardware inspection tab displaying comprehensive NVMe S.M.A.R.T.
+//          attributes, controller counters, wear percentages, and IOBlockStorage stats.
+// Concurrency: Main thread (@MainActor / SwiftUI view graph).
+// ============================================================================
+
 import SwiftUI
 import AppKit
 
+/// Inspection tab rendering detailed raw NVMe SMART metrics and IOBlockStorageDriver statistics.
 struct SmartInspectorTab: View {
     @ObservedObject var monitor: DiskHealthMonitor
 

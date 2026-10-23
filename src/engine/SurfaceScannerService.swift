@@ -1,11 +1,24 @@
+// ============================================================================
+// File: SurfaceScannerService.swift
+// Module: Layer 3 (Telemetry & Domain Engine)
+// Purpose: Non-destructive direct I/O media surface scanning and benchmark engine
+//          using fcntl(F_NOCACHE) with cancellation tokens and live ETA tracking.
+// Concurrency: Executes on background utility queue; cancellation token thread-safe.
+// ============================================================================
+
 import Foundation
 import Darwin
 
+// MARK: - Surface Scanner Service
+
+/// Service providing non-destructive direct media read benchmarking and bad-sector detection.
 final class SurfaceScannerService: @unchecked Sendable {
+    /// Shared singleton instance.
     static let shared = SurfaceScannerService()
 
     init() {}
 
+    /// Operational tiers for non-destructive surface scanning.
     enum SurfaceScanMode: String, CaseIterable, Identifiable, Hashable, Sendable {
         case quick = "quick"
         case standard = "standard"

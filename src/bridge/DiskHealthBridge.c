@@ -1,3 +1,12 @@
+// ============================================================================
+// File: DiskHealthBridge.c
+// Module: Layer 1 (C11 / IOKit Hardware Bridge)
+// Purpose: Implementation of Darwin IOKit storage registry traversal,
+//          NVMe S.M.A.R.T. extraction, driver statistics, and mount resolution.
+// Concurrency: Thread-safe; internal memoization ring buffer synchronized via
+//              pthread_mutex_t (sStaticCacheMutex).
+// ============================================================================
+
 #define _GNU_SOURCE
 #include "DiskHealthBridge.h"
 #include <stdio.h>
@@ -15,25 +24,53 @@
 #include <IOKit/storage/IOMedia.h>
 #include <IOKit/storage/nvme/NVMeSMARTLibExternal.h>
 
+// ============================================================================
+// MARK: - Static Registry Cache Structures & Invariants
+// ============================================================================
+
+/**
+ * @brief Invariant hardware metadata memoized per IORegistryEntryID.
+ * 
+ * Hardware descriptors (vendor, product, serial number, interconnect type, link speed)
+ * never change during the lifetime of a physical device attachment. Memoizing them
+ * saves expensive CoreFoundation string allocations on every 30-second poll cycle.
+ */
 typedef struct {
-    uint64_t entryId;
-    char productName[128];
-    char vendorName[128];
-    char productRevision[64];
-    char bsdName[64];
-    char serialNumber[128];
-    char interconnectType[64];
-    bool isInternal;
-    bool isRemovable;
-    uint64_t linkSpeedBps;
+    uint64_t entryId;               ///< Unique 64-bit kernel registry identifier (IORegistryEntryGetRegistryEntryID).
+    char productName[128];          ///< Model name (e.g. "Samsung PSSD T7").
+    char vendorName[128];           ///< Vendor name (e.g. "Samsung").
+    char productRevision[64];       ///< Firmware version string.
+    char bsdName[64];               ///< BSD name at initial capture (e.g. "disk6").
+    char serialNumber[128];         ///< Hardware serial number.
+    char interconnectType[64];      ///< Bus type (e.g. "USB", "PCI-Express").
+    bool isInternal;                ///< Internal storage indicator.
+    bool isRemovable;               ///< Removable media indicator.
+    uint64_t linkSpeedBps;          ///< Normalized interconnect bandwidth in bits per second.
 } StaticDeviceCacheEntry;
 
 #define MAX_STATIC_CACHE_ENTRIES 32
+
+/** Ring buffer storing static hardware descriptors for up to 32 block storage devices. */
 static StaticDeviceCacheEntry sStaticCache[MAX_STATIC_CACHE_ENTRIES];
 static int sStaticCacheCount = 0;
 static int sStaticCacheNextIdx = 0;
+
+/** Mutex synchronizing access to sStaticCache across concurrent engine / CLI threads. */
 static pthread_mutex_t sStaticCacheMutex = PTHREAD_MUTEX_INITIALIZER;
 
+// ============================================================================
+// MARK: - CoreFoundation Safe Extraction Helpers
+// ============================================================================
+
+/**
+ * @brief Safely copies a CFStringRef into a null-terminated UTF-8 C string buffer.
+ * 
+ * @param strRef CoreFoundation object reference to extract from.
+ * @param buf Target C string buffer.
+ * @param bufLen Size of target buffer in bytes.
+ * @return True if conversion succeeded; false otherwise.
+ * @note Always guarantees null-termination if bufLen > 0.
+ */
 static bool copyCFStringRefToBuffer(CFTypeRef strRef, char *buf, size_t bufLen) {
     if (!strRef || !buf || bufLen == 0) return false;
     if (CFGetTypeID(strRef) != CFStringGetTypeID()) return false;
@@ -45,6 +82,15 @@ static bool copyCFStringRefToBuffer(CFTypeRef strRef, char *buf, size_t bufLen) 
     return false;
 }
 
+/**
+ * @brief Extracts a string property from a CFDictionary by key.
+ * 
+ * @param dict CFDictionaryRef containing properties.
+ * @param key CFStringRef property key.
+ * @param buf Target output buffer.
+ * @param bufLen Target buffer capacity in bytes.
+ * @return True if string was found and copied; false otherwise.
+ */
 static bool getCFString(CFDictionaryRef dict, CFStringRef key, char *buf, size_t bufLen) {
     if (!dict || !key || !buf || bufLen == 0) return false;
     buf[0] = '\0';
@@ -52,6 +98,15 @@ static bool getCFString(CFDictionaryRef dict, CFStringRef key, char *buf, size_t
     return copyCFStringRefToBuffer(val, buf, bufLen);
 }
 
+/**
+ * @brief Safely extracts a 64-bit unsigned integer from a CFDictionary.
+ * 
+ * Clamps negative signed values to 0 to prevent unsigned wrap-around.
+ * 
+ * @param dict CFDictionaryRef to inspect.
+ * @param key CFStringRef key to look up.
+ * @return 64-bit unsigned integer, or 0 if missing or negative.
+ */
 static uint64_t getCFNumberU64(CFDictionaryRef dict, CFStringRef key) {
     if (!dict || !key) return 0;
     CFTypeRef val = CFDictionaryGetValue(dict, key);
@@ -72,24 +127,28 @@ uint64_t DiskExtractCFNumberU64(CFDictionaryRef dict, CFStringRef key) {
     return getCFNumberU64(dict, key);
 }
 
+// ============================================================================
+// MARK: - NVMe & Bus Decoding Utilities
+// ============================================================================
+
 uint64_t DiskDecodeNVMeLE128(const uint8_t *bytes) {
     if (!bytes) return 0;
     uint64_t low = 0;
     uint64_t high = 0;
     memcpy(&low, bytes, sizeof(uint64_t));
     memcpy(&high, bytes + sizeof(uint64_t), sizeof(uint64_t));
+    // If upper 64 bits contain non-zero data, saturate at UINT64_MAX
     if (CFSwapInt64LittleToHost(high) != 0) {
         return UINT64_MAX;
     }
     return CFSwapInt64LittleToHost(low);
 }
 
-// Safely decode 128-bit little-endian NVMe counter to 64-bit unsigned integer
+/** Internal wrapper for decoding NVMe 128-bit little-endian fields. */
 static uint64_t nvmeLe128ToU64(const void *ptr) {
     return DiskDecodeNVMeLE128((const uint8_t *)ptr);
 }
 
-// Convert raw 16-bit NVMe composite temperature to Celsius with boundary validation
 int32_t DiskConvertNVMeTemperature(uint16_t tempRaw) {
     if (tempRaw >= 233 && tempRaw <= 423) {
         // Valid Kelvin range: 233K (-40°C) to 423K (+150°C)
@@ -98,12 +157,11 @@ int32_t DiskConvertNVMeTemperature(uint16_t tempRaw) {
         // Non-standard controller reporting directly in Celsius
         return (int32_t)tempRaw;
     } else {
-        // 0 (unreported) or corrupt/sentinel value (e.g. 0xFFFF): default to safe nominal 0
+        // 0 (unreported) or corrupt/sentinel value (e.g. 0xFFFF): default to nominal 0
         return 0;
     }
 }
 
-// Convert IOKit USB "Device Speed" enum or raw bps to bits per second
 uint64_t DiskNormalizeLinkSpeedToBps(uint64_t rawSpeed) {
     switch (rawSpeed) {
         case 0: return 0;
@@ -113,11 +171,24 @@ uint64_t DiskNormalizeLinkSpeedToBps(uint64_t rawSpeed) {
         case 4: return 10000000000ULL;    // USB 3.1/3.2 SuperSpeed+ (10 Gbps)
         case 5: return 20000000000ULL;    // USB 3.2 Gen 2x2 (20 Gbps)
         default:
-            return rawSpeed;
+            return rawSpeed;              // Native bps rate pass-through
     }
 }
 
-// Inspect parent chain for USB / Thunderbolt / Interconnect properties
+// ============================================================================
+// MARK: - Registry Inspection: Parent & Child Traversal
+// ============================================================================
+
+/**
+ * @brief Inspects parent chain in kIOServicePlane for USB / Thunderbolt / bus properties.
+ * 
+ * Invariant (SYS-06): USB and Thunderbolt controllers sit higher in the registry tree
+ * than local PCIe/NVMe bridges. We allow USB / Thunderbolt parent nodes to take precedence
+ * so external Thunderbolt NVMe enclosures are correctly identified as external buses.
+ * 
+ * @param entry Starting io_registry_entry_t to inspect.
+ * @param outMetrics Metrics struct to update with link speed, serial number, and interconnect.
+ */
 static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwareMetrics *outMetrics) {
     io_registry_entry_t current = entry;
     IOObjectRetain(current);
@@ -132,7 +203,7 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
             break;
         }
 
-        // Link speed
+        // Interconnect Link Speed
         CFTypeRef linkSpeedRef = IORegistryEntryCreateCFProperty(parent, CFSTR("UsbLinkSpeed"), kCFAllocatorDefault, 0);
         if (!linkSpeedRef) {
             linkSpeedRef = IORegistryEntryCreateCFProperty(parent, CFSTR("LinkSpeed"), kCFAllocatorDefault, 0);
@@ -157,7 +228,7 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
             CFRelease(linkSpeedRef);
         }
 
-        // Serial number
+        // Hardware Serial Number
         if (outMetrics->serialNumber[0] == '\0') {
             CFTypeRef serialRef = IORegistryEntryCreateCFProperty(parent, CFSTR("USB Serial Number"), kCFAllocatorDefault, 0);
             if (!serialRef) {
@@ -174,7 +245,7 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
             }
         }
 
-        // Check if parent service name indicates bus type
+        // Parent service class name check for bus type classification
         io_name_t className;
         if (IOObjectGetClass(parent, className) == KERN_SUCCESS) {
             if (strstr(className, "USB") != NULL) {
@@ -198,7 +269,20 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
     IOObjectRelease(current);
 }
 
-// Inspect children for IOBlockStorageDriver statistics and physical whole-disk BSD Name (e.g. disk0, disk4)
+/**
+ * @brief Recursively traverses children to locate IOBlockStorageDriver stats and whole-disk BSD Name.
+ * 
+ * Invariants:
+ * 1. APFS Subtree Pruning (C11-01): AppleAPFSMedia nodes declare Whole = true. If we descended into
+ *    virtual APFS containers, they would overwrite the physical drive's bsdName (e.g. disk0 -> disk3).
+ *    Therefore, AppleAPFSContainerScheme, AppleAPFSContainer, AppleAPFSMedia, and AppleAPFSVolume
+ *    are strictly pruned at the entry point of the recursive traversal.
+ * 2. Bounded Recursion: Depth is strictly clamped to <= 12 levels to prevent stack overflow.
+ * 
+ * @param entry Starting io_registry_entry_t.
+ * @param outMetrics Metrics struct to populate.
+ * @param depth Current recursion depth (0 to 12).
+ */
 static void inspectChildrenForDriverStatsRecursive(io_registry_entry_t entry, DiskHardwareMetrics *outMetrics, int depth) {
     if (!entry || !outMetrics || depth > 12) return;
     if (outMetrics->statsValid && outMetrics->bsdName[0] != '\0') return;
@@ -274,11 +358,27 @@ static void inspectChildrenForDriverStatsRecursive(io_registry_entry_t entry, Di
     IOObjectRelease(childIter);
 }
 
+/** Helper starting recursive child driver inspection at depth 0. */
 static void inspectChildrenForDriverStats(io_registry_entry_t service, DiskHardwareMetrics *outMetrics) {
     inspectChildrenForDriverStatsRecursive(service, outMetrics, 0);
 }
 
-// Populate all hardware, SMART, driver, and bus metrics from an IOBlockStorageDevice service
+// ============================================================================
+// MARK: - Metrics Extraction & NVMe S.M.A.R.T. Plugin
+// ============================================================================
+
+/**
+ * @brief Populates hardware descriptors, NVMe SMART, and driver stats for an IOBlockStorageDevice.
+ * 
+ * Invariant (UAT2-03): sStaticCache memoizes invariant strings (productName, vendorName, serialNumber,
+ * interconnectType, linkSpeedBps) but DELIBERATELY OMITS restoring bsdName on cache hit.
+ * inspectChildrenForDriverStats is ALWAYS called on every evaluation to query the live IOMedia child
+ * node. This prevents the stale BSD name defect when an external USB disk is replugged and assigned
+ * a new BSD name (e.g. disk6 -> disk7) while retaining its same serial number.
+ * 
+ * @param service io_service_t pointing to an IOBlockStorageDevice.
+ * @param outMetrics Pointer to DiskHardwareMetrics to populate.
+ */
 static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHardwareMetrics *outMetrics) {
     if (!service || !outMetrics) return;
     memset(outMetrics, 0, sizeof(DiskHardwareMetrics));
@@ -366,7 +466,7 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
         inspectParentsForBusProperties(service, outMetrics);
     }
 
-    // 4. Inspect children for driver statistics and BSD Name
+    // 4. Always inspect children for driver statistics and live BSD Name (UAT2-03)
     inspectChildrenForDriverStats(service, outMetrics);
 
     if (!cacheHit) {
@@ -456,7 +556,7 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
                 outMetrics->availableSpareThreshold = data.AVAILABLE_SPARE_THRESHOLD;
                 outMetrics->percentageUsed = data.PERCENTAGE_USED;
 
-                // Safely convert full 128-bit little-endian fields to 64-bit integers
+                // Safely convert full 128-bit little-endian fields to 64-bit integers with saturation
                 outMetrics->dataUnitsRead = nvmeLe128ToU64(&data.DATA_UNITS_READ);
                 outMetrics->dataUnitsWritten = nvmeLe128ToU64(&data.DATA_UNITS_WRITTEN);
                 outMetrics->hostReadCommands = nvmeLe128ToU64(&data.HOST_READ_COMMANDS);
@@ -478,7 +578,21 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
     }
 }
 
-// Recursively traverse all parents in kIOServicePlane (handles APFS containers with multiple parent links)
+// ============================================================================
+// MARK: - Block Device Resolution (APFS Containers, Slices & Snapshots)
+// ============================================================================
+
+/**
+ * @brief Recursively traverses parent chain in kIOServicePlane to locate physical IOBlockStorageDevice.
+ * 
+ * Handles complex APFS synthesized container schemes where virtual volumes link through
+ * intermediate AppleAPFSContainer and AppleAPFSMedia nodes before reaching the physical partition.
+ * 
+ * @param entry Starting io_registry_entry_t.
+ * @param depth Current recursion depth (clamped to <= 24).
+ * @return Retained io_service_t pointing to the physical IOBlockStorageDevice, or 0 if not found.
+ * @note Caller is responsible for releasing returned io_service_t via IOObjectRelease.
+ */
 static io_service_t findParentBlockStorageDeviceRecursive(io_registry_entry_t entry, int depth) {
     if (!entry || depth > 24) return 0;
 
@@ -505,7 +619,13 @@ static io_service_t findParentBlockStorageDeviceRecursive(io_registry_entry_t en
     return foundDevice;
 }
 
-// Locate physical IOBlockStorageDevice for an APFS volume, snapshot, partition slice, or whole-disk BSD name
+/**
+ * @brief Locates the physical IOBlockStorageDevice for a whole disk, slice, or APFS snapshot.
+ * 
+ * @param rawBsdName BSD name (e.g. "disk0", "disk3s1", "/dev/disk4", "com.apple.os.update-...@/dev/disk3s1s1").
+ * @return Retained io_service_t pointing to physical device, or 0 if unresolved.
+ * @note Caller must release returned service via IOObjectRelease.
+ */
 static io_service_t findBlockStorageDeviceByBSDName(const char *rawBsdName) {
     if (!rawBsdName || rawBsdName[0] == '\0') return 0;
     if (strlen(rawBsdName) >= MAXPATHLEN) return 0;
@@ -538,7 +658,10 @@ static io_service_t findBlockStorageDeviceByBSDName(const char *rawBsdName) {
     return blockDevice;
 }
 
-// Enumerate all block storage devices on the system
+// ============================================================================
+// MARK: - Public API Implementations
+// ============================================================================
+
 int DiskListAllDevices(DiskHardwareMetrics *outArray, int maxCount) {
     if (!outArray || maxCount <= 0) return 0;
 
@@ -563,7 +686,6 @@ int DiskListAllDevices(DiskHardwareMetrics *outArray, int maxCount) {
     return count;
 }
 
-// Read metrics for a targeted identifier (mount path, BSD name, substring query, or auto)
 void DiskReadHardwareMetrics(const char *targetIdentifier, DiskHardwareMetrics *outMetrics) {
     if (!outMetrics) return;
     memset(outMetrics, 0, sizeof(DiskHardwareMetrics));
@@ -666,7 +788,6 @@ void DiskReadHardwareMetrics(const char *targetIdentifier, DiskHardwareMetrics *
     }
 }
 
-// Find the mounted filesystem path for a block storage device (resolving APFS containers and partitions)
 bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint, size_t maxLen) {
     if (!deviceBsdName || deviceBsdName[0] == '\0' || !outMountPoint || maxLen == 0) return false;
     outMountPoint[0] = '\0';
@@ -678,6 +799,7 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
     io_service_t targetDev = findBlockStorageDeviceByBSDName(cleanTargetBsd);
     if (targetDev == 0) return false;
 
+    // Fast path (OPT2-02): Stack-allocated buffer for up to 64 mount points eliminates heap allocation.
     struct statfs stackFs[64];
     struct statfs *fsList = stackFs;
     int allocMounts = 64;

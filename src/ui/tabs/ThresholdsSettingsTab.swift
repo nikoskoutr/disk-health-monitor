@@ -1,6 +1,15 @@
+// ============================================================================
+// File: ThresholdsSettingsTab.swift
+// Module: Layer 4 (Presentation / Settings Tabs)
+// Purpose: Thresholds tab for configuring temperature limits, disk usage percentages,
+//          free space reserves, and minimum expected USB interconnect bandwidth.
+// Concurrency: Main thread (@MainActor / SwiftUI view graph).
+// ============================================================================
+
 import SwiftUI
 import AppKit
 
+/// Preference tab managing health thresholds (temperature, space, wear, link speed).
 struct ThresholdsSettingsTab: View {
     @ObservedObject var configMgr: ConfigManager
 

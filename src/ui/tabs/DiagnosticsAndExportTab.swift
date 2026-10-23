@@ -1,6 +1,15 @@
+// ============================================================================
+// File: DiagnosticsAndExportTab.swift
+// Module: Layer 4 (Presentation / Settings Tabs)
+// Purpose: Diagnostics tab managing JSON/HTML report generation, non-destructive
+//          surface scanning controls, volume verification, and log rotation.
+// Concurrency: Main thread (@MainActor / SwiftUI view graph).
+// ============================================================================
+
 import SwiftUI
 import AppKit
 
+/// Preference tab managing diagnostics exports, surface scans, and verification.
 struct DiagnosticsAndExportTab: View {
     @ObservedObject var configMgr: ConfigManager
     @ObservedObject var viewModel: SettingsViewModel

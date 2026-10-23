@@ -1,7 +1,16 @@
+// ============================================================================
+// File: WebhookNotifier.swift
+// Module: Layer 3 (Telemetry & Domain Engine / Notifications)
+// Purpose: Universal multi-platform webhook dispatcher supporting Discord, Slack,
+//          Home Assistant, and generic JSON endpoints with URL redaction.
+// Concurrency: Thread-safe singleton using asynchronous URLSession tasks.
+// ============================================================================
+
 import Foundation
 
 // MARK: - Universal Multi-Platform Webhook Notifier (Discord, Slack, Home Assistant, Generic JSON)
 
+/// Asynchronous notification adapter dispatching webhook payloads across multiple services.
 final class WebhookNotifier {
     static let shared = WebhookNotifier()
     private let session: URLSession

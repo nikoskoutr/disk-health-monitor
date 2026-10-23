@@ -1,5 +1,14 @@
+// ============================================================================
+// File: DiskHealthError.swift
+// Module: Layer 2 (Infrastructure & Models)
+// Purpose: Strongly-typed domain error enumeration covering hardware queries,
+//          filesystem states, canary failures, keychain security, and alerts.
+// Concurrency: Sendable value type.
+// ============================================================================
+
 import Foundation
 
+/// Strongly typed errors produced across storage telemetry, configuration, and alerting.
 enum DiskHealthError: LocalizedError, Sendable, Equatable {
     case hardwareNotFound(query: String)
     case volumeNotMounted(path: String)

@@ -1,8 +1,17 @@
+// ============================================================================
+// File: DashboardMenuView.swift
+// Module: Layer 4 (Presentation / Menu Bar UI)
+// Purpose: SwiftUI popover view rendering real-time telemetry gauges, drive health
+//          indicators, wear metrics, and multi-disk horizontal pill selector.
+// Concurrency: Main thread (@MainActor / SwiftUI view graph).
+// ============================================================================
+
 import SwiftUI
 import AppKit
 
 // MARK: - SwiftUI Menu Bar Dashboard Card
 
+/// Compact menu bar dashboard card displaying real-time metrics and quick actions.
 struct DashboardMenuView: View {
     @ObservedObject var monitor: DiskHealthMonitor
     @ObservedObject var configMgr: ConfigManager = ConfigManager.shared

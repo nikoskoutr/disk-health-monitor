@@ -1,6 +1,17 @@
+// ============================================================================
+// File: TelemetryProvider.swift
+// Module: Layer 3 (Telemetry & Domain Engine)
+// Purpose: Abstract storage telemetry protocol and implementations bridging
+//          IOKit C11 hardware metrics, VFS statfs, and mock fault injection.
+// Concurrency: Sendable value types and thread-safe providers.
+// ============================================================================
+
 import Foundation
 import Darwin
 
+// MARK: - Telemetry Models
+
+/// Filesystem allocation metrics captured via Darwin `statfs` and APFS purgeable accounting.
 struct FilesystemMountMetrics: Sendable, Equatable {
     var isMounted: Bool = false
     var mountPoint: String = ""
@@ -13,19 +24,38 @@ struct FilesystemMountMetrics: Sendable, Equatable {
     var usedPercent: Double = 0.0
 }
 
+/// Descriptive volume information for UI pickers and CLI listings.
 struct MountedVolumeInfo: Sendable, Equatable {
     let path: String
     let displayName: String
 }
 
+// MARK: - Telemetry Provider Protocol
+
+/// Unified interface abstracting storage telemetry acquisition for testing and production.
 protocol DiskTelemetryProvider: Sendable {
+    /// Reads hardware descriptors and SMART metrics for a query or auto-detection.
     func readHardwareMetrics(query: String) -> DiskHardwareMetrics
+
+    /// Enumerates all attached physical block storage devices.
     func listAllDevices(maxCount: Int) -> [DiskHardwareMetrics]
+
+    /// Lists all local mounted volumes excluding special filesystems.
     func listLocalMountedVolumes() -> [MountedVolumeInfo]
+
+    /// Resolves the mount path for a Darwin BSD name (e.g. "disk0" -> "/").
     func findMountPoint(forBsdName bsdName: String) -> String?
+
+    /// Gathers filesystem capacity, free space, and purgeable bytes via `statfs`.
     func inspectFilesystem(mountPath: String) -> FilesystemMountMetrics
+
+    /// Verifies existence and access of required subdirectories on a volume.
     func checkSubpaths(mountPoint: String, isMounted: Bool, requiredSubpaths: [String]) -> [String: Bool]
+
+    /// Executes or retrieves a cached active 512B canary write/read probe.
     func runCanaryProbe(targetMount: String, force: Bool, nowTs: TimeInterval) -> CanaryProbeResult
+
+    /// Retrieves host thermal pressure state from `ProcessInfo`.
     func currentHostThermalState() -> ProcessInfo.ThermalState
 }
 

@@ -1,9 +1,19 @@
+// ============================================================================
+// File: ConfigManager.swift
+// Module: Layer 2 (Infrastructure & Configuration)
+// Purpose: Manages 5-tier configuration precedence (CLI > Env > .env > config.json > Defaults),
+//          atomic 0600 persistence, credential masking, and 5MB rotating event logging.
+// Concurrency: Thread-safe via NSRecursiveLock (configLock) and NSLock (logLock).
+//              ObservableObject publishing synchronized to @MainActor.
+// ============================================================================
+
 import Foundation
 import Combine
 import Darwin
 
-// MARK: - Universal Configuration
+// MARK: - Configuration Model
 
+/// Strongly-typed configuration schema representing all tunable monitoring parameters.
 struct DiskHealthConfig: Codable, Equatable {
     var targetVolumePath: String? = nil
     var targetDeviceQuery: String? = nil

@@ -1,9 +1,18 @@
+// ============================================================================
+// File: MacOSNotifier.swift
+// Module: Layer 3 (Telemetry & Domain Engine / Notifications)
+// Purpose: Adapter for native macOS UserNotifications banners and sound alerts
+//          with bundle detection ensuring safe operation when run outside .app.
+// Concurrency: Main thread / UNUserNotificationCenter completion callbacks.
+// ============================================================================
+
 import Foundation
 import UserNotifications
 import AppKit
 
 // MARK: - Native macOS Notifications
 
+/// Manages native macOS UserNotifications desktop banners and alerts.
 final class MacOSNotifier: NSObject, UNUserNotificationCenterDelegate {
     static let shared = MacOSNotifier()
 

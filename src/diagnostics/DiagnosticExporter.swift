@@ -1,7 +1,16 @@
+// ============================================================================
+// File: DiagnosticExporter.swift
+// Module: Layer 3 (Telemetry & Domain Engine / Diagnostics)
+// Purpose: Compiles comprehensive sanitized JSON diagnostic bundles and standalone
+//          styled HTML health/RMA reports with reverse-seek UTF-8 log tailing.
+// Concurrency: Thread-safe Sendable singleton.
+// ============================================================================
+
 import Foundation
 
 // MARK: - Diagnostic Exporter
 
+/// Compiles system storage diagnostics into sanitized JSON bundles or standalone HTML reports.
 final class DiagnosticExporter: @unchecked Sendable {
     static let shared = DiagnosticExporter()
 

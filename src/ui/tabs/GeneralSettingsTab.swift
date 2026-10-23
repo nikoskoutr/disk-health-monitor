@@ -1,6 +1,15 @@
+// ============================================================================
+// File: GeneralSettingsTab.swift
+// Module: Layer 4 (Presentation / Settings Tabs)
+// Purpose: General configuration tab managing target disk selection, multi-disk
+//          monitoring toggle, subpaths, and background launchd daemon setup.
+// Concurrency: Main thread (@MainActor / SwiftUI view graph).
+// ============================================================================
+
 import SwiftUI
 import AppKit
 
+/// Preference tab managing drive targets, background launchd agent, and polling interval.
 struct GeneralSettingsTab: View {
     @ObservedObject var configMgr: ConfigManager
     @ObservedObject var viewModel: SettingsViewModel

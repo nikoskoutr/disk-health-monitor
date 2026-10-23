@@ -1,10 +1,20 @@
+// ============================================================================
+// File: DiskHealthMonitor.swift
+// Module: Layer 3 (Telemetry & Domain Engine)
+// Purpose: Central coordinator for single-disk and fleet-wide storage evaluations,
+//          throughput delta tracking, baseline state persistence, and alert dispatch.
+// Concurrency: Thread-safe via NSRecursiveLock (engineLock). UI state synchronized
+//              via Combine @Published on @MainActor.
+// ============================================================================
+
 import Foundation
 import Darwin
 import Combine
 import AppKit
 
-// MARK: - Core Health Monitor Engine
+// MARK: - Types & Constants
 
+/// Synchronized ISO 8601 date formatter for daily summary digest comparisons.
 private let dailyDigestDateFormatter: SynchronizedDateFormatter = {
     let df = SynchronizedDateFormatter()
     df.locale = Locale(identifier: "en_US_POSIX")
@@ -12,7 +22,10 @@ private let dailyDigestDateFormatter: SynchronizedDateFormatter = {
     return df
 }()
 
+/// Primary telemetry coordinator orchestrating multi-disk evaluations,
+/// active canary write/read probes, volume verification, and alert delivery.
 final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
+    /// Shared singleton instance.
     static let shared = DiskHealthMonitor()
 
     typealias SurfaceScanMode = SurfaceScannerService.SurfaceScanMode
@@ -73,6 +86,14 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         self.lastSavedState = loaded
     }
 
+    /// Switches the currently inspected drive in the Menu Bar popover and Settings tabs.
+    ///
+    /// - Parameter key: Unique drive identifier (`serialNumber`, `bsdName`, or `mountPoint`).
+    /// - Note: Concurrency Optimization (SYS2-02): If invoked from the main UI thread,
+    ///   updates `@Published` properties immediately for instantaneous UI responsiveness,
+    ///   and dispatches `engineLock` synchronization asynchronously to a `.userInitiated`
+    ///   background queue. This prevents the main AppKit run loop from beachballing
+    ///   if a background poll is currently holding `engineLock` during `statfs` or `fsync`.
     func selectDashboardDrive(key: String) {
         let applySelectionToLock = { [weak self] in
             guard let self = self else { return }
@@ -625,6 +646,14 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         return snapshot
     }
 
+    /// Evaluates health, performance, and SMART telemetry across all monitored physical storage devices.
+    ///
+    /// - Parameters:
+    ///   - forceCanary: If true, forces an immediate active 512B write probe bypassing the 300s cache.
+    ///   - allowNotifications: If true, dispatches alert notifications for detected issues violating cooldowns.
+    ///   - telemetryProvider: Optional custom telemetry provider (used for unit test fault injection).
+    /// - Returns: Aggregated `MultiDiskHealthSnapshot` summarizing fleet health and per-drive metrics.
+    /// - Note: Concurrency: Synchronized via `engineLock`. Dispatches `@Published` updates to main thread.
     @discardableResult
     func evaluateAllMonitoredDisks(
         forceCanary: Bool = false,
@@ -801,6 +830,13 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         return multi
     }
 
+    /// Backward-compatible single-drive evaluation returning the snapshot of the selected drive.
+    ///
+    /// - Parameters:
+    ///   - forceCanary: If true, forces an immediate active 512B write probe bypassing the 300s cache.
+    ///   - allowNotifications: If true, dispatches alert notifications for detected issues violating cooldowns.
+    ///   - telemetryProvider: Optional custom telemetry provider (used for unit test fault injection).
+    /// - Returns: `DiskHealthSnapshot` of the currently selected or primary dashboard drive.
     @discardableResult
     func evaluateHealth(
         forceCanary: Bool = false,
@@ -1021,6 +1057,12 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         _ = notificationGroup.wait(timeout: .now() + timeout)
     }
 
+    /// Executes the user-configured alert script synchronously with a timeout watchdog.
+    ///
+    /// - Parameter timeoutSec: Watchdog duration in seconds (default 15.0s).
+    /// - Returns: Success with stdout/stderr output, or DiskHealthError.
+    /// - Note: Invariant (PROC-PIPE-01): Strips sensitive secrets (TELEGRAM_BOT_TOKEN, WEBHOOK_URL)
+    ///   from child process environment and drains pipe file handle to prevent buffer deadlock.
     func testAlertScriptResult(timeoutSec: TimeInterval = 15.0) -> Result<String, DiskHealthError> {
         let rawScriptPath = ConfigManager.shared.resolvedAlertScriptPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rawScriptPath.isEmpty else {

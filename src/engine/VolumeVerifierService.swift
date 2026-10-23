@@ -1,11 +1,27 @@
+// ============================================================================
+// File: VolumeVerifierService.swift
+// Module: Layer 3 (Telemetry & Domain Engine)
+// Purpose: Asynchronous filesystem verification invoking /usr/sbin/diskutil verifyVolume
+//          with grandchild process tree termination (pkill -P) and exit classification.
+// Concurrency: Executes on background utility dispatch queue; thread-safe.
+// ============================================================================
+
 import Foundation
 import Darwin
 
+// MARK: - Volume Verifier Service
+
+/// Service running and classifying filesystem integrity verification passes.
 final class VolumeVerifierService: @unchecked Sendable {
+    /// Shared singleton instance.
     static let shared = VolumeVerifierService()
 
     init() {}
 
+    /// Determines if a diskutil verification failure is due to permissions or lock contention rather than corruption.
+    ///
+    /// - Parameter result: Standard output/error string from diskutil.
+    /// - Returns: True if failure is non-corruption related (e.g. error -69863 unprivileged).
     static func isNonCorruptionVerifyFailure(_ result: String) -> Bool {
         let lower = result.lowercased()
         return lower.contains("-69863") ||
@@ -23,6 +39,14 @@ final class VolumeVerifierService: @unchecked Sendable {
                lower.contains("volume is busy")
     }
 
+    /// Classifies exit code and terminal output from diskutil verifyVolume into a structured health status.
+    ///
+    /// - Parameters:
+    ///   - terminationStatus: Process exit status code from diskutil.
+    ///   - output: Captured stdout/stderr text.
+    ///   - didTimeout: True if the 180s watchdog killed the process.
+    ///   - timeStr: Formatted timestamp string for display.
+    /// - Returns: Tuple indicating (isHealthy, isSkipped, summaryText).
     static func classifyVolumeVerificationOutput(terminationStatus: Int32, output: String, didTimeout: Bool, timeStr: String) -> (isHealthy: Bool, isSkipped: Bool, summary: String) {
         if didTimeout {
             return (true, true, "Skipped (\(timeStr)): Verification timed out after 180s")
@@ -46,6 +70,16 @@ final class VolumeVerifierService: @unchecked Sendable {
         return (false, false, "Failed (\(timeStr)): \(detail)")
     }
 
+    /// Terminates a parent process and all child processes spawned by it (e.g. diskutil -> fsck_apfs).
+    ///
+    /// Invariant (SYS2-05): diskutil verifyVolume forks fsck_apfs, which inherits pipe handles.
+    /// If only diskutil is killed with SIGKILL, the pipe remains open in fsck_apfs and
+    /// pipe.fileHandleForReading.readToEnd() hangs indefinitely. We invoke /usr/bin/pkill -P
+    /// to eliminate the entire process group before signaling the parent.
+    ///
+    /// - Parameters:
+    ///   - pid: Parent process identifier.
+    ///   - signal: POSIX signal to deliver (e.g. SIGTERM, SIGKILL).
     static func terminateProcessAndChildren(pid: pid_t, signal: Int32) {
         guard pid > 0 else { return }
         let pkill = Process()
@@ -56,6 +90,12 @@ final class VolumeVerifierService: @unchecked Sendable {
         kill(pid, signal)
     }
 
+    /// Runs filesystem verification asynchronously on a background queue.
+    ///
+    /// - Parameters:
+    ///   - target: Volume mount path or device BSD name (e.g. "/" or "disk0s2").
+    ///   - timeoutSec: Watchdog timeout in seconds (default 180s).
+    ///   - completion: Callback receiving (isHealthy, summaryText).
     func runVolumeVerification(
         target: String,
         timeoutSec: Double = 180.0,

@@ -1,8 +1,17 @@
+// ============================================================================
+// File: StatisticsAndInsightsTab.swift
+// Module: Layer 4 (Presentation / Settings Tabs)
+// Purpose: Fleet analytics tab rendering multi-disk health cards, throughput gauges,
+//          endurance summaries, and detailed hardware comparison tables.
+// Concurrency: Main thread (@MainActor / SwiftUI view graph).
+// ============================================================================
+
 import SwiftUI
 import AppKit
 
 // MARK: - Native macOS Multi-Disk Statistics & Comparative Insights Tab
 
+/// Fleet insights tab comparing health, throughput, endurance, and bus speeds across all drives.
 struct StatisticsAndInsightsTab: View {
     @ObservedObject var monitor: DiskHealthMonitor
     @ObservedObject var configMgr: ConfigManager = ConfigManager.shared

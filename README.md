@@ -35,6 +35,9 @@ Directly built on **IOKit**, **DiskArbitration**, **CoreFoundation**, and **Secu
 
 ## System Architecture
 
+> [!TIP]
+> For the comprehensive, production-grade architectural specification including arc42 sections, C4 Model-as-Code diagrams, runtime sequence diagrams, lock hierarchies, and ADRs, consult the authoritative [System Architecture Specification](docs/ARCHITECTURE.md).
+
 ```text
 disk-health-monitor/
 ├── build_and_install.sh          # Build, test, packaging, and LaunchAgent installer script

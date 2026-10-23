@@ -1,3 +1,11 @@
+// ============================================================================
+// File: HealthModels.swift
+// Module: Layer 2 (Infrastructure & Models)
+// Purpose: Core domain data structures, health snapshots, fleet aggregations,
+//          severity classifications, and thread-safe POSIX formatters.
+// Concurrency: Pure Sendable value types and synchronized formatters.
+// ============================================================================
+
 import Foundation
 
 // MARK: - Application Version & Architecture Information

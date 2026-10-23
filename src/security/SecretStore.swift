@@ -1,9 +1,18 @@
+// ============================================================================
+// File: SecretStore.swift
+// Module: Layer 2 (Infrastructure & Security)
+// Purpose: Opt-in macOS Keychain state machine and hardened atomic 0600 POSIX file
+//          writer preventing unprompted modal dialogs during headless/daemon execution.
+// Concurrency: Thread-safe via NSRecursiveLock (lock).
+// ============================================================================
+
 import Foundation
 import Security
 import Darwin
 
 // MARK: - POSIX Atomic File Writer with Hardened 0600 Permissions
 
+/// Atomic file replacement utility enforcing POSIX 0600 permissions and O_NOFOLLOW symlink safety.
 enum AtomicFileWriter {
     @discardableResult
     static func writeRestricted(data: Data, toPath path: String, permissions: mode_t = 0o600) -> Bool {
