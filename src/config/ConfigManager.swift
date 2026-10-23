@@ -68,24 +68,57 @@ struct DiskHealthConfig: Codable, Equatable {
         alertScriptPath = try container.decodeIfPresent(String.self, forKey: .alertScriptPath) ?? defaults.alertScriptPath
         useKeychainStorage = try container.decodeIfPresent(Bool.self, forKey: .useKeychainStorage) ?? defaults.useKeychainStorage
     }
+
+    func validated() -> DiskHealthConfig {
+        var v = self
+        if v.pollIntervalSeconds < 5.0 { v.pollIntervalSeconds = 5.0 }
+        if v.alertCooldownSeconds < 0.0 { v.alertCooldownSeconds = 0.0 }
+        v.tempWarningCelsius = max(20, min(v.tempWarningCelsius, 110))
+        v.tempCriticalCelsius = max(v.tempWarningCelsius + 1, min(v.tempCriticalCelsius, 120))
+        v.diskUsedWarningPercent = max(10.0, min(v.diskUsedWarningPercent, 98.0))
+        v.diskUsedCriticalPercent = max(v.diskUsedWarningPercent + 1.0, min(v.diskUsedCriticalPercent, 99.9))
+        v.minFreeSpaceWarningGB = max(1.0, v.minFreeSpaceWarningGB)
+        v.minFreeSpaceCriticalGB = max(0.5, min(v.minFreeSpaceCriticalGB, v.minFreeSpaceWarningGB - 0.5))
+        return v
+    }
 }
 
 final class ConfigManager: ObservableObject, @unchecked Sendable {
     static let shared = ConfigManager()
 
     let configDir: String
+    let stateDir: String
     let logsDir: String
 
-    var stateFilePath: String { "\(logsDir)/state.json" }
+    var stateFilePath: String { "\(stateDir)/state.json" }
     var configFilePath: String { "\(configDir)/config.json" }
     var logFilePath: String { "\(logsDir)/health.log" }
-    var latestJsonPath: String { "\(logsDir)/latest_status.json" }
+    var latestJsonPath: String { "\(stateDir)/latest_status.json" }
 
     private let configLock = NSRecursiveLock()
+    private var persistedConfig: DiskHealthConfig
     private var _config: DiskHealthConfig
     private(set) var dotEnvTelegramToken: String? = nil
     private(set) var dotEnvChatId: String? = nil
     private(set) var dotEnvWebhookUrl: String? = nil
+
+    static func isSecureUserOwnedFile(atPath path: String) -> Bool {
+        var st = stat()
+        if lstat(path, &st) != 0 {
+            return false
+        }
+        guard (st.st_mode & S_IFMT) == S_IFREG else {
+            return false
+        }
+        let uid = getuid()
+        guard st.st_uid == uid || st.st_uid == 0 else {
+            return false
+        }
+        guard (st.st_mode & 0o022) == 0 else {
+            return false
+        }
+        return true
+    }
 
     var config: DiskHealthConfig {
         get {
@@ -113,20 +146,6 @@ final class ConfigManager: ObservableObject, @unchecked Sendable {
 
     private init() {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let currentDir = FileManager.default.currentDirectoryPath
-        let resolvedBundleURL: URL = {
-            if Bundle.main.bundleURL.pathExtension == "app" {
-                return Bundle.main.bundleURL.resolvingSymlinksInPath()
-            }
-            if let execURL = Bundle.main.executableURL?.resolvingSymlinksInPath() {
-                let candidate = execURL.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-                if candidate.pathExtension == "app" {
-                    return candidate
-                }
-            }
-            return Bundle.main.bundleURL
-        }()
-        let bundleParent = resolvedBundleURL.deletingLastPathComponent().path
 
         // 1. Resolve User Configuration Directory
         if let envConfigDir = ProcessInfo.processInfo.environment["DISK_HEALTH_CONFIG_DIR"], !envConfigDir.isEmpty {
@@ -149,56 +168,45 @@ final class ConfigManager: ObservableObject, @unchecked Sendable {
         try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: self.configDir)
         SecretStore.shared.configDir = self.configDir
 
-        // 2. Resolve Logs Directory
+        // 2. Resolve State and Logs Directory
         if let envLogsDir = ProcessInfo.processInfo.environment["DISK_HEALTH_LOGS_DIR"], !envLogsDir.isEmpty {
             self.logsDir = (envLogsDir as NSString).standardizingPath
+            self.stateDir = self.logsDir
         } else {
-            let candidateRepoLogs = "\(currentDir)/logs"
-            let candidateBundleLogs = "\(bundleParent)/logs"
-            let isCurrentDirRepo = FileManager.default.fileExists(atPath: "\(currentDir)/src/bridge/DiskHealthBridge.c") ||
-                                   FileManager.default.fileExists(atPath: "\(currentDir)/build_and_install.sh")
-            let isBundleParentRepo = FileManager.default.fileExists(atPath: "\(bundleParent)/src/bridge/DiskHealthBridge.c") ||
-                                     FileManager.default.fileExists(atPath: "\(bundleParent)/build_and_install.sh")
-
-            if FileManager.default.fileExists(atPath: candidateRepoLogs) ||
-               (isCurrentDirRepo && (try? FileManager.default.createDirectory(atPath: candidateRepoLogs, withIntermediateDirectories: true)) != nil) {
-                self.logsDir = candidateRepoLogs
-            } else if FileManager.default.fileExists(atPath: candidateBundleLogs) ||
-                      (isBundleParentRepo && (try? FileManager.default.createDirectory(atPath: candidateBundleLogs, withIntermediateDirectories: true)) != nil) {
-                self.logsDir = candidateBundleLogs
-            } else {
-                self.logsDir = "\(self.configDir)/logs"
-            }
+            self.stateDir = self.configDir
+            self.logsDir = "\(self.configDir)/logs"
         }
         try? FileManager.default.createDirectory(atPath: self.logsDir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(atPath: self.stateDir, withIntermediateDirectories: true)
 
         // 3. Load JSON configuration
-        var initialConfig = DiskHealthConfig()
+        var loadedConfig = DiskHealthConfig()
         let configPath = "\(self.configDir)/config.json"
         if let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)),
            let decoded = try? JSONDecoder().decode(DiskHealthConfig.self, from: data) {
-            initialConfig = decoded
+            loadedConfig = decoded.validated()
         }
-        SecretStore.shared.useKeychainOptIn = initialConfig.useKeychainStorage
+        SecretStore.shared.useKeychainOptIn = loadedConfig.useKeychainStorage
 
         // 4. Migrate plaintext Telegram Bot Token & Webhook URL into SecretStore
         var needsResave = false
-        if ConfigManager.isRealSecretToken(initialConfig.telegramBotToken) {
-            _ = SecretStore.shared.setSecret(initialConfig.telegramBotToken, forKey: "telegramBotToken", allowInteractiveKeychain: false)
-            initialConfig.telegramBotToken = "REDACTED_IN_KEYCHAIN"
+        if ConfigManager.isRealSecretToken(loadedConfig.telegramBotToken) {
+            _ = SecretStore.shared.setSecret(loadedConfig.telegramBotToken, forKey: "telegramBotToken", allowInteractiveKeychain: false)
+            loadedConfig.telegramBotToken = "REDACTED_IN_KEYCHAIN"
             needsResave = true
         }
-        if ConfigManager.isRealSecretToken(initialConfig.webhookUrl) {
-            _ = SecretStore.shared.setSecret(initialConfig.webhookUrl, forKey: "webhookUrl", allowInteractiveKeychain: false)
-            initialConfig.webhookUrl = "REDACTED_IN_KEYCHAIN"
+        if ConfigManager.isRealSecretToken(loadedConfig.webhookUrl) {
+            _ = SecretStore.shared.setSecret(loadedConfig.webhookUrl, forKey: "webhookUrl", allowInteractiveKeychain: false)
+            loadedConfig.webhookUrl = "REDACTED_IN_KEYCHAIN"
             needsResave = true
         }
         if needsResave {
-            ConfigManager.saveSanitizedConfigFile(initialConfig, path: configPath)
+            ConfigManager.saveSanitizedConfigFile(loadedConfig, path: configPath)
         }
+        self.persistedConfig = loadedConfig
 
         // 5. Apply .env configuration (runtime overrides without mutating persisted secrets)
-        let (dotConfig, dotToken, dotChat, dotWebhook) = ConfigManager.loadDotEnvWithWebhook(into: initialConfig, configDir: self.configDir)
+        let (dotConfig, dotToken, dotChat, dotWebhook) = ConfigManager.loadDotEnvWithWebhook(into: loadedConfig, configDir: self.configDir)
         self.dotEnvTelegramToken = dotToken
         self.dotEnvChatId = dotChat
         if let dotWebhook = dotWebhook, ConfigManager.isRealSecretToken(dotWebhook) {
@@ -206,9 +214,7 @@ final class ConfigManager: ObservableObject, @unchecked Sendable {
         }
 
         // 6. Apply Environment variables
-        initialConfig = ConfigManager.applyEnvironmentVariables(into: dotConfig)
-
-        self._config = initialConfig
+        self._config = ConfigManager.applyEnvironmentVariables(into: dotConfig).validated()
 
         // Enforce 0600 on config.json if it exists
         if FileManager.default.fileExists(atPath: configPath) {
@@ -303,20 +309,19 @@ final class ConfigManager: ObservableObject, @unchecked Sendable {
         var foundChatId: String? = nil
         var foundWebhook: String? = nil
         let currentDir = FileManager.default.currentDirectoryPath
-        let bundleDir = Bundle.main.bundleURL.deletingLastPathComponent().path
 
         var searchPaths: [String] = []
         if let customEnv = ProcessInfo.processInfo.environment["DISK_HEALTH_ENV_FILE"], !customEnv.isEmpty {
             searchPaths.append((customEnv as NSString).standardizingPath)
         }
         searchPaths.append("\(configDir)/.env")
-        if ProcessInfo.processInfo.environment["DISK_HEALTH_CONFIG_DIR"]?.isEmpty ?? true {
+        if ProcessInfo.processInfo.environment["DISK_HEALTH_DEV_DOTENV"] == "1" {
             searchPaths.append("\(currentDir)/.env")
-            searchPaths.append("\(bundleDir)/.env")
         }
 
         for path in searchPaths {
             guard FileManager.default.fileExists(atPath: path),
+                  ConfigManager.isSecureUserOwnedFile(atPath: path),
                   let content = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
 
             for rawLine in content.components(separatedBy: .newlines) {
@@ -471,28 +476,34 @@ final class ConfigManager: ObservableObject, @unchecked Sendable {
 
     func updateConfig(_ updater: (inout DiskHealthConfig) -> Void) {
         configLock.lock()
-        var next = self._config
-        updater(&next)
-        SecretStore.shared.useKeychainOptIn = next.useKeychainStorage
-        if ConfigManager.isRealSecretToken(next.telegramBotToken) {
-            _ = SecretStore.shared.setSecret(next.telegramBotToken, forKey: "telegramBotToken", allowInteractiveKeychain: false)
+        updater(&self.persistedConfig)
+        self.persistedConfig = self.persistedConfig.validated()
+        SecretStore.shared.useKeychainOptIn = self.persistedConfig.useKeychainStorage
+        if ConfigManager.isRealSecretToken(self.persistedConfig.telegramBotToken) {
+            _ = SecretStore.shared.setSecret(self.persistedConfig.telegramBotToken, forKey: "telegramBotToken", allowInteractiveKeychain: false)
             self.dotEnvTelegramToken = nil
-            next.telegramBotToken = "REDACTED_IN_KEYCHAIN"
+            self.persistedConfig.telegramBotToken = "REDACTED_IN_KEYCHAIN"
         }
-        if ConfigManager.isRealSecretToken(next.webhookUrl) {
-            _ = SecretStore.shared.setSecret(next.webhookUrl, forKey: "webhookUrl", allowInteractiveKeychain: false)
+        if ConfigManager.isRealSecretToken(self.persistedConfig.webhookUrl) {
+            _ = SecretStore.shared.setSecret(self.persistedConfig.webhookUrl, forKey: "webhookUrl", allowInteractiveKeychain: false)
             self.dotEnvWebhookUrl = nil
-            next.webhookUrl = "REDACTED_IN_KEYCHAIN"
+            self.persistedConfig.webhookUrl = "REDACTED_IN_KEYCHAIN"
         }
-        self._config = next
-        saveConfigLocked(next)
+        saveConfigLocked(self.persistedConfig)
+
+        // Recompute effective config from updated persistedConfig + .env + env
+        let (dotConfig, dotToken, dotChat, dotWebhook) = ConfigManager.loadDotEnvWithWebhook(into: self.persistedConfig, configDir: self.configDir)
+        if let tok = dotToken { self.dotEnvTelegramToken = tok }
+        if let chat = dotChat { self.dotEnvChatId = chat }
+        if let hook = dotWebhook, ConfigManager.isRealSecretToken(hook) { self.dotEnvWebhookUrl = hook }
+        self._config = ConfigManager.applyEnvironmentVariables(into: dotConfig).validated()
         configLock.unlock()
         notifyObjectWillChangeOnMain()
     }
 
     func saveConfig() {
         configLock.lock()
-        let current = self._config
+        let current = self.persistedConfig
         configLock.unlock()
         ConfigManager.saveSanitizedConfigFile(current, path: configFilePath)
     }

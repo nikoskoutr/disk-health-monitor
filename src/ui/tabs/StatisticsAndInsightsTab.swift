@@ -17,14 +17,14 @@ struct StatisticsAndInsightsTab: View {
     @ObservedObject var configMgr: ConfigManager = ConfigManager.shared
 
     private var currentMulti: MultiDiskHealthSnapshot? {
-        monitor.publishedMultiSnapshot ?? monitor.currentMultiSnapshot
+        monitor.publishedMultiSnapshot
     }
 
     private var activeDisks: [DiskHealthSnapshot] {
         if let multi = currentMulti, !multi.disks.isEmpty {
             return multi.disks
         }
-        if let single = monitor.publishedSnapshot ?? monitor.currentSnapshot {
+        if let single = monitor.publishedSnapshot {
             return [single]
         }
         return []

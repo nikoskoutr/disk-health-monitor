@@ -268,8 +268,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        let currentActive = DiskHealthMonitor.shared.currentSnapshot?.bsdName ?? ""
-        let currentMount = DiskHealthMonitor.shared.currentSnapshot?.mountPoint ?? ""
+        let currentActive = DiskHealthMonitor.shared.publishedSnapshot?.bsdName ?? ""
+        let currentMount = DiskHealthMonitor.shared.publishedSnapshot?.mountPoint ?? ""
         let cfg = ConfigManager.shared.currentConfig
 
         // Monitor All Disks Option
@@ -291,7 +291,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         selectDiskMenu.addItem(autoItem)
         selectDiskMenu.addItem(NSMenuItem.separator())
 
-        let multi = DiskHealthMonitor.shared.currentMultiSnapshot
+        let multi = DiskHealthMonitor.shared.publishedMultiSnapshot
 
         // Physical Disks
         for d in devices {
@@ -392,8 +392,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         dailyDigestItem.state = DiskHealthMonitor.shared.dailySummaryEnabled ? .on : .off
-        updateDiskCache()
         populateSelectDiskMenu()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.updateDiskCache()
+            DispatchQueue.main.async {
+                self?.populateSelectDiskMenu()
+            }
+        }
         refreshHealth(forceCanary: false)
         if let hostingView = menu.items.first?.view {
             hostingView.invalidateIntrinsicContentSize()
@@ -534,7 +539,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateStatusBarButton(with snap: DiskHealthSnapshot) {
-        if let multi = DiskHealthMonitor.shared.currentMultiSnapshot {
+        if let multi = DiskHealthMonitor.shared.publishedMultiSnapshot {
             updateStatusBarButton(with: multi)
         } else {
             let dummyMulti = MultiDiskHealthSnapshot(
@@ -567,7 +572,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func exportDiagnosticReportAction() {
-        let cachedSnap = DiskHealthMonitor.shared.currentSnapshot
+        let cachedSnap = DiskHealthMonitor.shared.publishedSnapshot
         DispatchQueue.global(qos: .userInitiated).async {
             if let path = DiagnosticExporter.shared.saveDiagnosticReportToFile(snapshot: cachedSnap) {
                 DispatchQueue.main.async {
@@ -578,7 +583,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func exportHtmlReportAction() {
-        let cachedSnap = DiskHealthMonitor.shared.currentSnapshot
+        let cachedSnap = DiskHealthMonitor.shared.publishedSnapshot
         DispatchQueue.global(qos: .userInitiated).async {
             if let path = DiagnosticExporter.shared.saveDiagnosticReportHTMLToFile(snapshot: cachedSnap) {
                 DispatchQueue.main.async {
@@ -611,8 +616,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openVolumeInFinder() {
-        let path = DiskHealthMonitor.shared.currentSnapshot?.mountPoint.isEmpty == false
-            ? DiskHealthMonitor.shared.currentSnapshot!.mountPoint
+        let path = DiskHealthMonitor.shared.publishedSnapshot?.mountPoint.isEmpty == false
+            ? DiskHealthMonitor.shared.publishedSnapshot!.mountPoint
             : "/"
         NSWorkspace.shared.open(URL(fileURLWithPath: path))
     }

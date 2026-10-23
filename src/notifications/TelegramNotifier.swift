@@ -19,7 +19,6 @@ final class TelegramNotifier {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 12.0
         config.timeoutIntervalForResource = 15.0
-        config.connectionProxyDictionary = [:]
         self.session = URLSession(configuration: config)
     }
 
@@ -41,9 +40,14 @@ final class TelegramNotifier {
             return
         }
 
+        var safeText = htmlText
+        if safeText.count > 4000 {
+            safeText = String(safeText.prefix(3990)) + "\n... [truncated]"
+        }
+
         let payload: [String: Any] = [
             "chat_id": chatId,
-            "text": htmlText,
+            "text": safeText,
             "parse_mode": "HTML",
             "disable_notification": disableNotification
         ]
@@ -177,7 +181,14 @@ final class TelegramNotifier {
         let smartCounters = snapshot.smartValid
             ? "POH: \(snapshot.powerOnHours)h | Cycles: \(snapshot.powerCycles) | Unsafe: \(snapshot.unsafeShutdowns) | Media Err: \(snapshot.mediaErrors)"
             : "N/A"
-        let canaryStr = snapshot.canaryOk ? String(format: "✅ OK (%.2f ms)", snapshot.canaryLatencyMs) : "❌ FAILED (\(escapeHTML(snapshot.canaryError)))"
+        let canaryStr: String
+        if snapshot.canaryOk {
+            canaryStr = String(format: "✅ OK (%.2f ms)", snapshot.canaryLatencyMs)
+        } else if snapshot.canaryError == "Canary disabled" || snapshot.canaryError == "Volume not mounted" {
+            canaryStr = "⚪️ Disabled"
+        } else {
+            canaryStr = "❌ FAILED (\(escapeHTML(snapshot.canaryError)))"
+        }
 
         var lines: [String] = [
             statusLine,

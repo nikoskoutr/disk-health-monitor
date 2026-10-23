@@ -19,7 +19,6 @@ final class WebhookNotifier {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 12.0
         config.timeoutIntervalForResource = 15.0
-        config.connectionProxyDictionary = [:]
         self.session = URLSession(configuration: config)
     }
 

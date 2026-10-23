@@ -76,6 +76,10 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
     private struct DriveThroughputSample {
         var bytesRead: UInt64 = 0
         var bytesWritten: UInt64 = 0
+        var operationsRead: UInt64 = 0
+        var operationsWritten: UInt64 = 0
+        var totalTimeReadNs: UInt64 = 0
+        var totalTimeWriteNs: UInt64 = 0
         var timestamp: TimeInterval = 0
     }
     private var throughputSamplesByDrive: [String: DriveThroughputSample] = [:]
@@ -201,6 +205,18 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
 
     private func saveStateLocked(force: Bool = false) {
         let path = ConfigManager.shared.stateFilePath
+        let lockPath = "\(ConfigManager.shared.stateDir)/state.lock"
+        let lockFd = open(lockPath, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        if lockFd >= 0 {
+            _ = flock(lockFd, LOCK_EX)
+        }
+        defer {
+            if lockFd >= 0 {
+                _ = flock(lockFd, LOCK_UN)
+                close(lockFd)
+            }
+        }
+
         if !force, let last = lastSavedState, last == state, FileManager.default.fileExists(atPath: path) {
             return
         }
@@ -326,13 +342,14 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         } else {
             for k in Array(self.state.drives.keys) {
                 self.state.updateDriveState(key: k) { d in
-                    d.baselineUnsafeShutdowns = nil
-                    d.baselineMediaErrors = nil
-                    d.baselineErrorLogEntries = nil
-                    d.baselineIoReadErrors = nil
-                    d.baselineIoWriteErrors = nil
-                    d.baselineIoReadRetries = nil
-                    d.baselineIoWriteRetries = nil
+                    // Retain known baseline error counts rather than wiping to nil (which would trigger immediate false alerts)
+                    d.baselineUnsafeShutdowns = d.baselineUnsafeShutdowns ?? 0
+                    d.baselineMediaErrors = d.baselineMediaErrors ?? 0
+                    d.baselineErrorLogEntries = d.baselineErrorLogEntries ?? 0
+                    d.baselineIoReadErrors = d.baselineIoReadErrors ?? 0
+                    d.baselineIoWriteErrors = d.baselineIoWriteErrors ?? 0
+                    d.baselineIoReadRetries = d.baselineIoReadRetries ?? 0
+                    d.baselineIoWriteRetries = d.baselineIoWriteRetries ?? 0
                 }
             }
             self.state.monitoredTarget = oldTarget
@@ -346,6 +363,9 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
                     $0.lastVerifyTimestamp = 0
                 }
                 $0.lastOverallSeverity = HealthSeverity.healthy.rawValue
+                $0.consecutiveHealthyPolls = 0
+                $0.consecutiveUnhealthyPolls = 0
+                $0.lastNotifiedSeverity = HealthSeverity.healthy.rawValue
             }
         }
         self.state.lastOverallSeverity = HealthSeverity.healthy.rawValue
@@ -429,9 +449,18 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             )
         }
 
-        let driveKey = !serialNumber.isEmpty
-            ? serialNumber
-            : (!bsdName.isEmpty ? bsdName : (!resolvedMount.isEmpty ? resolvedMount : (!targetQuery.isEmpty ? targetQuery : "default")))
+        let driveKey: String = {
+            if !serialNumber.isEmpty && !DiskHealthSnapshot.isPlaceholderSerial(serialNumber) {
+                return serialNumber
+            }
+            if !serialNumber.isEmpty && !bsdName.isEmpty {
+                return "\(serialNumber)#\(bsdName)"
+            }
+            if !bsdName.isEmpty { return bsdName }
+            if !resolvedMount.isEmpty { return resolvedMount }
+            if !targetQuery.isEmpty { return targetQuery }
+            return "default"
+        }()
 
         // 5. Active I/O Canary Probe
         var canaryOk = false
@@ -460,6 +489,10 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         // 6. Throughput & Latency Calculations (tracked per driveKey)
         var readMBps = 0.0
         var writeMBps = 0.0
+        var intervalReadLatMs = 0.0
+        var intervalWriteLatMs = 0.0
+        var hasIntervalLatency = false
+
         if hw.statsValid {
             if let prev = throughputSamplesByDrive[driveKey], prev.timestamp > 0 && nowTs > prev.timestamp {
                 let dt = nowTs - prev.timestamp
@@ -469,16 +502,40 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
                 if hw.bytesWritten >= prev.bytesWritten {
                     writeMBps = Double(hw.bytesWritten - prev.bytesWritten) / (1_000_000.0 * dt)
                 }
+                if hw.operationsRead >= prev.operationsRead && hw.totalTimeReadNs >= prev.totalTimeReadNs {
+                    let deltaOpsR = hw.operationsRead - prev.operationsRead
+                    let deltaTimeNsR = hw.totalTimeReadNs - prev.totalTimeReadNs
+                    if deltaOpsR >= 50 {
+                        intervalReadLatMs = Double(deltaTimeNsR) / Double(deltaOpsR) / 1_000_000.0
+                        hasIntervalLatency = true
+                    }
+                }
+                if hw.operationsWritten >= prev.operationsWritten && hw.totalTimeWriteNs >= prev.totalTimeWriteNs {
+                    let deltaOpsW = hw.operationsWritten - prev.operationsWritten
+                    let deltaTimeNsW = hw.totalTimeWriteNs - prev.totalTimeWriteNs
+                    if deltaOpsW >= 50 {
+                        intervalWriteLatMs = Double(deltaTimeNsW) / Double(deltaOpsW) / 1_000_000.0
+                        hasIntervalLatency = true
+                    }
+                }
             }
-            throughputSamplesByDrive[driveKey] = DriveThroughputSample(bytesRead: hw.bytesRead, bytesWritten: hw.bytesWritten, timestamp: nowTs)
+            throughputSamplesByDrive[driveKey] = DriveThroughputSample(
+                bytesRead: hw.bytesRead,
+                bytesWritten: hw.bytesWritten,
+                operationsRead: hw.operationsRead,
+                operationsWritten: hw.operationsWritten,
+                totalTimeReadNs: hw.totalTimeReadNs,
+                totalTimeWriteNs: hw.totalTimeWriteNs,
+                timestamp: nowTs
+            )
         }
 
-        let avgReadLatMs = (hw.statsValid && hw.operationsRead > 0)
+        let avgReadLatMs = hasIntervalLatency ? intervalReadLatMs : ((hw.statsValid && hw.operationsRead > 0)
             ? (Double(hw.totalTimeReadNs) / Double(hw.operationsRead) / 1_000_000.0)
-            : 0.0
-        let avgWriteLatMs = (hw.statsValid && hw.operationsWritten > 0)
+            : 0.0)
+        let avgWriteLatMs = hasIntervalLatency ? intervalWriteLatMs : ((hw.statsValid && hw.operationsWritten > 0)
             ? (Double(hw.totalTimeWriteNs) / Double(hw.operationsWritten) / 1_000_000.0)
-            : 0.0
+            : 0.0)
 
         // 7. Update Peak Temp & Baselines for this specific physical drive
         var driveState = state.getDriveState(key: driveKey, bsdName: bsdName, serial: serialNumber)
@@ -491,13 +548,40 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             if driveState.baselineUnsafeShutdowns == nil { driveState.baselineUnsafeShutdowns = hw.unsafeShutdowns }
             if driveState.baselineMediaErrors == nil { driveState.baselineMediaErrors = 0 }
             if driveState.baselineErrorLogEntries == nil { driveState.baselineErrorLogEntries = hw.errorInfoLogEntries }
+
+            // Re-baseline on counter decrease (controller reset / firmware refresh)
+            if let prevMedia = driveState.baselineMediaErrors, hw.mediaErrors < prevMedia {
+                driveState.baselineMediaErrors = hw.mediaErrors
+            }
+            if let prevLog = driveState.baselineErrorLogEntries, hw.errorInfoLogEntries < prevLog {
+                driveState.baselineErrorLogEntries = hw.errorInfoLogEntries
+            }
         }
         if hw.statsValid {
             if driveState.baselineIoReadErrors == nil { driveState.baselineIoReadErrors = 0 }
             if driveState.baselineIoWriteErrors == nil { driveState.baselineIoWriteErrors = 0 }
             if driveState.baselineIoReadRetries == nil { driveState.baselineIoReadRetries = hw.retriesRead }
             if driveState.baselineIoWriteRetries == nil { driveState.baselineIoWriteRetries = hw.retriesWritten }
+
+            // Re-baseline on driver stats counter reset (system reboot / drive replug)
+            if let prevR = driveState.baselineIoReadErrors, hw.errorsRead < prevR {
+                driveState.baselineIoReadErrors = hw.errorsRead
+            }
+            if let prevW = driveState.baselineIoWriteErrors, hw.errorsWritten < prevW {
+                driveState.baselineIoWriteErrors = hw.errorsWritten
+            }
+            if let prevRetR = driveState.baselineIoReadRetries, hw.retriesRead < prevRetR {
+                driveState.baselineIoReadRetries = hw.retriesRead
+            }
+            if let prevRetW = driveState.baselineIoWriteRetries, hw.retriesWritten < prevRetW {
+                driveState.baselineIoWriteRetries = hw.retriesWritten
+            }
         }
+
+        if fsMetrics.isMounted && !fsMetrics.isReadOnly {
+            driveState.wasWritable = true
+        }
+
         state.drives[driveKey] = driveState
 
         // 8. Evaluate Health Rules Pipeline
@@ -646,11 +730,19 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         return snapshot
     }
 
+    static func isValidUniqueSerial(_ s: String) -> Bool {
+        let clean = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, clean != "0", clean != "N/A", clean != "None", clean != "0123456789ABCDEF" else { return false }
+        if clean.allSatisfy({ $0 == "0" || $0 == " " || $0 == "-" || $0 == "_" }) { return false }
+        return true
+    }
+
     /// Evaluates health, performance, and SMART telemetry across all monitored physical storage devices.
     ///
     /// - Parameters:
     ///   - forceCanary: If true, forces an immediate active 512B write probe bypassing the 300s cache.
     ///   - allowNotifications: If true, dispatches alert notifications for detected issues violating cooldowns.
+    ///   - persistState: If true, saves state.json and latest_status.json (false for read-only CLI calls).
     ///   - telemetryProvider: Optional custom telemetry provider (used for unit test fault injection).
     /// - Returns: Aggregated `MultiDiskHealthSnapshot` summarizing fleet health and per-drive metrics.
     /// - Note: Concurrency: Synchronized via `engineLock`. Dispatches `@Published` updates to main thread.
@@ -658,6 +750,7 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
     func evaluateAllMonitoredDisks(
         forceCanary: Bool = false,
         allowNotifications: Bool = true,
+        persistState: Bool = true,
         telemetryProvider: (any DiskTelemetryProvider)? = nil
     ) -> MultiDiskHealthSnapshot {
         engineLock.lock()
@@ -674,13 +767,28 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
 
         if cfg.monitorAllDisks {
             let all = provider.listAllDevices(maxCount: 32)
+            var serialCounts: [String: Int] = [:]
+            for dev in all where dev.found {
+                let ser = cStringToSwift(dev.serialNumber).trimmingCharacters(in: .whitespacesAndNewlines)
+                if DiskHealthMonitor.isValidUniqueSerial(ser) {
+                    serialCounts[ser, default: 0] += 1
+                }
+            }
+
             var seenKeys = Set<String>()
             var enumeratedDevices: [DiskHardwareMetrics] = []
             enumeratedDevices.reserveCapacity(all.count)
             for dev in all where dev.found {
-                let ser = cStringToSwift(dev.serialNumber)
-                let bsd = cStringToSwift(dev.bsdName)
-                let key = !ser.isEmpty ? ser : bsd
+                let ser = cStringToSwift(dev.serialNumber).trimmingCharacters(in: .whitespacesAndNewlines)
+                let bsd = cStringToSwift(dev.bsdName).trimmingCharacters(in: .whitespacesAndNewlines)
+                let key: String
+                if DiskHealthMonitor.isValidUniqueSerial(ser) && (serialCounts[ser] ?? 0) == 1 {
+                    key = ser
+                } else if DiskHealthMonitor.isValidUniqueSerial(ser) {
+                    key = "\(ser)#\(bsd)"
+                } else {
+                    key = bsd
+                }
                 if key.isEmpty || !seenKeys.contains(key) {
                     if !key.isEmpty { seenKeys.insert(key) }
                     enumeratedDevices.append(dev)
@@ -760,6 +868,25 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             snapshots.append(snap)
         }
 
+        // Safe fallback if target filtering yielded 0 snapshots (eliminates force unwrap trap)
+        if snapshots.isEmpty {
+            let fallback = evaluateSingleTargetLocked(
+                targetMount: cfg.targetVolumePath ?? "",
+                targetQuery: cfg.targetDeviceQuery ?? "",
+                preloadedHardware: nil,
+                isAutoDiscovered: false,
+                forceCanary: forceCanary,
+                allowNotifications: allowNotifications,
+                now: now,
+                nowTs: nowTs,
+                formattedTime: formattedTime,
+                formattedShortTime: formattedShortTime,
+                cfg: cfg,
+                provider: provider
+            )
+            snapshots.append(fallback)
+        }
+
         var worstSeverity: HealthSeverity = .healthy
         var worstScore: Int = snapshots.isEmpty ? 100 : Int.max
         var scoreSum: Int = 0
@@ -794,21 +921,23 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             selectedDashboardDriveKeyInternal = multi.primarySnapshot?.driveKey ?? snapshots.first?.driveKey ?? ""
         }
         let resolvedSelectedKey = selectedDashboardDriveKeyInternal
-        let primary = snapshots.first(where: { $0.driveKey == resolvedSelectedKey }) ?? multi.primarySnapshot ?? snapshots.first!
+        let primary = snapshots.first(where: { $0.driveKey == resolvedSelectedKey }) ?? multi.primarySnapshot ?? snapshots[0]
         self.latestSnapshotInternal = primary
 
-        // Save latest_status.json (single disk writes primary for full backward compatibility, multi writes multi)
-        if multi.disks.count > 1 {
-            if let jsonData = try? prettyJSONEncoder.encode(multi) {
-                _ = AtomicFileWriter.writeRestricted(data: jsonData, toPath: ConfigManager.shared.latestJsonPath, permissions: 0o600)
+        if persistState {
+            // Save latest_status.json (single disk writes primary for full backward compatibility, multi writes multi)
+            if multi.disks.count > 1 {
+                if let jsonData = try? prettyJSONEncoder.encode(multi) {
+                    _ = AtomicFileWriter.writeRestricted(data: jsonData, toPath: ConfigManager.shared.latestJsonPath, permissions: 0o600)
+                }
+            } else {
+                if let jsonData = try? prettyJSONEncoder.encode(primary) {
+                    _ = AtomicFileWriter.writeRestricted(data: jsonData, toPath: ConfigManager.shared.latestJsonPath, permissions: 0o600)
+                }
             }
-        } else {
-            if let jsonData = try? prettyJSONEncoder.encode(primary) {
-                _ = AtomicFileWriter.writeRestricted(data: jsonData, toPath: ConfigManager.shared.latestJsonPath, permissions: 0o600)
-            }
-        }
 
-        saveStateLocked()
+            saveStateLocked()
+        }
 
         if Thread.isMainThread {
             if self.selectedDashboardDriveKey != resolvedSelectedKey {
@@ -835,23 +964,23 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
     /// - Parameters:
     ///   - forceCanary: If true, forces an immediate active 512B write probe bypassing the 300s cache.
     ///   - allowNotifications: If true, dispatches alert notifications for detected issues violating cooldowns.
+    ///   - persistState: If true, saves state.json and latest_status.json (false for read-only CLI calls).
     ///   - telemetryProvider: Optional custom telemetry provider (used for unit test fault injection).
     /// - Returns: `DiskHealthSnapshot` of the currently selected or primary dashboard drive.
     @discardableResult
     func evaluateHealth(
         forceCanary: Bool = false,
         allowNotifications: Bool = true,
+        persistState: Bool = true,
         telemetryProvider: (any DiskTelemetryProvider)? = nil
     ) -> DiskHealthSnapshot {
         let multi = evaluateAllMonitoredDisks(
             forceCanary: forceCanary,
             allowNotifications: allowNotifications,
+            persistState: persistState,
             telemetryProvider: telemetryProvider
         )
-        engineLock.lock()
-        defer { engineLock.unlock() }
-        let key = selectedDashboardDriveKeyInternal
-        return multi.disks.first(where: { $0.driveKey == key }) ?? multi.primarySnapshot ?? multi.disks.first!
+        return self.latestSnapshotInternal ?? multi.primarySnapshot ?? multi.disks[0]
     }
 
     private func processAlertsAndDigestLocked(snapshot: DiskHealthSnapshot, rawMetrics hw: DiskHardwareMetrics, driveKey: String) {
@@ -874,8 +1003,6 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             }
         }
 
-        let driveSeverityRaw = state.drives[driveKey]?.lastOverallSeverity ?? state.lastOverallSeverity
-        let prevSeverity = HealthSeverity(rawValue: driveSeverityRaw) ?? .healthy
         if shouldSendAlert {
             let alertTitle = snapshot.overallSeverity == .critical
                 ? "\(snapshot.productName) CRITICAL HEALTH ALERT"
@@ -913,6 +1040,23 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
                     $0.baselineIoWriteRetries = hw.retriesWritten
                 }
             }
+            if snapshot.issues.contains(where: { $0.code == "IO_DRIVER_ERRORS" }) && hw.statsValid {
+                self.state.updateDriveState(key: driveKey) {
+                    $0.baselineIoReadErrors = hw.errorsRead
+                    $0.baselineIoWriteErrors = hw.errorsWritten
+                }
+            }
+            if snapshot.issues.contains(where: { $0.code == "MEDIA_ERRORS" }) && hw.smartValid {
+                self.state.updateDriveState(key: driveKey) {
+                    $0.baselineMediaErrors = hw.mediaErrors
+                }
+            }
+
+            self.state.updateDriveState(key: driveKey) {
+                $0.consecutiveUnhealthyPolls += 1
+                $0.consecutiveHealthyPolls = 0
+                $0.lastNotifiedSeverity = snapshot.overallSeverity.rawValue
+            }
 
             // Send Telegram alert
             let htmlMsg = TelegramNotifier.shared.formatReportHTML(snapshot: snapshot, title: alertTitle)
@@ -925,34 +1069,48 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
                 self?.notificationGroup.leave()
             }
             executeAlertScriptAsync(snapshot: snapshot, title: alertTitle, eventType: "health_alert")
-        } else if prevSeverity != .healthy && snapshot.overallSeverity == .healthy {
-            // Recovery notification
-            let recoveryTitle = "\(snapshot.productName) RECOVERED — HEALTHY"
-            ConfigManager.shared.log("Drive recovered to HEALTHY state.")
-            let prefix = "\(driveKey):"
-            for key in Array(state.lastAlertTimestampByCode.keys) where key.hasPrefix(prefix) || !key.contains(":") {
-                state.lastAlertTimestampByCode.removeValue(forKey: key)
-            }
+        } else if snapshot.overallSeverity == .healthy {
+            var driveState = self.state.getDriveState(key: driveKey)
+            driveState.consecutiveHealthyPolls += 1
+            driveState.consecutiveUnhealthyPolls = 0
 
-            if cfg.enableNativeNotifications {
-                MacOSNotifier.shared.postNotification(
-                    title: recoveryTitle,
-                    subtitle: "Score: \(snapshot.healthScore)/100",
-                    body: "All storage and filesystem health checks passed.",
-                    identifier: "disk-health-alert-\(driveKey)"
-                )
-            }
+            let previouslyAlerted = driveState.lastNotifiedSeverity != HealthSeverity.healthy.rawValue
+            if previouslyAlerted && driveState.consecutiveHealthyPolls >= 2 {
+                let recoveryTitle = "\(snapshot.productName) RECOVERED — HEALTHY"
+                ConfigManager.shared.log("Drive \(driveKey) recovered to HEALTHY state.")
+                driveState.lastNotifiedSeverity = HealthSeverity.healthy.rawValue
+                driveState.lastRecoveryTimestamp = nowTs
 
-            let msg = TelegramNotifier.shared.formatReportHTML(snapshot: snapshot, title: recoveryTitle)
-            notificationGroup.enter()
-            TelegramNotifier.shared.sendMessageAsync(htmlText: msg, disableNotification: false) { [weak self] _ in
-                self?.notificationGroup.leave()
+                // Recovery hold: retain cooldowns older than 900s, preventing rapid flapping alert spam
+                let prefix = "\(driveKey):"
+                for key in Array(state.lastAlertTimestampByCode.keys) where key.hasPrefix(prefix) || !key.contains(":") {
+                    let ts = state.lastAlertTimestampByCode[key] ?? 0
+                    if (nowTs - ts) > 900.0 {
+                        state.lastAlertTimestampByCode.removeValue(forKey: key)
+                    }
+                }
+
+                if cfg.enableNativeNotifications {
+                    MacOSNotifier.shared.postNotification(
+                        title: recoveryTitle,
+                        subtitle: "Score: \(snapshot.healthScore)/100",
+                        body: "All storage and filesystem health checks passed.",
+                        identifier: "disk-health-alert-\(driveKey)"
+                    )
+                }
+
+                let msg = TelegramNotifier.shared.formatReportHTML(snapshot: snapshot, title: recoveryTitle)
+                notificationGroup.enter()
+                TelegramNotifier.shared.sendMessageAsync(htmlText: msg, disableNotification: false) { [weak self] _ in
+                    self?.notificationGroup.leave()
+                }
+                notificationGroup.enter()
+                WebhookNotifier.shared.sendWebhookAsync(snapshot: snapshot, title: recoveryTitle, eventType: "health_recovered") { [weak self] _ in
+                    self?.notificationGroup.leave()
+                }
+                executeAlertScriptAsync(snapshot: snapshot, title: recoveryTitle, eventType: "health_recovered")
             }
-            notificationGroup.enter()
-            WebhookNotifier.shared.sendWebhookAsync(snapshot: snapshot, title: recoveryTitle, eventType: "health_recovered") { [weak self] _ in
-                self?.notificationGroup.leave()
-            }
-            executeAlertScriptAsync(snapshot: snapshot, title: recoveryTitle, eventType: "health_recovered")
+            state.drives[driveKey] = driveState
         }
 
         state.updateDriveState(key: driveKey) {
@@ -963,9 +1121,11 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         if state.dailySummaryEnabled {
             let digestScopedKey = "\(driveKey):DAILY_DIGEST"
             let lastDigestTs = state.lastAlertTimestampByCode[digestScopedKey] ?? 0
-            if state.lastDailySummaryDate.isEmpty {
-                state.lastDailySummaryDate = dailyDigestDateFormatter.string(from: Date(timeIntervalSince1970: nowTs))
+            if lastDigestTs == 0 {
                 state.lastAlertTimestampByCode[digestScopedKey] = nowTs
+                if state.lastDailySummaryDate.isEmpty {
+                    state.lastDailySummaryDate = dailyDigestDateFormatter.string(from: Date(timeIntervalSince1970: nowTs))
+                }
             } else if (nowTs - lastDigestTs) >= 20 * 3600 {
                 let nowDate = Date(timeIntervalSince1970: nowTs)
                 if Calendar.current.component(.hour, from: nowDate) >= 9 {
@@ -1029,12 +1189,10 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             ConfigManager.shared.log("Volume verification finished: ok=\(ok), result=\(summary)")
 
             let updatedSnap = self.evaluateHealth(forceCanary: true, allowNotifications: !ok)
-            if sendTelegram {
+            if sendTelegram && !summary.starts(with: "Skipped") {
                 let title: String
                 if summary.starts(with: "Verified OK") {
                     title = "\(updatedSnap.productName) File System Verification Passed"
-                } else if summary.starts(with: "Skipped") {
-                    title = "\(updatedSnap.productName) File System Verification Skipped"
                 } else {
                     title = "\(updatedSnap.productName) File System Verification FAILED"
                 }
@@ -1053,8 +1211,30 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
 
     private let notificationGroup = DispatchGroup()
 
-    func waitForPendingNotifications(timeout: TimeInterval = 3.0) {
+    func waitForPendingNotifications(timeout: TimeInterval = 16.0) {
         _ = notificationGroup.wait(timeout: .now() + timeout)
+    }
+
+    private static func makeCleanAlertScriptEnvironment(snapshot: DiskHealthSnapshot, title: String, eventType: String) -> [String: String] {
+        var env: [String: String] = [:]
+        let safeKeys = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "SHELL", "TMPDIR"]
+        let currentEnv = ProcessInfo.processInfo.environment
+        for k in safeKeys {
+            if let val = currentEnv[k] { env[k] = val }
+        }
+        if env["PATH"] == nil {
+            env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
+        }
+        env["DISK_HEALTH_EVENT"] = eventType
+        env["DISK_HEALTH_TITLE"] = title
+        env["DISK_HEALTH_SEVERITY"] = snapshot.overallSeverity.rawValue
+        env["DISK_HEALTH_SCORE"] = "\(snapshot.healthScore)"
+        env["DISK_HEALTH_DEVICE"] = "\(snapshot.vendorName) \(snapshot.productName)".trimmingCharacters(in: .whitespaces)
+        env["DISK_HEALTH_BSD_NAME"] = snapshot.bsdName
+        env["DISK_HEALTH_MOUNT_POINT"] = snapshot.mountPoint
+        env["DISK_HEALTH_TEMP_C"] = "\(snapshot.temperatureCelsius)"
+        env["DISK_HEALTH_ISSUES"] = snapshot.issues.map { "[\($0.code)] \($0.title)" }.joined(separator: "; ")
+        return env
     }
 
     /// Executes the user-configured alert script synchronously with a timeout watchdog.
@@ -1072,8 +1252,11 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         guard FileManager.default.isExecutableFile(atPath: expandedPath) else {
             return .failure(.scriptNotExecutable(path: expandedPath))
         }
+        guard ConfigManager.isSecureUserOwnedFile(atPath: expandedPath) else {
+            return .failure(.configurationInvalid(reason: "Alert script '\(expandedPath)' must be owned by current user (or root) and not group/world-writable."))
+        }
 
-        let snap = self.currentSnapshot ?? self.evaluateHealth(forceCanary: false, allowNotifications: false)
+        let snap = self.currentSnapshot ?? self.evaluateHealth(forceCanary: false, allowNotifications: false, persistState: false)
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: expandedPath)
         let pipeOut = Pipe()
@@ -1082,19 +1265,7 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         proc.standardError = pipeOut
         let readHandle = pipeOut.fileHandleForReading
 
-        var env = ProcessInfo.processInfo.environment
-        env.removeValue(forKey: "TELEGRAM_BOT_TOKEN")
-        env.removeValue(forKey: "WEBHOOK_URL")
-        env["DISK_HEALTH_EVENT"] = "test_alert"
-        env["DISK_HEALTH_TITLE"] = "\(snap.productName) Alert Script Test"
-        env["DISK_HEALTH_SEVERITY"] = snap.overallSeverity.rawValue
-        env["DISK_HEALTH_SCORE"] = "\(snap.healthScore)"
-        env["DISK_HEALTH_DEVICE"] = "\(snap.vendorName) \(snap.productName)".trimmingCharacters(in: .whitespaces)
-        env["DISK_HEALTH_BSD_NAME"] = snap.bsdName
-        env["DISK_HEALTH_MOUNT_POINT"] = snap.mountPoint
-        env["DISK_HEALTH_TEMP_C"] = "\(snap.temperatureCelsius)"
-        env["DISK_HEALTH_ISSUES"] = snap.issues.map { "[\($0.code)] \($0.title)" }.joined(separator: "; ")
-        proc.environment = env
+        proc.environment = DiskHealthMonitor.makeCleanAlertScriptEnvironment(snapshot: snap, title: "\(snap.productName) Alert Script Test", eventType: "test_alert")
 
         do {
             try proc.run()
@@ -1115,7 +1286,6 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
                         if pid > 0 {
                             VolumeVerifierService.terminateProcessAndChildren(pid: pid, signal: SIGKILL)
                         }
-                        try? readHandle.close()
                     }
                     timeoutLock.lock()
                     killWorkItem = escalation
@@ -1176,6 +1346,10 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             ConfigManager.shared.log("Alert script skipped (not executable): \(expandedPath)")
             return
         }
+        guard ConfigManager.isSecureUserOwnedFile(atPath: expandedPath) else {
+            ConfigManager.shared.log("Alert script skipped (insecure permissions/ownership): \(expandedPath)")
+            return
+        }
 
         notificationGroup.enter()
         DispatchQueue.global(qos: .utility).async {
@@ -1185,19 +1359,7 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             proc.standardInput = FileHandle.nullDevice
             proc.standardOutput = FileHandle.nullDevice
             proc.standardError = FileHandle.nullDevice
-            var env = ProcessInfo.processInfo.environment
-            env.removeValue(forKey: "TELEGRAM_BOT_TOKEN")
-            env.removeValue(forKey: "WEBHOOK_URL")
-            env["DISK_HEALTH_EVENT"] = eventType
-            env["DISK_HEALTH_TITLE"] = title
-            env["DISK_HEALTH_SEVERITY"] = snapshot.overallSeverity.rawValue
-            env["DISK_HEALTH_SCORE"] = "\(snapshot.healthScore)"
-            env["DISK_HEALTH_DEVICE"] = "\(snapshot.vendorName) \(snapshot.productName)".trimmingCharacters(in: .whitespaces)
-            env["DISK_HEALTH_BSD_NAME"] = snapshot.bsdName
-            env["DISK_HEALTH_MOUNT_POINT"] = snapshot.mountPoint
-            env["DISK_HEALTH_TEMP_C"] = "\(snapshot.temperatureCelsius)"
-            env["DISK_HEALTH_ISSUES"] = snapshot.issues.map { "[\($0.code)] \($0.title)" }.joined(separator: "; ")
-            proc.environment = env
+            proc.environment = DiskHealthMonitor.makeCleanAlertScriptEnvironment(snapshot: snapshot, title: title, eventType: eventType)
 
             do {
                 try proc.run()
@@ -1208,10 +1370,11 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
                 watchdog.schedule(deadline: .now() + 15.0)
                 watchdog.setEventHandler {
                     if proc.isRunning {
+                        VolumeVerifierService.terminateProcessAndChildren(pid: pid, signal: SIGTERM)
                         proc.terminate()
                         let escalation = DispatchWorkItem {
                             if proc.isRunning && pid > 0 {
-                                kill(pid, SIGKILL)
+                                VolumeVerifierService.terminateProcessAndChildren(pid: pid, signal: SIGKILL)
                             }
                         }
                         timeoutLock.lock()

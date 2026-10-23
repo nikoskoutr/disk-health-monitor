@@ -55,6 +55,43 @@ func printUsage() {
 func parseCommandLine() {
     let args = CommandLine.arguments
 
+    // Validate known CLI options (CLI-01) while ignoring macOS LaunchServices parameters (MISSED-05)
+    let recognizedFlags: Set<String> = [
+        "--all", "--volume", "--device", "--version", "-v", "--help", "-h",
+        "--export-config", "--unmasked", "--include-secrets", "--import-config",
+        "--export-diagnostics", "--export-html", "--surface-scan",
+        "--test-alert-script", "--list-disks", "--json", "--cli", "--status",
+        "--check", "--watch-mounts", "--deep", "--notify", "--notify-if-unhealthy",
+        "--verify", "--send-report", "--menubar"
+    ]
+
+    var skipNext = false
+    for i in 1..<args.count {
+        if skipNext {
+            skipNext = false
+            continue
+        }
+        let arg = args[i]
+        if arg == "--volume" || arg == "--device" || arg == "--import-config" || arg == "--export-diagnostics" || arg == "--export-html" || arg == "--surface-scan" {
+            if i + 1 < args.count && !args[i + 1].hasPrefix("-") {
+                skipNext = true
+            }
+            continue
+        }
+        if arg.hasPrefix("--surface-scan=") {
+            continue
+        }
+        if arg.hasPrefix("-") {
+            if arg.hasPrefix("-psn_") || arg.hasPrefix("-NS") || arg.hasPrefix("-Apple") {
+                continue
+            }
+            if !recognizedFlags.contains(arg) {
+                fputs("Error: Unrecognized option '\(arg)'. Use --help for usage information.\n", stderr)
+                exit(64)
+            }
+        }
+    }
+
     // Process override flags first (in-memory overrides for this invocation)
     if args.contains("--all") {
         ConfigManager.shared.overrideMonitorAll(true)
@@ -246,13 +283,13 @@ func parseCommandLine() {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let isMultiJson = args.contains("--all") || ConfigManager.shared.currentConfig.monitorAllDisks || ConfigManager.shared.currentConfig.monitoredTargets.count > 1
         if isMultiJson {
-            let multi = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: true, allowNotifications: false)
+            let multi = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: true, allowNotifications: false, persistState: false)
             if let data = try? encoder.encode(multi), let str = String(data: data, encoding: .utf8) {
                 print(str)
             }
             exit(Int32(multi.overallSeverity.rank))
         } else {
-            let snap = DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: false)
+            let snap = DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: false, persistState: false)
             if let data = try? encoder.encode(snap), let str = String(data: data, encoding: .utf8) {
                 print(str)
             }
@@ -273,7 +310,7 @@ func parseCommandLine() {
 
         let isMulti = args.contains("--all") || ConfigManager.shared.currentConfig.monitorAllDisks || ConfigManager.shared.currentConfig.monitoredTargets.count > 1
         if isMulti {
-            let multi = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: true, allowNotifications: notify)
+            let multi = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: true, allowNotifications: notify, persistState: notify)
             print("============================================================")
             print("  \(multi.overallSeverity.emoji) FLEET DISK HEALTH MONITOR — \(multi.overallSeverity.rawValue) (Worst: \(multi.worstHealthScore)/100, Avg: \(multi.averageHealthScore)/100) [\(multi.disks.count) Disks]")
             print("============================================================")
@@ -297,11 +334,11 @@ func parseCommandLine() {
             }
             print("============================================================")
             if notify {
-                DiskHealthMonitor.shared.waitForPendingNotifications(timeout: 3.0)
+                DiskHealthMonitor.shared.waitForPendingNotifications(timeout: 16.0)
             }
             exit(Int32(multi.overallSeverity.rank))
         } else {
-            let snap = DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: notify)
+            let snap = DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: notify, persistState: notify)
 
             print("============================================================")
             print("  \(snap.overallSeverity.emoji) DISK HEALTH MONITOR — \(snap.overallSeverity.rawValue) (Score: \(snap.healthScore)/100) [\(kAppArchShort)]")
@@ -340,14 +377,14 @@ func parseCommandLine() {
             }
             print("============================================================")
             if notify {
-                DiskHealthMonitor.shared.waitForPendingNotifications(timeout: 3.0)
+                DiskHealthMonitor.shared.waitForPendingNotifications(timeout: 16.0)
             }
             exit(Int32(snap.overallSeverity.rank))
         }
     }
 
     if args.contains("--send-report") {
-        let snap = DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: false)
+        let snap = DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: false, persistState: false)
         let html = TelegramNotifier.shared.formatReportHTML(snapshot: snap, title: "Disk Health Monitor Status Report")
         let ok = TelegramNotifier.shared.sendMessage(htmlText: html, disableNotification: false)
         print(ok ? "Telegram health report sent successfully." : "Failed to send Telegram health report.")

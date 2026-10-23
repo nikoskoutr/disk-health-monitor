@@ -123,7 +123,7 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
  * (233 K to 423 K, corresponding to -40°C to +150°C), clamping out-of-bounds readings.
  * 
  * @param tempRaw Raw 16-bit little-endian temperature from NVMe SMART payload in Kelvin.
- * @return Temperature in degrees Celsius, or -999 if invalid/unreported.
+ * @return Temperature in degrees Celsius, or 0 if invalid/unreported.
  */
 int32_t DiskConvertNVMeTemperature(uint16_t tempRaw);
 
@@ -141,8 +141,8 @@ uint64_t DiskDecodeNVMeLE128(const uint8_t *bytes);
 /**
  * @brief Normalizes raw IOKit link speed representations or speed codes to bits per second (bps).
  * 
- * Decodes discrete USB speed codes (1: Low Speed 1.5 Mbps, 2: Full Speed 12 Mbps,
- * 3: High Speed 480 Mbps, 4: SuperSpeed 5 Gbps, 5: SuperSpeed+ 10 Gbps) and passes
+ * Decodes discrete USB speed codes (1: Full Speed 12 Mbps, 2: High Speed 480 Mbps,
+ * 3: SuperSpeed 5 Gbps, 4: SuperSpeed+ 10 Gbps, 5: USB4 20 Gbps) and passes
  * raw bit-rate values directly through.
  * 
  * @param rawSpeed Raw speed integer from IOKit properties.

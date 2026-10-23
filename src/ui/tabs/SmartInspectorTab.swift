@@ -15,8 +15,8 @@ struct SmartInspectorTab: View {
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
-            let multi = monitor.publishedMultiSnapshot ?? monitor.currentMultiSnapshot
-            let targetSnap = multi?.disks.first(where: { $0.driveKey == monitor.selectedDashboardDriveKey }) ?? monitor.publishedSnapshot ?? monitor.currentSnapshot
+            let multi = monitor.publishedMultiSnapshot
+            let targetSnap = multi?.disks.first(where: { $0.driveKey == monitor.selectedDashboardDriveKey }) ?? monitor.publishedSnapshot
             if let snap = targetSnap {
                 VStack(alignment: .leading, spacing: 14) {
                     if let multi = multi, multi.disks.count > 1 {

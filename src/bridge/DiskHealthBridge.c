@@ -675,7 +675,7 @@ int DiskListAllDevices(DiskHardwareMetrics *outArray, int maxCount) {
 
     int count = 0;
     io_service_t service;
-    while ((service = IOIteratorNext(iter)) != 0 && count < maxCount) {
+    while (count < maxCount && (service = IOIteratorNext(iter)) != 0) {
         populateMetricsFromBlockStorageDevice(service, &outArray[count]);
         if (outArray[count].found) {
             count++;
@@ -825,6 +825,7 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
     }
     bool found = false;
     int bestScore = -1;
+    uint64_t bestCapacity = 0;
 
     for (int i = 0; i < count; i++) {
         const char *fromName = fsList[i].f_mntfromname;
@@ -844,20 +845,29 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
         const char *mountPath = fsList[i].f_mntonname;
 
         int candidateScore = 1;
+        uint64_t candidateCapacity = (uint64_t)fsList[i].f_blocks * (uint64_t)fsList[i].f_bsize;
+        bool isWritable = ((fsList[i].f_flags & MNT_RDONLY) == 0);
+        bool isEfiOrRecovery = (strstr(mountPath, "EFI") != NULL || strstr(mountPath, "Recovery") != NULL || strstr(mountPath, "Preboot") != NULL);
+
         if (isExactSliceMatch) {
             candidateScore = 10;
         } else if (strcmp(mountPath, "/") == 0) {
-            candidateScore = 4; // Root filesystem is highest priority
-        } else if (strncmp(mountPath, "/Volumes/", 9) == 0 && strcmp(mountPath, "/Volumes/Recovery") != 0) {
-            candidateScore = 3; // External user volume
+            candidateScore = 6; // Root filesystem takes absolute whole-disk priority
+        } else if (strncmp(mountPath, "/Volumes/", 9) == 0 && !isEfiOrRecovery) {
+            candidateScore = isWritable ? 5 : 4; // Prefer writable external user volumes
         } else if (strcmp(mountPath, "/System/Volumes/Data") == 0) {
-            candidateScore = 2; // Data volume
-        } else if (strncmp(mountPath, "/System/Volumes/", 16) == 0 || strcmp(mountPath, "/Volumes/Recovery") == 0) {
-            candidateScore = 0; // Hidden internal / recovery volumes
+            candidateScore = 3; // Data volume
+        } else if (isEfiOrRecovery) {
+            candidateScore = 1; // Hidden helper / EFI / Recovery partition on same physical disk
+        } else if (strncmp(mountPath, "/System/Volumes/", 16) == 0) {
+            candidateScore = 0; // System container helpers
         }
 
-        // Skip expensive IOKit parent traversal if this mount cannot beat our current bestScore
-        if (candidateScore <= bestScore) {
+        // Skip expensive IOKit parent traversal if this mount cannot beat our current best
+        if (candidateScore < bestScore) {
+            continue;
+        }
+        if (candidateScore == bestScore && candidateCapacity <= bestCapacity) {
             continue;
         }
 
@@ -872,8 +882,9 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
         }
 
         if (isExactSliceMatch || isSameDevice) {
-            if (candidateScore > bestScore) {
+            if (candidateScore > bestScore || (candidateScore == bestScore && candidateCapacity > bestCapacity)) {
                 bestScore = candidateScore;
+                bestCapacity = candidateCapacity;
                 strlcpy(outMountPoint, mountPath, maxLen);
                 found = true;
                 if (candidateScore == 10) {

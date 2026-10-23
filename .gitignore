@@ -31,7 +31,6 @@ disk-health
 # Project Directories Ignored from Version Control
 scripts/
 logs/
-docs/
 
 # Secrets & Environment Overrides
 .secrets.json

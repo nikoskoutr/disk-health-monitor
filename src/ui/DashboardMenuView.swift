@@ -17,8 +17,8 @@ struct DashboardMenuView: View {
     @ObservedObject var configMgr: ConfigManager = ConfigManager.shared
 
     var body: some View {
-        let multi = monitor.publishedMultiSnapshot ?? monitor.currentMultiSnapshot
-        let activeSnap = multi?.disks.first(where: { $0.driveKey == monitor.selectedDashboardDriveKey }) ?? monitor.publishedSnapshot ?? monitor.currentSnapshot
+        let multi = monitor.publishedMultiSnapshot
+        let activeSnap = multi?.disks.first(where: { $0.driveKey == monitor.selectedDashboardDriveKey }) ?? monitor.publishedSnapshot
         if let snap = activeSnap {
             let cfg = configMgr.config
             VStack(alignment: .leading, spacing: 10) {
@@ -128,7 +128,7 @@ struct DashboardMenuView: View {
                                 .fill(Color.secondary.opacity(0.2))
                                 .frame(height: 7)
                             RoundedRectangle(cornerRadius: 4)
-                                .fill(capacityColor(snap.usedPercent))
+                                .fill(capacityColor(snap.usedPercent, cfg: cfg))
                                 .frame(width: max(4, geo.size.width * CGFloat(min(100.0, max(0.0, snap.usedPercent)) / 100.0)), height: 7)
                         }
                     }
@@ -179,12 +179,30 @@ struct DashboardMenuView: View {
                         subtitle: snap.smartValid ? String(format: "%.2f TB R • %.1f GB/d • %lluh", snap.totalTerabytesRead, snap.dailyTerabytesWritten * 1000.0, snap.powerOnHours) : "No SMART",
                         tint: .purple
                     )
+                    let canarySub: String = {
+                        if snap.canaryOk {
+                            return String(format: "Canary: %.1f ms • OK", snap.canaryLatencyMs)
+                        } else if snap.canaryError == "Canary disabled" || snap.canaryError == "Volume not mounted" {
+                            return snap.canaryError == "Canary disabled" ? "Canary: Disabled" : "Canary: Unmounted"
+                        } else {
+                            return "Canary: FAILED"
+                        }
+                    }()
+                    let canaryTint: Color = {
+                        if snap.canaryOk {
+                            return (snap.errorsRead + snap.errorsWritten + snap.mediaErrors == 0) ? .green : .orange
+                        } else if snap.canaryError == "Canary disabled" || snap.canaryError == "Volume not mounted" {
+                            return .secondary
+                        } else {
+                            return .red
+                        }
+                    }()
                     metricTile(
                         icon: "waveform.path.ecg",
                         title: "I/O & CANARY PROBE",
                         value: "\(snap.errorsRead + snap.errorsWritten + snap.mediaErrors) Errors",
-                        subtitle: snap.canaryOk ? String(format: "Canary: %.1f ms • OK", snap.canaryLatencyMs) : "Canary: FAILED",
-                        tint: (snap.canaryOk && (snap.errorsRead + snap.errorsWritten + snap.mediaErrors == 0)) ? .green : .red
+                        subtitle: canarySub,
+                        tint: canaryTint
                     )
                 }
 
@@ -318,9 +336,9 @@ struct DashboardMenuView: View {
         }
     }
 
-    private func capacityColor(_ pct: Double) -> Color {
-        if pct >= 92 { return .red }
-        if pct >= 82 { return .orange }
+    private func capacityColor(_ pct: Double, cfg: DiskHealthConfig) -> Color {
+        if pct >= cfg.diskUsedCriticalPercent { return .red }
+        if pct >= cfg.diskUsedWarningPercent { return .orange }
         return .blue
     }
 }

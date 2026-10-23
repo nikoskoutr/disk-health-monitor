@@ -102,8 +102,8 @@ final class CanaryProbeService: @unchecked Sendable {
     ///    to active `opendir()` + `readdir()` directory traversal.
     private func performSingleCanaryPass(targetMount: String) -> CanaryProbeResult {
         let effectiveDir: String
-        if targetMount == "/" && FileManager.default.isWritableFile(atPath: "/System/Volumes/Data/private/tmp") {
-            effectiveDir = "/System/Volumes/Data/private/tmp"
+        if targetMount == "/" {
+            effectiveDir = ConfigManager.shared.configDir
         } else {
             effectiveDir = targetMount
         }
@@ -113,9 +113,9 @@ final class CanaryProbeService: @unchecked Sendable {
         guard var data = header.data(using: .utf8) else {
             return CanaryProbeResult(ok: false, latencyMs: 0, error: "Encoding error")
         }
-        // Pad to 512-byte sector boundary so F_NOCACHE pwrite/pread never fails with EINVAL on exFAT/FAT32
-        if data.count < 512 {
-            data.append(Data(repeating: 0x20, count: 512 - data.count - 1))
+        // Pad to 4096-byte boundary so F_NOCACHE pwrite/pread succeeds on 4K sectors without driver EINVAL
+        if data.count < 4096 {
+            data.append(Data(repeating: 0x20, count: 4096 - data.count - 1))
             data.append(0x0A)
         }
 
@@ -192,6 +192,10 @@ final class CanaryProbeService: @unchecked Sendable {
         guard bytesRead == data.count, readBuf.elementsEqual(data) else {
             unlink(canaryPath)
             return CanaryProbeResult(ok: false, latencyMs: 0, error: "readback verification mismatch")
+        }
+
+        if targetMount.hasPrefix("/Volumes/") {
+            unlink(canaryPath)
         }
 
         let elapsedNs = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds

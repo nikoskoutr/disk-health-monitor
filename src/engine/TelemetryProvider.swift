@@ -261,7 +261,7 @@ final class MockTelemetryProvider: DiskTelemetryProvider, @unchecked Sendable {
         if let override = override {
             return override
         }
-        return CanaryProbeService.shared.runCanaryCheck(targetMount: targetMount, force: force, nowTs: nowTs)
+        return CanaryProbeResult(ok: true, latencyMs: 1.0, error: "")
     }
 
     func checkSubpaths(mountPoint: String, isMounted: Bool, requiredSubpaths: [String]) -> [String: Bool] {

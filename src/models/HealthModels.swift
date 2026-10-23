@@ -21,8 +21,8 @@ public let kAppArchitecture = "unknown"
 public let kAppArchShort = "unknown"
 #endif
 
-public let kAppVersion = "2.4.0"
-public let kAppBuildNumber = "7"
+public let kAppVersion = "2.5.0"
+public let kAppBuildNumber = "8"
 
 // MARK: - Data Models
 
@@ -49,7 +49,7 @@ enum HealthSeverity: String, Codable, Sendable, Equatable {
 }
 
 struct HealthIssue: Codable, Identifiable, Sendable, Equatable {
-    var id: String { code }
+    var id: String { "\(code):\(detail)" }
     let code: String
     let severity: HealthSeverity
     let title: String
@@ -71,6 +71,11 @@ struct DriveBaselineState: Codable, Sendable, Equatable {
     var lastVerifyResult: String = "Not run yet"
     var lastVerifyOk: Bool = true
     var lastOverallSeverity: String = HealthSeverity.healthy.rawValue
+    var consecutiveUnhealthyPolls: Int = 0
+    var consecutiveHealthyPolls: Int = 0
+    var lastNotifiedSeverity: String = HealthSeverity.healthy.rawValue
+    var lastRecoveryTimestamp: TimeInterval = 0
+    var wasWritable: Bool? = nil
 
     init(bsdName: String = "", serialNumber: String = "") {
         self.bsdName = bsdName
@@ -84,6 +89,8 @@ struct DriveBaselineState: Codable, Sendable, Equatable {
         case baselineIoReadRetries, baselineIoWriteRetries
         case peakTemperatureCelsius, lastVerifyTimestamp, lastVerifyResult, lastVerifyOk
         case lastOverallSeverity
+        case consecutiveUnhealthyPolls, consecutiveHealthyPolls, lastNotifiedSeverity
+        case lastRecoveryTimestamp, wasWritable
     }
 
     init(from decoder: Decoder) throws {
@@ -103,6 +110,11 @@ struct DriveBaselineState: Codable, Sendable, Equatable {
         lastVerifyResult = try c.decodeIfPresent(String.self, forKey: .lastVerifyResult) ?? def.lastVerifyResult
         lastVerifyOk = try c.decodeIfPresent(Bool.self, forKey: .lastVerifyOk) ?? def.lastVerifyOk
         lastOverallSeverity = try c.decodeIfPresent(String.self, forKey: .lastOverallSeverity) ?? def.lastOverallSeverity
+        consecutiveUnhealthyPolls = try c.decodeIfPresent(Int.self, forKey: .consecutiveUnhealthyPolls) ?? def.consecutiveUnhealthyPolls
+        consecutiveHealthyPolls = try c.decodeIfPresent(Int.self, forKey: .consecutiveHealthyPolls) ?? def.consecutiveHealthyPolls
+        lastNotifiedSeverity = try c.decodeIfPresent(String.self, forKey: .lastNotifiedSeverity) ?? def.lastNotifiedSeverity
+        lastRecoveryTimestamp = try c.decodeIfPresent(TimeInterval.self, forKey: .lastRecoveryTimestamp) ?? def.lastRecoveryTimestamp
+        wasWritable = try c.decodeIfPresent(Bool.self, forKey: .wasWritable) ?? def.wasWritable
     }
 }
 
@@ -353,8 +365,33 @@ extension DiskHardwareMetrics: @unchecked Sendable {}
 // MARK: - Multi-Disk Fleet Models & Snapshot Extensions
 
 extension DiskHealthSnapshot: Identifiable {
+    static func isPlaceholderSerial(_ serial: String) -> Bool {
+        let s = serial.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty { return true }
+        let placeholders: Set<String> = [
+            "000000000000",
+            "0000000000000000",
+            "0123456789ABCDEF",
+            "0123456789abcdef",
+            "1234567890",
+            "None",
+            "N/A",
+            "UNKNOWN",
+            "Generic",
+            "0"
+        ]
+        if placeholders.contains(s) { return true }
+        if s.count >= 4 && Set(s).count == 1 { return true }
+        return false
+    }
+
     var driveKey: String {
-        if !serialNumber.isEmpty { return serialNumber }
+        if !serialNumber.isEmpty && !DiskHealthSnapshot.isPlaceholderSerial(serialNumber) {
+            return serialNumber
+        }
+        if !serialNumber.isEmpty && !bsdName.isEmpty {
+            return "\(serialNumber)#\(bsdName)"
+        }
         if !bsdName.isEmpty { return bsdName }
         if !mountPoint.isEmpty { return mountPoint }
         return "\(vendorName)-\(productName)"

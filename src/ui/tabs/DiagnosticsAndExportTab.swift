@@ -225,7 +225,7 @@ struct DiagnosticsAndExportTab: View {
                 SettingsCard(title: "File System Integrity Verification", icon: "checkmark.shield.fill", iconColor: .teal) {
                     SettingsRow(
                         title: "Verify Volume File System (diskutil verifyVolume)",
-                        subtitle: "Last Status: \(monitor.currentSnapshot?.lastVerifyResult ?? "Not run yet")"
+                        subtitle: "Last Status: \(monitor.publishedSnapshot?.lastVerifyResult ?? "Not run yet")"
                     ) {
                         Button(action: {
                             viewModel.runVolumeVerificationAction()

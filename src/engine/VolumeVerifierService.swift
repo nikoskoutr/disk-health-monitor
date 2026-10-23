@@ -49,7 +49,7 @@ final class VolumeVerifierService: @unchecked Sendable {
     /// - Returns: Tuple indicating (isHealthy, isSkipped, summaryText).
     static func classifyVolumeVerificationOutput(terminationStatus: Int32, output: String, didTimeout: Bool, timeStr: String) -> (isHealthy: Bool, isSkipped: Bool, summary: String) {
         if didTimeout {
-            return (true, true, "Skipped (\(timeStr)): Verification timed out after 180s")
+            return (false, false, "Failed (\(timeStr)): Verification timed out after 180s")
         }
         let passed = (terminationStatus == 0) &&
             (output.contains("appears to be OK") ||
@@ -134,7 +134,6 @@ final class VolumeVerifierService: @unchecked Sendable {
                             if pid > 0 {
                                 VolumeVerifierService.terminateProcessAndChildren(pid: pid, signal: SIGKILL)
                             }
-                            try? readHandle.close()
                         }
                         timeoutLock.lock()
                         killWorkItem = escalation

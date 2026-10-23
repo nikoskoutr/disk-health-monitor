@@ -758,7 +758,7 @@ struct CoreLogicTestRunner {
         assertTrue(!kAppArchitecture.isEmpty, "kAppArchitecture must not be empty")
         assertTrue(!kAppArchShort.isEmpty, "kAppArchShort must not be empty")
         assertTrue(kAppArchShort == "arm64" || kAppArchShort == "x86_64", "kAppArchShort must be either arm64 or x86_64")
-        assertTrue(kAppVersion == "2.4.0", "kAppVersion must match 2.4.0")
+        assertTrue(kAppVersion == "2.5.0", "kAppVersion must match 2.5.0")
 
         let diag = DiagnosticExporter.shared.generateDiagnosticReport()
         guard let sys = diag["system"] as? [String: Any] else {
@@ -2652,6 +2652,290 @@ struct CoreLogicTestRunner {
             VolumeVerifierService.terminateProcessAndChildren(pid: 0, signal: SIGTERM) // Must safely no-op for pid <= 0
 
             print("  [OK] Canary sector-alignment, orphan self-healing, UI drive synchronization, brand-new drive metrics, and child termination verified")
+        }
+
+        // ====================================================================
+        // Test 41: ConfigManager Validation & isSecureUserOwnedFile (RULE-08, SEC-01)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 41: ConfigManager Validation & Secure File Verification (RULE-08, SEC-01) ===")
+            var cfg = DiskHealthConfig()
+            cfg.tempWarningCelsius = 75
+            cfg.tempCriticalCelsius = 60 // Invalid: warn > crit
+            cfg.diskUsedWarningPercent = 95.0
+            cfg.diskUsedCriticalPercent = 90.0 // Invalid: warn > crit
+            cfg.minFreeSpaceCriticalGB = 40.0
+            cfg.minFreeSpaceWarningGB = 20.0 // Invalid: crit > warn
+            cfg.pollIntervalSeconds = 1.0 // Invalid: < 5.0s
+
+            let validated = cfg.validated()
+            assertTrue(validated.pollIntervalSeconds >= 5.0, "pollIntervalSeconds must be clamped to >= 5.0")
+            assertTrue(validated.tempWarningCelsius < validated.tempCriticalCelsius, "tempCriticalCelsius must exceed tempWarningCelsius")
+            assertTrue(validated.diskUsedWarningPercent < validated.diskUsedCriticalPercent, "diskUsedCriticalPercent must exceed diskUsedWarningPercent")
+            assertTrue(validated.minFreeSpaceCriticalGB < validated.minFreeSpaceWarningGB, "minFreeSpaceCriticalGB must be strictly less than minFreeSpaceWarningGB")
+
+            // Test isSecureUserOwnedFile
+            let tmpPath = "\(NSTemporaryDirectory())test_secure_file_\(UUID().uuidString).txt"
+            try? "secure-content".write(toFile: tmpPath, atomically: true, encoding: .utf8)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmpPath)
+            assertTrue(ConfigManager.isSecureUserOwnedFile(atPath: tmpPath), "Owner-read/write file (0600) must be accepted as secure")
+
+            // Insecure group/world-writable file (0666)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o666], ofItemAtPath: tmpPath)
+            assertTrue(!ConfigManager.isSecureUserOwnedFile(atPath: tmpPath), "World-writable file (0666) must be rejected as insecure")
+
+            // Symlink must be rejected
+            let symPath = "\(NSTemporaryDirectory())test_symlink_\(UUID().uuidString)"
+            try? FileManager.default.createSymbolicLink(atPath: symPath, withDestinationPath: tmpPath)
+            assertTrue(!ConfigManager.isSecureUserOwnedFile(atPath: symPath), "Symbolic link must be rejected by isSecureUserOwnedFile")
+
+            try? FileManager.default.removeItem(atPath: tmpPath)
+            try? FileManager.default.removeItem(atPath: symPath)
+            print("  [OK] ConfigManager validation and file security checks verified")
+        }
+
+        // ====================================================================
+        // Test 42: Safe Empty Snapshot Handling & Duplicate Serial Fallback (MISSED-01, RULE-05)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 42: Empty Snapshot Fallback & Duplicate Serial Handling (MISSED-01, RULE-05) ===")
+            let mock = MockTelemetryProvider()
+            let monitor = DiskHealthMonitor.shared
+
+            // Test MISSED-01: cfg with monitorAllDisks=false and monitoredTargets containing empty string
+            ConfigManager.shared.updateConfig {
+                $0.monitorAllDisks = false
+                $0.monitoredTargets = ["   "]
+            }
+
+            // Must NOT crash with force-unwrap on empty snapshots array
+            let multi = monitor.evaluateAllMonitoredDisks(forceCanary: false, allowNotifications: false, persistState: false, telemetryProvider: mock)
+            assertTrue(!multi.disks.isEmpty, "evaluateAllMonitoredDisks must safely fall back when target filtering produces empty array")
+            assertTrue(multi.primarySnapshot != nil, "primarySnapshot must be present and safe")
+
+            // Test RULE-05: Duplicate placeholder serial numbers
+            var dev1 = DiskHardwareMetrics()
+            dev1.found = true
+            dev1.isInternal = false
+            _ = "disk10".withCString { strlcpy(&dev1.bsdName.0, $0, 32) }
+            _ = "000000000000".withCString { strlcpy(&dev1.serialNumber.0, $0, 64) }
+
+            var dev2 = DiskHardwareMetrics()
+            dev2.found = true
+            dev2.isInternal = false
+            _ = "disk11".withCString { strlcpy(&dev2.bsdName.0, $0, 32) }
+            _ = "000000000000".withCString { strlcpy(&dev2.serialNumber.0, $0, 64) }
+
+            mock.allDevices = [dev1, dev2]
+            ConfigManager.shared.updateConfig {
+                $0.monitorAllDisks = true
+                $0.monitoredTargets = []
+            }
+            let dupMulti = monitor.evaluateAllMonitoredDisks(forceCanary: false, allowNotifications: false, persistState: false, telemetryProvider: mock)
+            assertTrue(dupMulti.disks.count == 2, "Both drives with dummy/duplicate serials must be monitored, got \(dupMulti.disks.count)")
+            assertTrue(dupMulti.disks[0].driveKey != dupMulti.disks[1].driveKey, "Drives sharing duplicate serials must have distinct driveKeys: '\(dupMulti.disks[0].driveKey)' vs '\(dupMulti.disks[1].driveKey)'")
+            print("  [OK] Empty snapshot fallback and duplicate serial deduplication verified")
+        }
+
+        // ====================================================================
+        // Test 43: Baseline Reset Safety & Reboot Counter Reset (MISSED-02, RULE-02)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 43: Baseline Reset Safety & Re-baseline on Reset (MISSED-02, RULE-02) ===")
+            let mock = MockTelemetryProvider()
+            let monitor = DiskHealthMonitor.shared
+            let testKey = "test_baseline_key_\(UUID().uuidString)"
+
+            monitor.mutateStateForTesting { s in
+                s.updateDriveState(key: testKey) { d in
+                    d.baselineMediaErrors = 10
+                    d.baselineIoReadErrors = 5
+                    d.baselineIoWriteErrors = 3
+                }
+            }
+
+            // Clear snapshots so activeSnapshots is empty, then call resetBaselines()
+            monitor.clearCurrentSnapshotForTesting()
+            monitor.resetBaselines()
+
+            let stateAfterReset = monitor.persistentState.getDriveState(key: testKey)
+            assertTrue(stateAfterReset.baselineMediaErrors != nil && stateAfterReset.baselineMediaErrors! >= 10, "resetBaselines must NOT wipe existing error baselines to nil/0 when active snapshots are empty")
+            assertTrue(stateAfterReset.baselineIoReadErrors != nil && stateAfterReset.baselineIoReadErrors! >= 5, "baselineIoReadErrors must be preserved across reset")
+
+            // Test reboot/replug counter decrease: when counters reset to lower numbers, baselines must adapt
+            var hwReset = DiskHardwareMetrics()
+            hwReset.found = true
+            hwReset.statsValid = true
+            hwReset.errorsRead = 0 // Decreased from 5 (e.g. system reboot)
+            hwReset.errorsWritten = 0
+            _ = "disk20".withCString { strlcpy(&hwReset.bsdName.0, $0, 32) }
+            _ = "SERIAL_REBOOT".withCString { strlcpy(&hwReset.serialNumber.0, $0, 64) }
+            mock.hardwareMetrics = hwReset
+
+            let snapReboot = monitor.evaluateHealth(forceCanary: false, allowNotifications: false, persistState: false, telemetryProvider: mock)
+            let rebootState = monitor.persistentState.getDriveState(key: snapReboot.driveKey)
+            assertTrue(rebootState.baselineIoReadErrors == 0, "Counter decrease (system reboot) must re-baseline to current lower value (0), got \(String(describing: rebootState.baselineIoReadErrors))")
+            print("  [OK] Baseline reset safety and reboot counter reset verified")
+        }
+
+        // ====================================================================
+        // Test 44: Naturally Read-Only Filesystems & Alert Hysteresis (RULE-03, ALERT-01)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 44: Naturally Read-Only Filesystems & Alert Hysteresis (RULE-03, ALERT-01) ===")
+            // Rule 3: Test NTFS read-only volume
+            let ntfsContext = HealthEvaluationContext(
+                nowTs: 1000.0,
+                config: DiskHealthConfig(),
+                hardware: DiskHardwareMetrics(),
+                linkSpeedFormatted: "5 Gbps",
+                interconnect: "USB",
+                mountToInspect: "/Volumes/WindowsNTFS",
+                filesystem: FilesystemMountMetrics(
+                    isMounted: true,
+                    mountPoint: "/Volumes/WindowsNTFS",
+                    filesystemType: "ntfs",
+                    isReadOnly: true,
+                    totalBytes: 1_000_000_000_000,
+                    freeBytes: 500_000_000_000,
+                    purgeableBytes: 0,
+                    usedBytes: 500_000_000_000,
+                    usedPercent: 50.0
+                ),
+                subpathsStatus: [:],
+                canaryOk: true,
+                canaryLatencyMs: 1.0,
+                canaryError: "",
+                avgReadLatMs: 0.0,
+                avgWriteLatMs: 0.0,
+                inWakeGrace: false,
+                hostThermalState: .nominal,
+                driveState: DriveBaselineState(),
+                recentTemperatureSamples: []
+            )
+
+            let rule = VolumeMountAndReadOnlyRule()
+            let outcome = rule.evaluate(context: ntfsContext)
+            assertTrue(!outcome.issues.contains(where: { $0.code == "VOLUME_READONLY" }), "Naturally read-only NTFS volume must NOT be flagged as VOLUME_READONLY")
+
+            // Test Value Hysteresis: DiskSpaceRule
+            var cfg = DiskHealthConfig()
+            cfg.diskUsedWarningPercent = 85.0
+            cfg.diskUsedCriticalPercent = 95.0
+
+            var healthyDriveState = DriveBaselineState()
+            healthyDriveState.lastOverallSeverity = HealthSeverity.healthy.rawValue
+
+            var unhealthyDriveState = DriveBaselineState()
+            unhealthyDriveState.lastOverallSeverity = HealthSeverity.warning.rawValue
+
+            let spaceRule = DiskSpaceRule()
+            let fs84 = FilesystemMountMetrics(
+                isMounted: true,
+                mountPoint: "/Volumes/TestHysteresis",
+                filesystemType: "apfs",
+                isReadOnly: false,
+                totalBytes: 1_000_000_000_000,
+                freeBytes: 160_000_000_000,
+                purgeableBytes: 0,
+                usedBytes: 840_000_000_000,
+                usedPercent: 84.0
+            )
+
+            let ctxHealthy = HealthEvaluationContext(
+                nowTs: 1000.0,
+                config: cfg,
+                hardware: DiskHardwareMetrics(),
+                linkSpeedFormatted: "5 Gbps",
+                interconnect: "USB",
+                mountToInspect: "/Volumes/TestHysteresis",
+                filesystem: fs84,
+                subpathsStatus: [:],
+                canaryOk: true,
+                canaryLatencyMs: 1.0,
+                canaryError: "",
+                avgReadLatMs: 0.0,
+                avgWriteLatMs: 0.0,
+                inWakeGrace: false,
+                hostThermalState: .nominal,
+                driveState: healthyDriveState,
+                recentTemperatureSamples: []
+            )
+            let outHealthy = spaceRule.evaluate(context: ctxHealthy)
+            assertTrue(!outHealthy.issues.contains(where: { $0.code == "DISK_SPACE_WARNING" }), "Healthy drive at 84% must not trigger warning")
+
+            let ctxUnhealthy = HealthEvaluationContext(
+                nowTs: 1000.0,
+                config: cfg,
+                hardware: DiskHardwareMetrics(),
+                linkSpeedFormatted: "5 Gbps",
+                interconnect: "USB",
+                mountToInspect: "/Volumes/TestHysteresis",
+                filesystem: fs84,
+                subpathsStatus: [:],
+                canaryOk: true,
+                canaryLatencyMs: 1.0,
+                canaryError: "",
+                avgReadLatMs: 0.0,
+                avgWriteLatMs: 0.0,
+                inWakeGrace: false,
+                hostThermalState: .nominal,
+                driveState: unhealthyDriveState,
+                recentTemperatureSamples: []
+            )
+            let outUnhealthy = spaceRule.evaluate(context: ctxUnhealthy)
+            assertTrue(outUnhealthy.issues.contains(where: { $0.code == "DISK_SPACE_WARNING" }), "Unhealthy drive at 84% must retain warning under hysteresis until <= 83.5%")
+
+            print("  [OK] Naturally read-only filesystem handling and alert value hysteresis verified")
+        }
+
+        // ====================================================================
+        // Test 45: Interval Latency & Read-Only CLI State Invariance (RULE-01, STATE-02)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 45: Interval Latency & CLI Read-Only State Invariance (RULE-01, STATE-02) ===")
+            let mock = MockTelemetryProvider()
+            let monitor = DiskHealthMonitor.shared
+
+            var hw1 = DiskHardwareMetrics()
+            hw1.found = true
+            hw1.statsValid = true
+            hw1.operationsRead = 1000
+            hw1.totalTimeReadNs = 5_000_000_000 // 5.0s / 1000 ops = 5.0 ms avg
+            _ = "disk30".withCString { strlcpy(&hw1.bsdName.0, $0, 32) }
+            _ = "SERIAL_INTERVAL".withCString { strlcpy(&hw1.serialNumber.0, $0, 64) }
+            mock.hardwareMetrics = hw1
+
+            // Poll 1: Establishes initial baseline throughput sample
+            let snap1 = monitor.evaluateHealth(forceCanary: false, allowNotifications: false, persistState: false, telemetryProvider: mock)
+            assertTrue(snap1.avgReadLatencyMs >= 4.9 && snap1.avgReadLatencyMs <= 5.1, "Initial poll must report baseline latency ~5.0ms, got \(snap1.avgReadLatencyMs)")
+
+            // Poll 2: 100 new operations taking 50ms each (spike: 50.0 ms interval latency)
+            var hw2 = hw1
+            hw2.operationsRead = 1100 // +100 ops
+            hw2.totalTimeReadNs = 5_000_000_000 + (100 * 50_000_000) // +5.0s for 100 ops = 50ms interval latency
+            mock.hardwareMetrics = hw2
+
+            let snap2 = monitor.evaluateHealth(forceCanary: false, allowNotifications: false, persistState: false, telemetryProvider: mock)
+            assertTrue(snap2.avgReadLatencyMs >= 48.0 && snap2.avgReadLatencyMs <= 52.0, "Interval latency must compute delta time / delta ops (~50ms), got \(snap2.avgReadLatencyMs)")
+
+            // Test STATE-02: read-only evaluation with persistState: false must NOT create or alter state.json
+            let stateFile = ConfigManager.shared.stateFilePath
+            let initialMtime: Date? = {
+                if let attrs = try? FileManager.default.attributesOfItem(atPath: stateFile),
+                   let mtime = attrs[.modificationDate] as? Date {
+                    return mtime
+                }
+                return nil
+            }()
+
+            _ = monitor.evaluateHealth(forceCanary: false, allowNotifications: false, persistState: false, telemetryProvider: mock)
+            if let initial = initialMtime, let attrs = try? FileManager.default.attributesOfItem(atPath: stateFile),
+               let current = attrs[.modificationDate] as? Date {
+                assertTrue(current == initial, "persistState: false must NOT modify state.json on disk")
+            }
+
+            print("  [OK] Interval delta latency calculation and read-only state invariance verified")
         }
 
         print("✅ All Swift Core Logic Unit Tests Passed!")

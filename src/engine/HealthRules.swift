@@ -73,6 +73,10 @@ struct HardwarePresenceRule: HealthRule {
 struct VolumeMountAndReadOnlyRule: HealthRule {
     let ruleId = "VolumeMountAndReadOnly"
 
+    static let naturallyReadOnlyFsTypes: Set<String> = [
+        "ntfs", "cd9660", "udf", "iso9660", "cdda", "webdav", "devfs", "autofs"
+    ]
+
     func evaluate(context: HealthEvaluationContext) -> HealthRuleOutcome {
         var outcome = HealthRuleOutcome()
 
@@ -91,13 +95,26 @@ struct VolumeMountAndReadOnlyRule: HealthRule {
         } else if context.filesystem.isMounted {
             // Read-Only Mount (excluding sealed macOS root filesystem "/")
             if context.filesystem.isReadOnly && context.filesystem.mountPoint != "/" {
-                outcome.issues.append(HealthIssue(
-                    code: "VOLUME_READONLY",
-                    severity: .critical,
-                    title: "Volume Mounted Read-Only",
-                    detail: "Volume \(context.filesystem.mountPoint) is mounted in read-only mode (filesystem journal fault or protection)."
-                ))
-                outcome.scorePenalty += 45
+                let fsType = context.filesystem.filesystemType.lowercased()
+                let isNaturallyReadOnly = Self.naturallyReadOnlyFsTypes.contains(fsType)
+                if !isNaturallyReadOnly {
+                    let shouldFlag: Bool
+                    if !context.hardware.isInternal && context.driveState.wasWritable == nil {
+                        shouldFlag = (fsType == "apfs" || fsType == "hfs" || fsType == "exfat" || fsType == "msdos")
+                    } else {
+                        shouldFlag = true
+                    }
+
+                    if shouldFlag {
+                        outcome.issues.append(HealthIssue(
+                            code: "VOLUME_READONLY",
+                            severity: .critical,
+                            title: "Volume Mounted Read-Only",
+                            detail: "Volume \(context.filesystem.mountPoint) is mounted in read-only mode (filesystem journal fault or protection)."
+                        ))
+                        outcome.scorePenalty += 45
+                    }
+                }
             }
         }
         return outcome
@@ -174,6 +191,8 @@ struct DiskSpaceRule: HealthRule {
         let cfg = context.config
         let effectiveCriticalGB = totalGB > 0 ? min(cfg.minFreeSpaceCriticalGB, totalGB * 0.05) : cfg.minFreeSpaceCriticalGB
         let effectiveWarningGB = totalGB > 0 ? min(cfg.minFreeSpaceWarningGB, totalGB * 0.10) : cfg.minFreeSpaceWarningGB
+        let wasUnhealthy = context.driveState.lastOverallSeverity != HealthSeverity.healthy.rawValue
+        let effectiveWarnPercent = wasUnhealthy ? max(10.0, cfg.diskUsedWarningPercent - 1.5) : cfg.diskUsedWarningPercent
 
         if context.filesystem.usedPercent >= cfg.diskUsedCriticalPercent || freeGB < effectiveCriticalGB {
             outcome.issues.append(HealthIssue(
@@ -183,7 +202,7 @@ struct DiskSpaceRule: HealthRule {
                 detail: String(format: "Only %.1f GB free (%.1f%% used on %@).", freeGB, context.filesystem.usedPercent, context.filesystem.mountPoint)
             ))
             outcome.scorePenalty += 25
-        } else if context.filesystem.usedPercent >= cfg.diskUsedWarningPercent || freeGB < effectiveWarningGB {
+        } else if context.filesystem.usedPercent >= effectiveWarnPercent || freeGB < effectiveWarningGB {
             outcome.issues.append(HealthIssue(
                 code: "DISK_SPACE_WARNING",
                 severity: .warning,
@@ -278,6 +297,8 @@ struct ThermalAndSpikeRule: HealthRule {
 
         let tempC = Int(context.hardware.temperatureCelsius)
         let cfg = context.config
+        let wasUnhealthy = context.driveState.lastOverallSeverity != HealthSeverity.healthy.rawValue
+        let effectiveWarnTemp = wasUnhealthy ? (cfg.tempWarningCelsius - 2) : cfg.tempWarningCelsius
 
         if tempC >= cfg.tempCriticalCelsius {
             outcome.issues.append(HealthIssue(
@@ -287,7 +308,7 @@ struct ThermalAndSpikeRule: HealthRule {
                 detail: "Temperature is \(tempC)°C (>= \(cfg.tempCriticalCelsius)°C thermal damage threshold)."
             ))
             outcome.scorePenalty += 35
-        } else if tempC >= cfg.tempWarningCelsius {
+        } else if tempC >= effectiveWarnTemp {
             outcome.issues.append(HealthIssue(
                 code: "TEMP_WARNING",
                 severity: .warning,

@@ -145,9 +145,9 @@ cat << EOF > "${CONTENTS_DIR}/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.4.0</string>
+    <string>2.5.0</string>
     <key>CFBundleVersion</key>
-    <string>7</string>
+    <string>8</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>NSPrincipalClass</key>
