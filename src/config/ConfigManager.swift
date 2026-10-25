@@ -38,6 +38,8 @@ struct DiskHealthConfig: Codable, Equatable {
     var webhookUrl: String = ""
     var alertScriptPath: String = ""
     var useKeychainStorage: Bool = false
+    var enableActionRulesEngine: Bool = true
+    var actionRules: [ActionRule] = ActionRule.defaultStarterRules
 
     init() {}
 
@@ -67,6 +69,8 @@ struct DiskHealthConfig: Codable, Equatable {
         webhookUrl = try container.decodeIfPresent(String.self, forKey: .webhookUrl) ?? defaults.webhookUrl
         alertScriptPath = try container.decodeIfPresent(String.self, forKey: .alertScriptPath) ?? defaults.alertScriptPath
         useKeychainStorage = try container.decodeIfPresent(Bool.self, forKey: .useKeychainStorage) ?? defaults.useKeychainStorage
+        enableActionRulesEngine = try container.decodeIfPresent(Bool.self, forKey: .enableActionRulesEngine) ?? defaults.enableActionRulesEngine
+        actionRules = try container.decodeIfPresent([ActionRule].self, forKey: .actionRules) ?? defaults.actionRules
     }
 
     func validated() -> DiskHealthConfig {
@@ -79,6 +83,10 @@ struct DiskHealthConfig: Codable, Equatable {
         v.diskUsedCriticalPercent = max(v.diskUsedWarningPercent + 1.0, min(v.diskUsedCriticalPercent, 99.9))
         v.minFreeSpaceWarningGB = max(1.0, v.minFreeSpaceWarningGB)
         v.minFreeSpaceCriticalGB = max(0.5, min(v.minFreeSpaceCriticalGB, v.minFreeSpaceWarningGB - 0.5))
+        for i in v.actionRules.indices {
+            v.actionRules[i].requiredConsecutivePolls = max(1, min(v.actionRules[i].requiredConsecutivePolls, 20))
+            v.actionRules[i].cooldownSeconds = max(60.0, min(v.actionRules[i].cooldownSeconds, 604_800.0))
+        }
         return v
     }
 }
@@ -91,6 +99,7 @@ final class ConfigManager: ObservableObject, @unchecked Sendable {
     let logsDir: String
 
     var stateFilePath: String { "\(stateDir)/state.json" }
+    var historyFilePath: String { "\(stateDir)/history.json" }
     var configFilePath: String { "\(configDir)/config.json" }
     var logFilePath: String { "\(logsDir)/health.log" }
     var latestJsonPath: String { "\(stateDir)/latest_status.json" }
@@ -594,28 +603,28 @@ final class ConfigManager: ObservableObject, @unchecked Sendable {
     private var lastLoggedTimestamp: Date = .distantPast
     private var isParentDirVerified: Bool = false
 
+    private static let telegramBotRegex = try? NSRegularExpression(pattern: "bot[0-9]{5,}:[A-Za-z0-9_-]{15,}")
+    private static let tokenRegex = try? NSRegularExpression(pattern: "(?<![A-Za-z0-9])[0-9]{6,}:[A-Za-z0-9_-]{20,}")
+    private static let webhookRegex = try? NSRegularExpression(pattern: "https?://[^\\s\"']+/webhooks/[^\\s\"']+")
+    private static let slackWebhookRegex = try? NSRegularExpression(pattern: "https?://hooks\\.slack\\.com/services/[^\\s\"']+")
+
     static func redactSensitiveLogText(_ text: String) -> String {
+        guard text.contains("bot") || text.contains("http") || text.contains(":") else {
+            return text
+        }
         var sanitized = text
-        sanitized = sanitized.replacingOccurrences(
-            of: "bot[0-9]{5,}:[A-Za-z0-9_-]{15,}",
-            with: "bot<REDACTED_TOKEN>",
-            options: .regularExpression
-        )
-        sanitized = sanitized.replacingOccurrences(
-            of: "(?<![A-Za-z0-9])[0-9]{6,}:[A-Za-z0-9_-]{20,}",
-            with: "<REDACTED_TOKEN>",
-            options: .regularExpression
-        )
-        sanitized = sanitized.replacingOccurrences(
-            of: "https?://[^\\s\"']+/webhooks/[^\\s\"']+",
-            with: "https://<REDACTED_WEBHOOK_URL>",
-            options: .regularExpression
-        )
-        sanitized = sanitized.replacingOccurrences(
-            of: "https?://hooks\\.slack\\.com/services/[^\\s\"']+",
-            with: "https://hooks.slack.com/services/<REDACTED>",
-            options: .regularExpression
-        )
+        if let regex = telegramBotRegex {
+            sanitized = regex.stringByReplacingMatches(in: sanitized, range: NSRange(location: 0, length: sanitized.utf16.count), withTemplate: "bot<REDACTED_TOKEN>")
+        }
+        if let regex = tokenRegex {
+            sanitized = regex.stringByReplacingMatches(in: sanitized, range: NSRange(location: 0, length: sanitized.utf16.count), withTemplate: "<REDACTED_TOKEN>")
+        }
+        if let regex = webhookRegex {
+            sanitized = regex.stringByReplacingMatches(in: sanitized, range: NSRange(location: 0, length: sanitized.utf16.count), withTemplate: "https://<REDACTED_WEBHOOK_URL>")
+        }
+        if let regex = slackWebhookRegex {
+            sanitized = regex.stringByReplacingMatches(in: sanitized, range: NSRange(location: 0, length: sanitized.utf16.count), withTemplate: "https://hooks.slack.com/services/<REDACTED>")
+        }
         return sanitized
     }
 
@@ -661,8 +670,16 @@ final class ConfigManager: ObservableObject, @unchecked Sendable {
         if fd >= 0 {
             fchmod(fd, 0o600)
             data.withUnsafeBytes { ptr in
-                if let base = ptr.baseAddress {
-                    _ = write(fd, base, data.count)
+                guard let base = ptr.baseAddress else { return }
+                var bytesWritten = 0
+                let totalBytes = data.count
+                while bytesWritten < totalBytes {
+                    let rc = write(fd, base.advanced(by: bytesWritten), totalBytes - bytesWritten)
+                    if rc < 0 {
+                        if errno == EINTR { continue }
+                        break
+                    }
+                    bytesWritten += rc
                 }
             }
             close(fd)

@@ -33,6 +33,9 @@ func printUsage() {
       --export-html         Generate standalone HTML health & RMA report in logs/ (or [path])
       --surface-scan [mode] Run non-destructive F_NOCACHE surface scan (modes: quick, standard, full)
       --verify              Run volume filesystem verification (diskutil verifyVolume)
+      --list-rules          List all configured 'When X, Do Y' automation rules
+      --simulate-rule [id]  Simulate an automation rule in dry-run mode against a synthetic snapshot
+      --top-io              Sample active processes performing disk I/O via Darwin libproc
       --test-alert-script   Test execution of the configured custom alert shell script
       --send-report         Dispatch on-demand HTML health report to Telegram
       --menubar             Launch the macOS Menu Bar status item application (default)
@@ -60,6 +63,7 @@ func parseCommandLine() {
         "--all", "--volume", "--device", "--version", "-v", "--help", "-h",
         "--export-config", "--unmasked", "--include-secrets", "--import-config",
         "--export-diagnostics", "--export-html", "--surface-scan",
+        "--list-rules", "--simulate-rule", "--top-io",
         "--test-alert-script", "--list-disks", "--json", "--cli", "--status",
         "--check", "--watch-mounts", "--deep", "--notify", "--notify-if-unhealthy",
         "--verify", "--send-report", "--menubar"
@@ -72,13 +76,13 @@ func parseCommandLine() {
             continue
         }
         let arg = args[i]
-        if arg == "--volume" || arg == "--device" || arg == "--import-config" || arg == "--export-diagnostics" || arg == "--export-html" || arg == "--surface-scan" {
+        if arg == "--volume" || arg == "--device" || arg == "--import-config" || arg == "--export-diagnostics" || arg == "--export-html" || arg == "--surface-scan" || arg == "--simulate-rule" {
             if i + 1 < args.count && !args[i + 1].hasPrefix("-") {
                 skipNext = true
             }
             continue
         }
-        if arg.hasPrefix("--surface-scan=") {
+        if arg.hasPrefix("--surface-scan=") || arg.hasPrefix("--simulate-rule=") {
             continue
         }
         if arg.hasPrefix("-") {
@@ -242,6 +246,85 @@ func parseCommandLine() {
         let (ok, summary) = DiskHealthMonitor.shared.testAlertScript()
         print(summary)
         exit(ok ? 0 : 1)
+    }
+
+    if args.contains("--list-rules") {
+        let cfg = ConfigManager.shared.currentConfig
+        print("================================================================================")
+        print("  DECLARATIVE AUTOMATION RULES (Engine: \(cfg.enableActionRulesEngine ? "ENABLED" : "DISABLED"))")
+        print("================================================================================")
+        if cfg.actionRules.isEmpty {
+            print("  No automation rules configured.")
+        }
+        for (idx, rule) in cfg.actionRules.enumerated() {
+            let statusStr = rule.isEnabled ? "ACTIVE" : "DISABLED"
+            let dryStr = rule.dryRunOnly ? " [DRY-RUN]" : ""
+            print("  [\(idx + 1)] \(rule.name) (id: \(rule.id)) — \(statusStr)\(dryStr)")
+            print("      WHEN: \(rule.conditionSummary)")
+            print("      ON:   \(rule.scope.displayName) • Sustained: \(rule.requiredConsecutivePolls) poll(s) • Cooldown: \(Int(rule.cooldownSeconds))s")
+            print("      DO:   \(rule.actionType.displayName)")
+        }
+        print("================================================================================")
+        exit(0)
+    }
+
+    if let simIdx = args.firstIndex(where: { $0 == "--simulate-rule" || $0.hasPrefix("--simulate-rule=") }) {
+        let cfg = ConfigManager.shared.currentConfig
+        guard !cfg.actionRules.isEmpty else {
+            fputs("Error: No automation rules configured to simulate.\n", stderr)
+            exit(1)
+        }
+        var query = "1"
+        let arg = args[simIdx]
+        if arg.hasPrefix("--simulate-rule=") {
+            query = String(arg.dropFirst("--simulate-rule=".count))
+        } else if simIdx + 1 < args.count && !args[simIdx + 1].hasPrefix("-") {
+            query = args[simIdx + 1]
+        }
+
+        var targetRule: ActionRule? = nil
+        if let oneBasedIdx = Int(query), oneBasedIdx >= 1 && oneBasedIdx <= cfg.actionRules.count {
+            targetRule = cfg.actionRules[oneBasedIdx - 1]
+        } else {
+            targetRule = cfg.actionRules.first(where: {
+                $0.id.caseInsensitiveCompare(query) == .orderedSame ||
+                $0.name.localizedCaseInsensitiveContains(query)
+            })
+        }
+
+        guard let rule = targetRule else {
+            fputs("Error: Rule '\(query)' not found. Use --list-rules to view available rule indices or IDs.\n", stderr)
+            exit(1)
+        }
+
+        let rec = DiskHealthMonitor.shared.simulateActionRule(rule, executeLive: false, persistAuditRecord: false)
+        print("================================================================================")
+        print("  AUTOMATION RULE DRY-RUN SIMULATION")
+        print("================================================================================")
+        print("  Rule:    \(rec.ruleName) (\(rec.ruleId))")
+        print("  Target:  \(rec.driveDisplayName)")
+        print("  Trigger: \(rec.triggerReason)")
+        print("  Action:  \(rec.actionType.displayName)")
+        print("  Status:  \(rec.status.rawValue)")
+        print("  Result:  \(rec.outputDetail)")
+        print("================================================================================")
+        exit(0)
+    }
+
+    if args.contains("--top-io") {
+        let culprits = ProcessIoInspector.shared.sampleActiveCulpritsWindow(durationSec: 0.35, topN: 8)
+        print("================================================================================")
+        print("  TOP ACTIVE DISK I/O PROCESSES (Darwin libproc rusage_info_v4)")
+        print("================================================================================")
+        if culprits.isEmpty {
+            print("  No active disk I/O processes detected.")
+        } else {
+            for (idx, p) in culprits.enumerated() {
+                print("  [\(idx + 1)] \(p.formattedSummary)")
+            }
+        }
+        print("================================================================================")
+        exit(0)
     }
 
     if args.contains("--list-disks") {

@@ -758,8 +758,8 @@ struct CoreLogicTestRunner {
         assertTrue(!kAppArchitecture.isEmpty, "kAppArchitecture must not be empty")
         assertTrue(!kAppArchShort.isEmpty, "kAppArchShort must not be empty")
         assertTrue(kAppArchShort == "arm64" || kAppArchShort == "x86_64", "kAppArchShort must be either arm64 or x86_64")
-        assertTrue(kAppVersion == "2.6.0", "kAppVersion must match 2.6.0")
-        assertTrue(kAppBuildNumber == "9", "kAppBuildNumber must match 9")
+        assertTrue(kAppVersion == "2.8.0", "kAppVersion must match 2.8.0")
+        assertTrue(kAppBuildNumber == "11", "kAppBuildNumber must match 11")
 
         let diag = DiagnosticExporter.shared.generateDiagnosticReport()
         guard let sys = diag["system"] as? [String: Any] else {
@@ -3171,6 +3171,473 @@ struct CoreLogicTestRunner {
             assertTrue(statePoll2.lastNotifiedSeverity == HealthSeverity.warning.rawValue, "Poll 2 of persistent latency warning must dispatch alert")
 
             print("  [OK] Transient alert 2-poll hysteresis, external host thermal isolation, and internal NVMe log threshold verified")
+        }
+
+        // ====================================================================
+        // Test 49: Non-Blocking Snapshot Lock, Duplicate Bridge Serials & Concurrent Canary (ARGON-01)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 49: Non-Blocking Snapshot Lock, Duplicate Bridge Serials & Concurrent Canary (ARGON-01) ===")
+            let monitor = DiskHealthMonitor.shared
+            let mock = MockTelemetryProvider()
+
+            // 49a. Duplicate Non-Placeholder Bridge Serial Disambiguation across fleet
+            let clonedSerial = "RTL9210B_BRIDGE_CLONE"
+            let devA = makeMockDiskHardwareMetrics(found: true, bsdName: "disk10", serialNumber: clonedSerial, isInternal: false, smartValid: true)
+            let devB = makeMockDiskHardwareMetrics(found: true, bsdName: "disk11", serialNumber: clonedSerial, isInternal: false, smartValid: true)
+            mock.allDevices = [devA, devB]
+            mock.mountPointByBsd["disk10"] = "/Volumes/CloneA"
+            mock.mountPointByBsd["disk11"] = "/Volumes/CloneB"
+            mock.filesystemMetrics = FilesystemMountMetrics(
+                isMounted: true,
+                mountPoint: "/Volumes/CloneA",
+                filesystemType: "apfs",
+                isReadOnly: false,
+                totalBytes: 500_000_000_000,
+                freeBytes: 400_000_000_000,
+                purgeableBytes: 0,
+                usedBytes: 100_000_000_000,
+                usedPercent: 20.0
+            )
+
+            ConfigManager.shared.updateConfig {
+                $0.monitorAllDisks = true
+                $0.monitoredTargets = []
+                $0.enableActiveCanary = false
+                $0.enableNativeNotifications = false
+            }
+
+            let fleet = monitor.evaluateAllMonitoredDisks(forceCanary: false, allowNotifications: false, persistState: true, telemetryProvider: mock)
+            assertTrue(fleet.disks.count == 2, "Both drives with cloned bridge serial must be monitored in fleet")
+            let keys = fleet.disks.map { $0.driveKey }
+            assertTrue(keys.contains("\(clonedSerial)#disk10"), "Drive A must disambiguate driveKey to RTL9210B_BRIDGE_CLONE#disk10")
+            assertTrue(keys.contains("\(clonedSerial)#disk11"), "Drive B must disambiguate driveKey to RTL9210B_BRIDGE_CLONE#disk11")
+            assertTrue(keys[0] != keys[1], "Drive keys must be strictly unique to avoid SwiftUI ID collisions")
+
+            // 49b. Non-blocking snapshotLock verification: reading currentSnapshot / currentMultiSnapshot returns instant copy
+            let snapCopy = monitor.currentSnapshot
+            let multiCopy = monitor.currentMultiSnapshot
+            assertTrue(snapCopy != nil, "currentSnapshot must be accessible via leaf snapshotLock")
+            assertTrue(multiCopy != nil && multiCopy?.disks.count == 2, "currentMultiSnapshot must reflect fleet via snapshotLock")
+
+            // 49c. Concurrent Canary Probe safety on the same mount
+            let group = DispatchGroup()
+            var canaryResults = [CanaryProbeResult]()
+            let canaryLock = NSLock()
+            for _ in 0..<4 {
+                group.enter()
+                DispatchQueue.global().async {
+                    let res = CanaryProbeService.shared.runCanaryCheck(targetMount: "/", force: true)
+                    canaryLock.lock()
+                    canaryResults.append(res)
+                    canaryLock.unlock()
+                    group.leave()
+                }
+            }
+            let waitRes = group.wait(timeout: .now() + 5.0)
+            assertTrue(waitRes == .success, "Concurrent force canary checks on root volume must not deadlock or timeout")
+            assertTrue(canaryResults.count == 4, "All 4 concurrent canary passes must complete cleanly")
+
+            print("  [OK] Duplicate bridge serial disambiguation, snapshotLock leaf isolation, and concurrent canary serialization verified")
+        }
+
+        // ====================================================================
+        // Test 50: Declarative ActionRuleEngine ("When X Happens, Do Y"), Scopes, Hysteresis, Cooldowns & Safety Guards
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 50: Declarative ActionRuleEngine, Scopes, Hysteresis, Cooldowns & Safety Guards ===")
+            let origConfig = ConfigManager.shared.currentConfig
+            defer {
+                ConfigManager.shared.updateConfig { $0 = origConfig }
+            }
+
+            // 50a. Trigger Metric & Operator Evaluation
+            let ruleTemp = ActionRule(
+                id: "test-temp-rule",
+                name: "External Temp >= 65C",
+                isEnabled: true,
+                scope: .externalOnly,
+                triggerMetric: .temperatureCelsius,
+                conditionOperator: .greaterThanOrEqual,
+                thresholdValue: 65.0,
+                requiredConsecutivePolls: 2,
+                cooldownSeconds: 600.0,
+                actionType: .safeUnmountDrive
+            )
+
+            let (simSnapExt, prevSevExt, simRatesExt) = ActionRuleEngine.makeSyntheticMatchingSnapshot(for: ruleTemp)
+            assertTrue(!simSnapExt.isInternal, "External scope synthetic snapshot must be external")
+            let evalMatch = ActionRuleEngine.evaluateRuleCondition(
+                rule: ruleTemp,
+                snapshot: simSnapExt,
+                previousSeverity: prevSevExt,
+                historyRates: simRatesExt
+            )
+            assertTrue(evalMatch.matched, "Synthetic snapshot for ruleTemp must match condition")
+
+            // Verify external drive is rejected by .internalOnly scope
+            let internalCopy = simSnapExt
+            let ruleIntOnly = ActionRule(
+                id: "test-int-only",
+                name: "Internal Only Rule",
+                isEnabled: true,
+                scope: .internalOnly,
+                triggerMetric: .temperatureCelsius,
+                conditionOperator: .greaterThanOrEqual,
+                thresholdValue: 30.0
+            )
+            let evalScopeReject = ActionRuleEngine.evaluateRuleCondition(rule: ruleIntOnly, snapshot: internalCopy)
+            assertTrue(!evalScopeReject.matched, "External drive must be rejected by .internalOnly scope")
+
+            // Verify USB / Thunderbolt / SpecificTarget scopes
+            let usbRule = ActionRule(name: "USB Scope", scope: .usbBusOnly, triggerMetric: .healthScore, conditionOperator: .lessThanOrEqual, thresholdValue: 99)
+            assertTrue(ActionRuleEngine.matchesScope(rule: usbRule, snapshot: simSnapExt), "USB drive must match .usbBusOnly scope")
+
+            let tbRule = ActionRule(name: "TB Scope", scope: .thunderboltBusOnly, triggerMetric: .healthScore, conditionOperator: .lessThanOrEqual, thresholdValue: 99)
+            assertTrue(!ActionRuleEngine.matchesScope(rule: tbRule, snapshot: simSnapExt), "USB drive must not match .thunderboltBusOnly scope")
+
+            let specificRule = ActionRule(name: "Specific BSD", scope: .specificTarget, specificTargetFilter: "disk6")
+            assertTrue(ActionRuleEngine.matchesScope(rule: specificRule, snapshot: simSnapExt), "disk6 must match specificTargetFilter 'disk6'")
+
+            // 50b. Issue Code & Severity Transition Triggers
+            let issueRule = ActionRule(
+                name: "Media Errors Rule",
+                scope: .allDrives,
+                triggerMetric: .issueCode,
+                targetIssueCode: "MEDIA_ERRORS",
+                actionType: .exportHtmlReport
+            )
+            let (issueSnap, _, _) = ActionRuleEngine.makeSyntheticMatchingSnapshot(for: issueRule)
+            assertTrue(ActionRuleEngine.evaluateRuleCondition(rule: issueRule, snapshot: issueSnap).matched, "MEDIA_ERRORS issue rule must match")
+
+            let recoveryRule = ActionRule(
+                name: "Recovery Transition",
+                scope: .allDrives,
+                triggerMetric: .severityTransition,
+                targetIssueCode: "RECOVERED"
+            )
+            let (recSnap, recPrevSev, _) = ActionRuleEngine.makeSyntheticMatchingSnapshot(for: recoveryRule)
+            assertTrue(
+                ActionRuleEngine.evaluateRuleCondition(rule: recoveryRule, snapshot: recSnap, previousSeverity: recPrevSev).matched,
+                "RECOVERED transition from CRITICAL to HEALTHY must match"
+            )
+            assertTrue(
+                !ActionRuleEngine.evaluateRuleCondition(rule: recoveryRule, snapshot: recSnap, previousSeverity: .healthy).matched,
+                "RECOVERED transition must not fire when previousSeverity was already HEALTHY"
+            )
+
+            // 50c. Consecutive Poll Hysteresis (requiredConsecutivePolls = 2) & Per-Rule Cooldown (600s)
+            var testState = DiskPersistentState()
+            var testCfg = DiskHealthConfig()
+            testCfg.enableActionRulesEngine = true
+            var dryRule = ruleTemp
+            dryRule.dryRunOnly = true
+            testCfg.actionRules = [dryRule]
+
+            // Poll 1 at t=1000: matches 1/2 -> no execution yet
+            let recsPoll1 = ActionRuleEngine.shared.evaluateAndExecuteRules(
+                for: simSnapExt,
+                previousSeverity: .healthy,
+                state: &testState,
+                config: testCfg,
+                historyRates: .zero,
+                nowTs: 1000.0
+            )
+            assertTrue(recsPoll1.isEmpty, "Poll 1/2 must not fire rule yet when requiredConsecutivePolls == 2")
+
+            // Poll 2 at t=1030: matches 2/2 -> executes!
+            let recsPoll2 = ActionRuleEngine.shared.evaluateAndExecuteRules(
+                for: simSnapExt,
+                previousSeverity: .healthy,
+                state: &testState,
+                config: testCfg,
+                historyRates: .zero,
+                nowTs: 1030.0
+            )
+            assertTrue(recsPoll2.count == 1, "Poll 2/2 must execute rule")
+            assertTrue(recsPoll2[0].status == .dryRun, "Dry-run rule must record .dryRun status")
+
+            // Poll 3 at t=1060 (within 600s cooldown): suppressed by cooldown!
+            let recsPoll3 = ActionRuleEngine.shared.evaluateAndExecuteRules(
+                for: simSnapExt,
+                previousSeverity: .healthy,
+                state: &testState,
+                config: testCfg,
+                historyRates: .zero,
+                nowTs: 1060.0
+            )
+            assertTrue(recsPoll3.isEmpty, "Poll 3 within 600s cooldown window must be suppressed")
+
+            // Poll 4 at t=1700 (after 600s cooldown elapsed): executes again!
+            let recsPoll4 = ActionRuleEngine.shared.evaluateAndExecuteRules(
+                for: simSnapExt,
+                previousSeverity: .healthy,
+                state: &testState,
+                config: testCfg,
+                historyRates: .zero,
+                nowTs: 1700.0
+            )
+            assertTrue(recsPoll4.count == 1, "Poll 4 after 600s cooldown must execute rule again")
+
+            // 50d. Mandatory Safety Guard on System / Boot Drives
+            assertTrue(ActionRuleEngine.isSystemProtectedMount(mountPoint: "/", isInternal: true, bsdName: "disk0"), "Root '/' must be system protected")
+            assertTrue(ActionRuleEngine.isSystemProtectedMount(mountPoint: "/System/Volumes/Data", isInternal: false, bsdName: "disk3s5"), "/System/Volumes/Data must be system protected")
+            assertTrue(!ActionRuleEngine.isSystemProtectedMount(mountPoint: "/Volumes/ExternalBackup", isInternal: false, bsdName: "disk6"), "External /Volumes/ExternalBackup must NOT be blocked")
+
+            let unsafeRootRule = ActionRule(
+                name: "Attempt Unmount Root",
+                scope: .internalOnly,
+                triggerMetric: .temperatureCelsius,
+                conditionOperator: .greaterThanOrEqual,
+                thresholdValue: 20.0,
+                actionType: .safeUnmountDrive,
+                dryRunOnly: false
+            )
+            let (rootSimSnap, _, _) = ActionRuleEngine.makeSyntheticMatchingSnapshot(for: unsafeRootRule)
+            let blockedRec = ActionRuleEngine.shared.executeRuleAction(
+                rule: unsafeRootRule,
+                snapshot: rootSimSnap,
+                triggerReason: "Temp >= 20C",
+                nowTs: 2000.0,
+                dryRun: false
+            )
+            assertTrue(blockedRec.status == .blockedBySafetyGuard, "Attempting to unmount internal/root drive must be blocked by safety guard")
+
+            // 50e. Custom Sandboxed Script Execution via ActionRule
+            let ruleScriptPath = "\(NSTemporaryDirectory())action_rule_script_\(UUID().uuidString).sh"
+            let scriptBody = """
+            #!/bin/sh
+            echo "RULE_EXEC_OK:$DISK_HEALTH_RULE_NAME:$DISK_HEALTH_TRIGGER_REASON"
+            exit 0
+            """
+            try? scriptBody.write(toFile: ruleScriptPath, atomically: true, encoding: .utf8)
+            _ = chmod(ruleScriptPath, 0o755)
+            let scriptRule = ActionRule(
+                name: "Custom Script Action Test",
+                scope: .allDrives,
+                triggerMetric: .temperatureCelsius,
+                conditionOperator: .greaterThanOrEqual,
+                thresholdValue: 50.0,
+                actionType: .runCustomScript,
+                actionParameter: ruleScriptPath,
+                dryRunOnly: false
+            )
+            let liveScriptRec = DiskHealthMonitor.shared.simulateActionRule(scriptRule, executeLive: true, persistAuditRecord: false)
+            assertTrue(liveScriptRec.status == .succeeded, "Custom script action rule must succeed, got \(liveScriptRec.status): \(liveScriptRec.outputDetail)")
+            assertTrue(liveScriptRec.outputDetail.contains("RULE_EXEC_OK:Custom Script Action Test"), "Script output must include injected DISK_HEALTH_RULE_NAME")
+            try? FileManager.default.removeItem(atPath: ruleScriptPath)
+
+            print("  [OK] Declarative ActionRuleEngine triggers, scopes, poll hysteresis, cooldowns, safety guards, and custom script actions verified")
+        }
+
+        // ====================================================================
+        // Test 51: TelemetryHistoryStore Ring Buffer, 0600 Persistence & Rate-of-Change Metrics
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 51: TelemetryHistoryStore Ring Buffer & Rate-of-Change Metrics ===")
+            let tempHistoryPath = "\(NSTemporaryDirectory())history_test_\(UUID().uuidString).json"
+            defer {
+                try? FileManager.default.removeItem(atPath: tempHistoryPath)
+            }
+
+            let store = TelemetryHistoryStore(customFilePath: tempHistoryPath)
+            let baseRule = ActionRule(name: "Base", triggerMetric: .temperatureCelsius, thresholdValue: 40)
+            let (baseSnap, _, _) = ActionRuleEngine.makeSyntheticMatchingSnapshot(for: baseRule)
+
+            // 51a. Record 2 snapshots 1 hour apart with 50 GB free space drop and +0.25 TBW
+            let t0: TimeInterval = 100_000
+            let snapT0 = DiskHealthSnapshot(
+                timestamp: t0,
+                formattedTime: "2026-10-25 08:00:00",
+                formattedShortTime: "08:00:00",
+                overallSeverity: .healthy,
+                healthScore: 100,
+                issues: [],
+                hardwareFound: true,
+                vendorName: baseSnap.vendorName,
+                productName: baseSnap.productName,
+                productRevision: baseSnap.productRevision,
+                bsdName: "disk9",
+                serialNumber: "HIST-DRIVE-001",
+                usbSerialNumber: "HIST-DRIVE-001",
+                interconnectType: "USB",
+                protocolType: "NVMe",
+                isInternal: false,
+                isRemovable: true,
+                linkSpeedBps: 10_000_000_000,
+                linkSpeedFormatted: "10 Gbps",
+                isMounted: true,
+                mountPoint: "/Volumes/HistTest",
+                filesystemType: "apfs",
+                isReadOnly: false,
+                totalBytes: 1_000_000_000_000,
+                freeBytes: 500_000_000_000, // 500 GB free
+                purgeableBytes: 0,
+                usedBytes: 500_000_000_000,
+                usedPercent: 50.0,
+                subpathsStatus: [:],
+                canaryOk: true,
+                canaryLatencyMs: 1.0,
+                canaryError: "",
+                smartValid: true,
+                criticalWarning: 0,
+                temperatureCelsius: 40,
+                peakTemperatureCelsius: 40,
+                availableSpare: 100,
+                availableSpareThreshold: 10,
+                percentageUsed: 5,
+                lifeRemainingPercent: 95,
+                totalTerabytesRead: 5.0,
+                totalTerabytesWritten: 10.0, // 10.0 TBW at t0
+                powerCycles: 10,
+                powerOnHours: 1000,
+                unsafeShutdowns: 0,
+                mediaErrors: 0,
+                errorInfoLogEntries: 0,
+                statsValid: true,
+                sessionBytesRead: 0,
+                sessionBytesWritten: 0,
+                operationsRead: 100,
+                operationsWritten: 100,
+                errorsRead: 0,
+                errorsWritten: 0,
+                retriesRead: 0,
+                retriesWritten: 0,
+                avgReadLatencyMs: 1.0,
+                avgWriteLatencyMs: 1.0,
+                readThroughputMBps: 0,
+                writeThroughputMBps: 0,
+                lastVerifyResult: "Verified OK",
+                lastVerifyOk: true
+            )
+
+            assertTrue(store.recordSnapshot(snapT0, force: true, persistToDisk: true), "Initial snapshot must be recorded")
+            // Immediate duplicate within 300s without severity change should be throttled when force == false
+            assertTrue(!store.recordSnapshot(snapT0, force: false, persistToDisk: false), "Duplicate snapshot within 300s must be throttled")
+
+            // 1 hour later (t0 + 3600): freeBytes dropped from 500 GB to 450 GB (50 GB/hr drop), TBW increased by 0.25 TB (6.0 TB/day pace)
+            let snapT1 = DiskHealthSnapshot(
+                timestamp: t0 + 3600.0,
+                formattedTime: "2026-10-25 09:00:00",
+                formattedShortTime: "09:00:00",
+                overallSeverity: .healthy,
+                healthScore: 100,
+                issues: [],
+                hardwareFound: true,
+                vendorName: baseSnap.vendorName,
+                productName: baseSnap.productName,
+                productRevision: baseSnap.productRevision,
+                bsdName: "disk9",
+                serialNumber: "HIST-DRIVE-001",
+                usbSerialNumber: "HIST-DRIVE-001",
+                interconnectType: "USB",
+                protocolType: "NVMe",
+                isInternal: false,
+                isRemovable: true,
+                linkSpeedBps: 10_000_000_000,
+                linkSpeedFormatted: "10 Gbps",
+                isMounted: true,
+                mountPoint: "/Volumes/HistTest",
+                filesystemType: "apfs",
+                isReadOnly: false,
+                totalBytes: 1_000_000_000_000,
+                freeBytes: 450_000_000_000, // 450 GB free (-50 GB in 1 hr)
+                purgeableBytes: 0,
+                usedBytes: 550_000_000_000,
+                usedPercent: 55.0,
+                subpathsStatus: [:],
+                canaryOk: true,
+                canaryLatencyMs: 1.0,
+                canaryError: "",
+                smartValid: true,
+                criticalWarning: 0,
+                temperatureCelsius: 44,
+                peakTemperatureCelsius: 44,
+                availableSpare: 100,
+                availableSpareThreshold: 10,
+                percentageUsed: 5,
+                lifeRemainingPercent: 95,
+                totalTerabytesRead: 5.0,
+                totalTerabytesWritten: 10.25, // +0.25 TB in 1h = 6.0 TB/day
+                powerCycles: 10,
+                powerOnHours: 1001,
+                unsafeShutdowns: 0,
+                mediaErrors: 0,
+                errorInfoLogEntries: 0,
+                statsValid: true,
+                sessionBytesRead: 0,
+                sessionBytesWritten: 0,
+                operationsRead: 100,
+                operationsWritten: 100,
+                errorsRead: 0,
+                errorsWritten: 0,
+                retriesRead: 0,
+                retriesWritten: 0,
+                avgReadLatencyMs: 1.0,
+                avgWriteLatencyMs: 1.0,
+                readThroughputMBps: 0,
+                writeThroughputMBps: 0,
+                lastVerifyResult: "Verified OK",
+                lastVerifyOk: true
+            )
+            assertTrue(store.recordSnapshot(snapT1, force: false, persistToDisk: true), "Snapshot after 1 hour must be recorded")
+
+            let rates = store.computeRateMetrics(for: snapT1)
+            assertTrue(abs(rates.freeSpaceDropGBPerHour - 50.0) < 0.1, "Expected ~50.0 GB/hr drop rate, got \(rates.freeSpaceDropGBPerHour)")
+            assertTrue(abs(rates.terabytesWrittenLast24h - 6.0) < 0.1, "Expected ~6.0 TB/day recent burn rate, got \(rates.terabytesWrittenLast24h)")
+
+            // Verify rate-of-change ActionRule evaluation
+            let dropRule = ActionRule(
+                name: "Rapid Space Drop >= 25 GB/hr",
+                scope: .allDrives,
+                triggerMetric: .freeSpaceDropGBPerHour,
+                conditionOperator: .greaterThanOrEqual,
+                thresholdValue: 25.0
+            )
+            assertTrue(
+                ActionRuleEngine.evaluateRuleCondition(rule: dropRule, snapshot: snapT1, historyRates: rates).matched,
+                "freeSpaceDropGBPerHour rule must trigger when drop rate is 50 GB/hr >= 25 GB/hr"
+            )
+
+            // Verify 0600 file permissions on history.json
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: tempHistoryPath),
+               let perms = attrs[.posixPermissions] as? NSNumber {
+                assertTrue(perms.intValue == 0o600, "history.json must be written with 0600 permissions")
+            } else {
+                assertTrue(false, "history.json file must exist with readable attributes")
+            }
+
+            print("  [OK] TelemetryHistoryStore ring buffer, 0600 persistence, and rate-of-change triggers verified")
+        }
+
+        // ====================================================================
+        // Test 52: ProcessIoInspector Delta Calculation & Sorting
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 52: ProcessIoInspector Delta Calculation & Sorting ===")
+            let prevSamples: [Int32: ProcessIoInspector.RawSample] = [
+                101: .init(pid: 101, processName: "mds_stores", bytesRead: 10_000_000, bytesWritten: 20_000_000),
+                202: .init(pid: 202, processName: "backupd", bytesRead: 50_000_000, bytesWritten: 100_000_000)
+            ]
+            let curSamples: [Int32: ProcessIoInspector.RawSample] = [
+                101: .init(pid: 101, processName: "mds_stores", bytesRead: 12_000_000, bytesWritten: 22_000_000), // +4 MB total
+                202: .init(pid: 202, processName: "backupd", bytesRead: 90_000_000, bytesWritten: 260_000_000)   // +200 MB total
+            ]
+            let culprits = ProcessIoInspector.computeCulprits(
+                previous: prevSamples,
+                current: curSamples,
+                elapsedSeconds: 2.0,
+                topN: 5
+            )
+            assertTrue(culprits.count == 2, "Must compute 2 culprit entries")
+            assertTrue(culprits[0].pid == 202 && culprits[0].processName == "backupd", "backupd with +200MB delta must rank #1")
+            assertTrue(abs(culprits[0].readMBps - 20.0) < 0.01, "Expected 20 MB/s read for backupd")
+            assertTrue(abs(culprits[0].writeMBps - 80.0) < 0.01, "Expected 80 MB/s write for backupd")
+
+            let liveSamples = ProcessIoInspector.shared.captureRawSamples()
+            assertTrue(!liveSamples.isEmpty, "Live captureRawSamples via libproc must return active processes")
+
+            print("  [OK] ProcessIoInspector delta throughput calculation, ranking, and live libproc sampling verified")
         }
 
         print("✅ All Swift Core Logic Unit Tests Passed!")

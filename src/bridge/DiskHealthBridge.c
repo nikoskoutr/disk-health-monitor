@@ -16,6 +16,8 @@
 #include <pthread.h>
 #include <sys/param.h>
 #include <sys/mount.h>
+#include <sys/resource.h>
+#include <libproc.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <IOKit/IOCFPlugIn.h>
@@ -46,6 +48,9 @@ typedef struct {
     bool isInternal;                ///< Internal storage indicator.
     bool isRemovable;               ///< Removable media indicator.
     uint64_t linkSpeedBps;          ///< Normalized interconnect bandwidth in bits per second.
+    uint32_t usbCurrentAvailableMa; ///< USB bus current available in mA.
+    uint32_t usbCurrentRequiredMa;  ///< USB bus current allocated/requested in mA.
+    uint32_t linkWidthLanes;        ///< Active PCIe / Thunderbolt lane count.
 } StaticDeviceCacheEntry;
 
 #define MAX_STATIC_CACHE_ENTRIES 64
@@ -293,6 +298,65 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
             }
         }
 
+        // USB Current Allocation & Power Budget (mA)
+        if (outMetrics->usbCurrentAvailableMa == 0) {
+            CFTypeRef availRef = IORegistryEntryCreateCFProperty(parent, CFSTR("BusPowerAvailable"), kCFAllocatorDefault, 0);
+            if (!availRef) {
+                availRef = IORegistryEntryCreateCFProperty(parent, CFSTR("kUSBHostPropertyBusCurrentPoolAllocation"), kCFAllocatorDefault, 0);
+            }
+            if (availRef) {
+                if (CFGetTypeID(availRef) == CFNumberGetTypeID()) {
+                    int64_t val = 0;
+                    if (CFNumberGetValue((CFNumberRef)availRef, kCFNumberSInt64Type, &val) && val > 0) {
+                        // BusPowerAvailable in legacy IOUSB is sometimes in 2mA units if <= 250; modern USBHost is in mA
+                        uint32_t ma = (val <= 250 && (val % 50 != 0 || val == 250)) ? (uint32_t)(val * 2) : (uint32_t)val;
+                        if (ma <= 5000) {
+                            outMetrics->usbCurrentAvailableMa = ma;
+                        }
+                    }
+                }
+                CFRelease(availRef);
+            }
+        }
+        if (outMetrics->usbCurrentRequiredMa == 0) {
+            CFTypeRef reqRef = IORegistryEntryCreateCFProperty(parent, CFSTR("kUSBHostPropertyCurrentAllocation"), kCFAllocatorDefault, 0);
+            if (!reqRef) {
+                reqRef = IORegistryEntryCreateCFProperty(parent, CFSTR("bMaxPower"), kCFAllocatorDefault, 0);
+            }
+            if (!reqRef) {
+                reqRef = IORegistryEntryCreateCFProperty(parent, CFSTR("Requested Power"), kCFAllocatorDefault, 0);
+            }
+            if (reqRef) {
+                if (CFGetTypeID(reqRef) == CFNumberGetTypeID()) {
+                    int64_t val = 0;
+                    if (CFNumberGetValue((CFNumberRef)reqRef, kCFNumberSInt64Type, &val) && val > 0) {
+                        uint32_t ma = (val <= 250 && (val == 250 || val == 45 || val == 50)) ? (uint32_t)(val * 2) : (uint32_t)val;
+                        if (ma <= 5000) {
+                            outMetrics->usbCurrentRequiredMa = ma;
+                        }
+                    }
+                }
+                CFRelease(reqRef);
+            }
+        }
+
+        // PCIe / Thunderbolt Active Lane Width
+        if (outMetrics->linkWidthLanes == 0) {
+            CFTypeRef laneRef = IORegistryEntryCreateCFProperty(parent, CFSTR("LinkWidth"), kCFAllocatorDefault, 0);
+            if (!laneRef) {
+                laneRef = IORegistryEntryCreateCFProperty(parent, CFSTR("Active Link Width"), kCFAllocatorDefault, 0);
+            }
+            if (laneRef) {
+                if (CFGetTypeID(laneRef) == CFNumberGetTypeID()) {
+                    int64_t lanes = 0;
+                    if (CFNumberGetValue((CFNumberRef)laneRef, kCFNumberSInt64Type, &lanes) && lanes > 0 && lanes <= 32) {
+                        outMetrics->linkWidthLanes = (uint32_t)lanes;
+                    }
+                }
+                CFRelease(laneRef);
+            }
+        }
+
         IOObjectRelease(current);
         current = parent;
     }
@@ -432,6 +496,9 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
                 outMetrics->isRemovable = sStaticCache[i].isRemovable;
                 outMetrics->linkSpeedBps = sStaticCache[i].linkSpeedBps;
                 outMetrics->usbLinkSpeedBps = sStaticCache[i].linkSpeedBps;
+                outMetrics->usbCurrentAvailableMa = sStaticCache[i].usbCurrentAvailableMa;
+                outMetrics->usbCurrentRequiredMa = sStaticCache[i].usbCurrentRequiredMa;
+                outMetrics->linkWidthLanes = sStaticCache[i].linkWidthLanes;
                 cacheHit = true;
                 break;
             }
@@ -523,7 +590,7 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
             }
         }
 
-        if (hasEntryId && outMetrics->bsdName[0] != '\0' && !isVirtualDiskDevice(outMetrics)) {
+        if (hasEntryId && !isVirtualDiskDevice(outMetrics)) {
             pthread_mutex_lock(&sStaticCacheMutex);
             StaticDeviceCacheEntry *slot = NULL;
             for (int i = 0; i < sStaticCacheCount; i++) {
@@ -547,6 +614,9 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
             slot->isInternal = outMetrics->isInternal;
             slot->isRemovable = outMetrics->isRemovable;
             slot->linkSpeedBps = outMetrics->linkSpeedBps;
+            slot->usbCurrentAvailableMa = outMetrics->usbCurrentAvailableMa;
+            slot->usbCurrentRequiredMa = outMetrics->usbCurrentRequiredMa;
+            slot->linkWidthLanes = outMetrics->linkWidthLanes;
             pthread_mutex_unlock(&sStaticCacheMutex);
         }
     }
@@ -704,15 +774,35 @@ int DiskListAllDevices(DiskHardwareMetrics *outArray, int maxCount) {
     }
 
     int count = 0;
+    int virtualCount = 0;
+    int maxVirtual = (maxCount < 64 ? maxCount : 64);
+    DiskHardwareMetrics *virtualDevs = calloc((size_t)maxVirtual, sizeof(DiskHardwareMetrics));
+
     io_service_t service;
-    while (count < maxCount && (service = IOIteratorNext(iter)) != 0) {
-        populateMetricsFromBlockStorageDevice(service, &outArray[count]);
-        if (outArray[count].found) {
-            count++;
+    while ((service = IOIteratorNext(iter)) != 0) {
+        DiskHardwareMetrics metrics;
+        populateMetricsFromBlockStorageDevice(service, &metrics);
+        if (metrics.found) {
+            if (!isVirtualDiskDevice(&metrics)) {
+                if (count < maxCount) {
+                    outArray[count++] = metrics;
+                }
+            } else if (virtualDevs && virtualCount < maxVirtual) {
+                virtualDevs[virtualCount++] = metrics;
+            }
         }
         IOObjectRelease(service);
     }
     IOObjectRelease(iter);
+
+    // Append virtual devices only if remaining capacity exists in outArray
+    if (virtualDevs) {
+        for (int v = 0; v < virtualCount && count < maxCount; v++) {
+            outArray[count++] = virtualDevs[v];
+        }
+        free(virtualDevs);
+    }
+
     return count;
 }
 
@@ -830,6 +920,10 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
     io_service_t targetDev = findBlockStorageDeviceByBSDName(cleanTargetBsd);
     if (targetDev == 0) return false;
 
+    uint64_t targetDevId = 0;
+    IORegistryEntryGetRegistryEntryID(targetDev, &targetDevId);
+    size_t targetBsdLen = strlen(cleanTargetBsd);
+
     // Fast path (OPT2-02): Stack-allocated buffer for up to 64 mount points eliminates heap allocation.
     struct statfs stackFs[64];
     struct statfs *fsList = stackFs;
@@ -872,6 +966,9 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
 
         // 1. Exact partition slice or snapshot name match takes absolute priority (score 10)
         bool isExactSliceMatch = (strcmp(cleanFrom, cleanTargetBsd) == 0);
+        bool isSliceOfTarget = (!isExactSliceMatch &&
+                                strncmp(cleanFrom, cleanTargetBsd, targetBsdLen) == 0 &&
+                                (cleanFrom[targetBsdLen] == 's' || cleanFrom[targetBsdLen] == 'p'));
         bool isSameDevice = false;
         const char *mountPath = fsList[i].f_mntonname;
 
@@ -902,12 +999,17 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
             continue;
         }
 
-        if (isExactSliceMatch) {
+        if (isExactSliceMatch || isSliceOfTarget) {
             isSameDevice = true;
         } else {
             io_service_t dev = findBlockStorageDeviceByBSDName(fromName);
             if (dev != 0) {
-                isSameDevice = IOObjectIsEqualTo(dev, targetDev);
+                uint64_t candDevId = 0;
+                if (targetDevId != 0 && IORegistryEntryGetRegistryEntryID(dev, &candDevId) == KERN_SUCCESS && candDevId != 0) {
+                    isSameDevice = (candDevId == targetDevId);
+                } else {
+                    isSameDevice = IOObjectIsEqualTo(dev, targetDev);
+                }
                 IOObjectRelease(dev);
             }
         }
@@ -928,4 +1030,65 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
     if (fsList != stackFs) free(fsList);
     IOObjectRelease(targetDev);
     return found;
+}
+
+// ============================================================================
+// MARK: - Process Disk I/O Telemetry via Darwin libproc (proc_pid_rusage)
+// ============================================================================
+
+int DiskSampleProcessIoMetrics(DiskProcessIoMetric *outArray, int maxCount) {
+    if (!outArray || maxCount <= 0) return 0;
+
+    int numBytes = proc_listallpids(NULL, 0);
+    if (numBytes <= 0) return 0;
+
+    size_t pidCapacity = (size_t)(numBytes / (int)sizeof(pid_t)) + 64;
+    pid_t stackPids[512];
+    pid_t *pids = stackPids;
+    if (pidCapacity > 512) {
+        pids = (pid_t *)calloc(pidCapacity, sizeof(pid_t));
+        if (!pids) return 0;
+    }
+
+    int actualBytes = proc_listallpids(pids, (int)(pidCapacity * sizeof(pid_t)));
+    if (actualBytes <= 0) {
+        if (pids != stackPids) free(pids);
+        return 0;
+    }
+
+    int pidCount = actualBytes / (int)sizeof(pid_t);
+    int populated = 0;
+
+    for (int i = 0; i < pidCount && populated < maxCount; i++) {
+        pid_t pid = pids[i];
+        if (pid <= 0) continue;
+
+        struct rusage_info_v4 ru;
+        memset(&ru, 0, sizeof(ru));
+        if (proc_pid_rusage(pid, RUSAGE_INFO_V4, (rusage_info_t *)&ru) != 0) {
+            continue;
+        }
+
+        // Include processes with non-zero disk I/O or the current process itself
+        if (ru.ri_diskio_bytesread == 0 && ru.ri_diskio_byteswritten == 0 && pid != getpid()) {
+            continue;
+        }
+
+        DiskProcessIoMetric *entry = &outArray[populated];
+        memset(entry, 0, sizeof(DiskProcessIoMetric));
+        entry->pid = (int32_t)pid;
+        entry->diskBytesRead = ru.ri_diskio_bytesread;
+        entry->diskBytesWritten = ru.ri_diskio_byteswritten;
+
+        char nameBuf[128] = {0};
+        if (proc_name(pid, nameBuf, sizeof(nameBuf) - 1) > 0 && nameBuf[0] != '\0') {
+            strlcpy(entry->processName, nameBuf, sizeof(entry->processName));
+        } else {
+            snprintf(entry->processName, sizeof(entry->processName), "pid-%d", (int)pid);
+        }
+        populated++;
+    }
+
+    if (pids != stackPids) free(pids);
+    return populated;
 }

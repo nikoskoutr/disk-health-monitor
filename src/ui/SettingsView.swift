@@ -21,6 +21,7 @@ struct SettingsView: View {
         (0, "General", "gearshape.fill"),
         (1, "Thresholds", "slider.horizontal.3"),
         (2, "Notifications", "bell.badge.fill"),
+        (6, "Automation", "bolt.shield.fill"),
         (3, "S.M.A.R.T.", "cpu.fill"),
         (4, "Statistics", "chart.bar.xaxis"),
         (5, "Diagnostics", "wrench.and.screwdriver.fill")
@@ -70,6 +71,8 @@ struct SettingsView: View {
                     ThresholdsSettingsTab(configMgr: configMgr)
                 case 2:
                     NotificationsSettingsTab(configMgr: configMgr, viewModel: viewModel)
+                case 6:
+                    AutomationRulesTab(configMgr: configMgr, viewModel: viewModel, monitor: monitor)
                 case 3:
                     SmartInspectorTab(monitor: monitor)
                 case 4:
@@ -82,6 +85,6 @@ struct SettingsView: View {
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
-        .frame(width: 760, height: 680)
+        .frame(width: 820, height: 700)
     }
 }

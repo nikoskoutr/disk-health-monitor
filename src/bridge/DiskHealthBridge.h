@@ -12,7 +12,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,6 +40,9 @@ typedef struct {
     bool isRemovable;                   ///< True for hot-pluggable external storage media.
     uint64_t linkSpeedBps;              ///< Physical interconnect link bandwidth normalized to bits per second (bps).
     uint64_t usbLinkSpeedBps;           ///< Backward-compatibility mirror of linkSpeedBps.
+    uint32_t usbCurrentAvailableMa;     ///< USB bus current available to device in milliamperes (mA), or 0 if N/A.
+    uint32_t usbCurrentRequiredMa;      ///< USB current requested/allocated by device in milliamperes (mA), or 0 if N/A.
+    uint32_t linkWidthLanes;            ///< Active PCIe / Thunderbolt lane width (e.g. 1, 2, 4), or 0 if N/A.
 
     // ========================================================================
     // NVMe Base Specification 1.4+ S.M.A.R.T. / Health Information Log
@@ -152,6 +157,30 @@ uint64_t DiskDecodeNVMeLE128(const uint8_t *bytes);
 uint64_t DiskNormalizeLinkSpeedToBps(uint64_t rawSpeed);
 
 /**
+ * @brief Per-process disk I/O byte counters captured via Darwin libproc (proc_pid_rusage).
+ */
+typedef struct {
+    int32_t pid;                        ///< POSIX process identifier.
+    char processName[128];              ///< Executable process name (from proc_name).
+    uint64_t diskBytesRead;             ///< Cumulative logical/physical bytes read from disk by process.
+    uint64_t diskBytesWritten;          ///< Cumulative logical/physical bytes written to disk by process.
+} DiskProcessIoMetric;
+
+/**
+ * @brief Enumerates active processes with non-zero disk I/O activity via Darwin libproc.
+ *
+ * Uses proc_listallpids and proc_pid_rusage (RUSAGE_INFO_V4) to capture cumulative disk read
+ * and write byte counters for accessible processes without requiring root privileges for user tasks.
+ *
+ * @param outArray Pre-allocated array of DiskProcessIoMetric structs to populate.
+ * @param maxCount Maximum number of entries to write into @p outArray.
+ * @return Number of processes populated in @p outArray (0 on invalid arguments).
+ * @note Thread-safe. Zero dynamic memory leaks.
+ */
+int DiskSampleProcessIoMetrics(DiskProcessIoMetric *outArray, int maxCount);
+
+#ifdef __APPLE__
+/**
  * @brief Safely extracts a 64-bit unsigned integer from a CoreFoundation dictionary.
  * 
  * Handles negative signed values by clamping to 0, preventing signed wrap-around
@@ -162,6 +191,7 @@ uint64_t DiskNormalizeLinkSpeedToBps(uint64_t rawSpeed);
  * @return Extracted 64-bit unsigned value, or 0 if missing or negative.
  */
 uint64_t DiskExtractCFNumberU64(CFDictionaryRef dict, CFStringRef key);
+#endif
 
 #ifdef __cplusplus
 }

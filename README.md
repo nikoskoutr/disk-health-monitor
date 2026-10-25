@@ -20,7 +20,10 @@ Directly built on **IOKit**, **DiskArbitration**, **CoreFoundation**, and **Secu
 ## Key Features
 
 - **Zero-Dependency Native IOKit & C11 NVMe Bridge**: Direct kernel communication via `IONVMeSMARTUserClient` and `IOBlockStorageDriver`. Decodes full 128-bit little-endian NVMe counters without integer truncation.
-- **Hardware S.M.A.R.T. Inspector (`⌘I`)**: Detailed inspector displaying all raw NVMe registers, normalized attributes, critical warning bitmasks, temperature, and condition flags.
+- **Declarative Rule-Based Automation Engine (`⌘A`)**: `"When [Trigger] on [Drive Scope] for [Consecutive Polls] → Do [Action]"` automation engine supporting 13 trigger metrics (26 issue codes, numeric thresholds, severity transitions, and rate-of-change triggers), 6 drive scopes, poll hysteresis, per-rule cooldowns, boot-volume safety guards, dry-run simulation, 5 curated presets, and 12 automated actions (safe unmount/eject, read-only remount, Time Machine backup, APFS snapshot thinning, surface scans, Shortcuts, custom scripts, and top I/O process capture).
+- **Process Disk I/O Culprit Detector (`--top-io`)**: Kernel-level `<libproc.h>` (`proc_pid_rusage` `RUSAGE_INFO_V4`) process I/O sampler that identifies and ranks the top processes generating disk read/write throughput during latency spikes or high write burn.
+- **Historical Telemetry Ring Buffer & Trend Sparklines (`⌘S`)**: Persistent 180-point ring buffer (`history.json`) tracking temperature, free space, health score, latency, and cumulative TBW with native SwiftUI sparklines and rate-of-change calculations (`GB/hr` free space drop and `24h TBW`).
+- **Hardware S.M.A.R.T. & Bus Power Inspector (`⌘I`)**: Detailed inspector displaying all raw NVMe registers, normalized attributes, critical warning bitmasks, USB bus power allocation (`mA`), and PCIe/Thunderbolt lane width (`x4`).
 - **SSD Lifetime & Endurance Forecasting**: Real-time projection of remaining SSD operational lifespan and daily write burn rate ($\text{TB/day}$) derived from Power-On Hours (POH) and cumulative Terabytes Written (TBW).
 - **Multi-Tier Physical Surface Scans**: Non-destructive direct unbuffered media read testing (`F_NOCACHE`) with 3 operational tiers (`quick`, `standard`, `full`), live terminal progress bar, throughput monitoring, error accounting, and cancellation.
 - **APFS Physical Store Resolution & Purgeable Space Accounting**: Recursively traverses the `kIOServicePlane` registry tree from synthesized APFS volumes (`diskXsY`) to underlying physical block devices, distinguishing between nominal free space and opportunistic APFS purgeable capacity.
@@ -45,17 +48,17 @@ disk-health-monitor/
 ├── assets/                       # AppIcon.png (1024x1024), AppIcon.icns, and UI previews
 ├── scripts/                      # CoreGraphics vector icon generator
 ├── logs/                         # Runtime logs, latest JSON telemetry snapshot, and state persistence
-├── tests/                        # C11/IOKit unit tests (16) and Swift engine unit tests (48)
+├── tests/                        # C11/IOKit unit tests (17) and Swift engine unit tests (52)
 └── src/                          # Modular C11 + Swift source tree
     ├── main.swift                # CLI router, argument parser, and NSApplication bootstrap
-    ├── bridge/                   # Low-level C11 IOKit / NVMe SMART bridge
-    ├── models/                   # Domain models, telemetry snapshots, and POSIX formatters
+    ├── bridge/                   # Low-level C11 IOKit / NVMe SMART & libproc bridge
+    ├── models/                   # Domain models, automation rule schemas, and POSIX formatters
     ├── security/                 # Keychain SecretStore and POSIX SingleInstanceLock
     ├── config/                   # ConfigManager, .env parser, and thread-safe logger
     ├── notifications/            # Notification Center, Telegram, Webhook, and Script dispatchers
-    ├── diagnostics/              # JSON diagnostic bundle and standalone HTML report generator
-    ├── engine/                   # 12-rule health evaluation engine, canary probe, and surface scanner
-    └── ui/                       # Menu bar controller, dashboard card, and 6-tab Settings window
+    ├── diagnostics/              # JSON/HTML report exporters and ProcessIoInspector
+    ├── engine/                   # 12-rule health engine, ActionRuleEngine, TelemetryHistoryStore, canary & scanner
+    └── ui/                       # Menu bar controller, dashboard card, and 7-tab Settings window
 ```
 
 ```mermaid
@@ -99,10 +102,10 @@ flowchart TD
 | [`src/security/`](src/security/README.md) | macOS Keychain secret storage and POSIX single-instance lock |
 | [`src/config/`](src/config/README.md) | Multi-source configuration resolution, `.env` parser, and structured logging |
 | [`src/notifications/`](src/notifications/README.md) | Notification Center, Telegram Bot, Webhooks (Discord/Slack/HA), and script hooks |
-| [`src/diagnostics/`](src/diagnostics/README.md) | Sanitized JSON diagnostic exporter and standalone HTML RMA report generator |
-| [`src/engine/`](src/engine/README.md) | 12-rule evaluation engine, canary I/O probe, multi-tier surface scanner |
-| [`src/ui/`](src/ui/README.md) | Menu bar status controller, telemetry card, and 6-tab Settings window (`⌘,`) |
-| [`tests/`](tests/run_tests.sh) | 16 C11/IOKit unit tests, 48 Swift engine unit tests, and CLI test stages |
+| [`src/diagnostics/`](src/diagnostics/README.md) | Sanitized JSON diagnostic exporter, HTML RMA report generator, and `ProcessIoInspector` |
+| [`src/engine/`](src/engine/README.md) | 12-rule evaluation engine, `ActionRuleEngine`, `TelemetryHistoryStore`, canary I/O probe, surface scanner |
+| [`src/ui/`](src/ui/README.md) | Menu bar status controller, telemetry card, and 7-tab Settings window (`⌘,`, `⌘A`, `⌘I`, `⌘S`) |
+| [`tests/`](tests/run_tests.sh) | 17 C11/IOKit unit tests, 52 Swift engine unit tests, and CLI test stages |
 | [`scripts/`](scripts/generate_app_icon.swift) | CoreGraphics vector application icon generator |
 | [`assets/`](assets/README.md) | Application branding and icon assets |
 | [`logs/`](logs/README.md) | Runtime log files, telemetry snapshots, and state persistence |
@@ -153,7 +156,7 @@ $$\text{Daily Burn Rate} = \frac{\text{Total TBW}}{\max(1, \text{POH} / 24)} \qu
 # Compile and create DiskHealthMonitor.app + ./disk-health CLI
 ./build_and_install.sh
 
-# Run the automated test suite (16 C tests + 48 Swift tests + CLI integration)
+# Run the automated test suite (17 C tests + 52 Swift tests + CLI integration)
 ./build_and_install.sh --test
 
 # Cross-compile release DMGs, ZIPs, and standalone CLI binaries in dist/
@@ -191,6 +194,9 @@ $$\text{Daily Burn Rate} = \frac{\text{Total TBW}}{\max(1, \text{POH} / 24)} \qu
 | `--export-diagnostics [path]` | Export comprehensive JSON diagnostic bundle |
 | `--export-config [path]` | Export current configuration as sanitized JSON (`--unmasked` for secrets) |
 | `--import-config <path>` | Import and apply configuration profile from a JSON file |
+| `--list-rules` | Print configured automation rules (`When → Do`) and recent execution audit log |
+| `--simulate-rule [id\|index]` | Dry-run simulate an automation rule against a synthetic matching snapshot |
+| `--top-io` | Sample and rank the top disk I/O processes over 1.2s via `<libproc.h>` |
 | `--test-alert-script` | Test execution of the configured custom alert shell script |
 | `--send-report` | Dispatch an on-demand HTML health report to Telegram |
 | `--volume <path>` | Target a specific mount point (e.g., `--volume /` or `--volume /Volumes/SSD`) |

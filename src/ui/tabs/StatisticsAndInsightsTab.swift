@@ -45,7 +45,10 @@ struct StatisticsAndInsightsTab: View {
                 // 4. Kernel Driver Latency & Canary Performance
                 latencyAndPerformanceCard
 
-                // 5. Per-Drive Raw S.M.A.R.T. Register Breakdown
+                // 5. Historical Telemetry Ring Buffer & Sparklines
+                historicalTrendSparklinesCard
+
+                // 6. Per-Drive Raw S.M.A.R.T. Register Breakdown
                 smartRegisterBreakdownCard
             }
             .padding(.bottom, 16)
@@ -272,6 +275,96 @@ struct StatisticsAndInsightsTab: View {
                 }
             }
         }
+    }
+
+    // MARK: - 5. Historical Telemetry Ring Buffer & Trend Sparklines
+
+    @ViewBuilder
+    private var historicalTrendSparklinesCard: some View {
+        SettingsCard(title: "Historical Telemetry Trends & Rate-of-Change (history.json)", icon: "chart.xyaxis.line", iconColor: .indigo) {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(activeDisks) { disk in
+                    let points = TelemetryHistoryStore.shared.points(forDriveKey: disk.driveKey)
+                    let rates = TelemetryHistoryStore.shared.computeRateMetrics(for: disk)
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("\(disk.vendorName) \(disk.productName) (\(disk.bsdName))")
+                                .font(.system(size: 12, weight: .semibold))
+                            Spacer()
+                            Text("\(points.count) samples • 24h Burn: \(String(format: "%.2f TB/day", rates.terabytesWrittenLast24h)) • Drop: \(String(format: "%.2f GB/hr", rates.freeSpaceDropGBPerHour))")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundColor(.secondary)
+                        }
+
+                        if points.count >= 2 {
+                            let recent = Array(points.suffix(36))
+                            HStack(spacing: 12) {
+                                sparklineStrip(
+                                    title: "TEMP (°C)",
+                                    values: recent.map { Double($0.temperatureCelsius) },
+                                    minBound: 20.0,
+                                    maxBound: 85.0,
+                                    tint: .orange
+                                )
+                                sparklineStrip(
+                                    title: "HEALTH SCORE",
+                                    values: recent.map { Double($0.healthScore) },
+                                    minBound: 0.0,
+                                    maxBound: 100.0,
+                                    tint: .green
+                                )
+                                sparklineStrip(
+                                    title: "USED SPACE (%)",
+                                    values: recent.map(\.usedPercent),
+                                    minBound: 0.0,
+                                    maxBound: 100.0,
+                                    tint: .blue
+                                )
+                            }
+                        } else {
+                            Text("Collecting time-series points (sampled every 5 minutes or on severity change)...")
+                                .font(.system(size: 10.5))
+                                .foregroundColor(.secondary)
+                        }
+
+                        if disk.id != activeDisks.last?.id {
+                            Divider().padding(.top, 4)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func sparklineStrip(title: String, values: [Double], minBound: Double, maxBound: Double, tint: Color) -> some View {
+        let minVal = values.min() ?? minBound
+        let maxVal = values.max() ?? maxBound
+        let lo = min(minBound, minVal)
+        let hi = max(maxBound, maxVal, lo + 1.0)
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Text(title)
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text(String(format: "min %.0f / max %.0f", minVal, maxVal))
+                    .font(.system(size: 8.5, design: .monospaced))
+                    .foregroundColor(.secondary)
+            }
+            HStack(alignment: .bottom, spacing: 2) {
+                ForEach(Array(values.enumerated()), id: \.offset) { _, val in
+                    let norm = max(0.12, min(1.0, (val - lo) / (hi - lo)))
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(tint.opacity(0.8))
+                        .frame(width: 4, height: CGFloat(norm * 24.0))
+                }
+                Spacer(minLength: 0)
+            }
+            .frame(height: 24)
+        }
+        .padding(6)
+        .frame(maxWidth: .infinity)
+        .background(RoundedRectangle(cornerRadius: 6).fill(tint.opacity(0.08)))
     }
 
     // MARK: - 5. Per-Drive Raw S.M.A.R.T. Register Breakdown

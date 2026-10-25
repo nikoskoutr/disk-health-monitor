@@ -32,8 +32,20 @@ final class CanaryProbeService: @unchecked Sendable {
 
     private let lock = NSLock()
     private var cacheByMount: [String: (timestamp: TimeInterval, result: CanaryProbeResult)] = [:]
+    private var mountExecutionLocks: [String: NSLock] = [:]
 
     init() {}
+
+    private func lockForMount(_ mount: String) -> NSLock {
+        lock.lock()
+        defer { lock.unlock() }
+        if let existing = mountExecutionLocks[mount] {
+            return existing
+        }
+        let newLock = NSLock()
+        mountExecutionLocks[mount] = newLock
+        return newLock
+    }
 
     /// Clears the 300-second per-mount canary result cache.
     func resetCache() {
@@ -58,6 +70,21 @@ final class CanaryProbeService: @unchecked Sendable {
             return res
         }
         lock.unlock()
+
+        let mountLock = lockForMount(key)
+        mountLock.lock()
+        defer { mountLock.unlock() }
+
+        // Re-check cache under mountLock in case another thread just completed the pass
+        if !force {
+            lock.lock()
+            if let entry = cacheByMount[key], (nowTs - entry.timestamp) < 300, entry.timestamp > 0 {
+                let res = entry.result
+                lock.unlock()
+                return res
+            }
+            lock.unlock()
+        }
 
         var result = performSingleCanaryPass(targetMount: targetMount)
         if !result.ok || result.latencyMs > 300.0 {

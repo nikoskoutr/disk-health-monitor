@@ -45,7 +45,7 @@ final class DiagnosticExporter: @unchecked Sendable {
     }
 
     func generateDiagnosticReport(snapshot: DiskHealthSnapshot? = nil) -> [String: Any] {
-        let snap = snapshot ?? DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: false)
+        let snap = snapshot ?? DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: false, persistState: false)
         let cfg = ConfigManager.shared.currentConfig
         let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
         let hostName = ProcessInfo.processInfo.hostName
@@ -239,8 +239,8 @@ final class DiagnosticExporter: @unchecked Sendable {
     }
 
     func exportDiagnosticReportHTML(snapshot: DiskHealthSnapshot? = nil) -> String {
-        let snap = snapshot ?? DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: false)
-        let multi = DiskHealthMonitor.shared.currentMultiSnapshot ?? DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: true, allowNotifications: false)
+        let snap = snapshot ?? DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: false, persistState: false)
+        let multi = DiskHealthMonitor.shared.currentMultiSnapshot ?? DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: true, allowNotifications: false, persistState: false)
         let esc = TelegramNotifier.shared.escapeHTML
         let badgeColor: String = {
             switch snap.overallSeverity {

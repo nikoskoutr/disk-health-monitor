@@ -391,6 +391,34 @@ int main(void) {
     }
     printf("  PCIe vs USB link speed guard, virtual disk exclusion, and 64-entry cache verified\n");
 
-    printf("\n=== All 16 Bridge Tests Passed Successfully! ===\n");
+    printf("\n=== Test 17: Darwin libproc DiskSampleProcessIoMetrics & USB Power Topology (v2.8.0) ===\n");
+    // Boundary checks
+    assert(DiskSampleProcessIoMetrics(NULL, 10) == 0);
+    DiskProcessIoMetric singleProc;
+    assert(DiskSampleProcessIoMetrics(&singleProc, 0) == 0);
+    assert(DiskSampleProcessIoMetrics(&singleProc, -5) == 0);
+
+    // 1-element clamp
+    int oneCount = DiskSampleProcessIoMetrics(&singleProc, 1);
+    assert(oneCount == 1);
+    assert(singleProc.pid > 0);
+    assert(singleProc.processName[0] != '\0');
+
+    // Full enumeration including current test process (getpid())
+    DiskProcessIoMetric procList[512];
+    int procCount = DiskSampleProcessIoMetrics(procList, 512);
+    assert(procCount >= 1 && procCount <= 512);
+    bool foundSelfPid = false;
+    for (int i = 0; i < procCount; i++) {
+        assert(procList[i].pid > 0);
+        assert(procList[i].processName[0] != '\0');
+        if (procList[i].pid == (int32_t)getpid()) {
+            foundSelfPid = true;
+        }
+    }
+    assert(foundSelfPid);
+    printf("  DiskSampleProcessIoMetrics verified (%d processes sampled, self PID %d found)\n", procCount, (int)getpid());
+
+    printf("\n=== All 17 Bridge Tests Passed Successfully! ===\n");
     return 0;
 }

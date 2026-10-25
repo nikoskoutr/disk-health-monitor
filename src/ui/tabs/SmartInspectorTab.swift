@@ -48,10 +48,10 @@ struct SmartInspectorTab: View {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text("\(snap.vendorName) \(snap.productName)")
                                     .font(.system(size: 14, weight: .bold))
-                                Text("BSD: \(snap.bsdName.isEmpty ? "offline" : snap.bsdName) • Bus: \(snap.interconnectType) (\(snap.linkSpeedFormatted)) • Rev: \(snap.productRevision.isEmpty ? "N/A" : snap.productRevision)")
+                                Text("BSD: \(snap.bsdName.isEmpty ? "offline" : snap.bsdName) • Bus: \(snap.interconnectType) (\(snap.linkSpeedFormatted))\(snap.linkWidthLanes > 0 ? " [x\(snap.linkWidthLanes) Lanes]" : "") • Rev: \(snap.productRevision.isEmpty ? "N/A" : snap.productRevision)")
                                     .font(.system(size: 11, design: .monospaced))
                                     .foregroundColor(.secondary)
-                                Text("Serial: \(snap.serialNumber.isEmpty ? "N/A" : snap.serialNumber)")
+                                Text("Serial: \(snap.serialNumber.isEmpty ? "N/A" : snap.serialNumber)\(snap.usbCurrentAvailableMa > 0 || snap.usbCurrentRequiredMa > 0 ? " • USB Power: \(snap.usbCurrentRequiredMa)mA req / \(snap.usbCurrentAvailableMa)mA avail" : "")")
                                     .font(.system(size: 11, design: .monospaced))
                                     .foregroundColor(.secondary)
                             }

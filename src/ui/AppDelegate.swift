@@ -194,6 +194,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statsItem.target = self
         menu.addItem(statsItem)
 
+        let automationItem = NSMenuItem(title: "Automation Rules & Actions...", action: #selector(openAutomationTab), keyEquivalent: "a")
+        automationItem.target = self
+        menu.addItem(automationItem)
+
         let telegramReportItem = NSMenuItem(title: "Send Status Report to Telegram Now", action: #selector(sendTelegramReportNow), keyEquivalent: "t")
         telegramReportItem.target = self
         menu.addItem(telegramReportItem)
@@ -463,7 +467,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateDiskCache() {
-        let devices = IOKitTelemetryProvider.shared.listAllDevices(maxCount: 16)
+        let devices = IOKitTelemetryProvider.shared.listAllDevices(maxCount: 32).filter { $0.found && !DiskHealthMonitor.isVirtualDiskMetrics($0) }
         let mounts = IOKitTelemetryProvider.shared.listLocalMountedVolumes()
         cacheLock.lock()
         cachedDevices = devices
@@ -569,6 +573,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func openStatisticsTab() {
         statusItem.menu?.cancelTracking()
         SettingsWindowController.shared.showSettings(tab: 4)
+    }
+
+    @objc func openAutomationTab() {
+        statusItem.menu?.cancelTracking()
+        SettingsWindowController.shared.showSettings(tab: 6)
     }
 
     @objc private func exportDiagnosticReportAction() {

@@ -77,6 +77,33 @@ echo "  [OK] disk-health -v"
 "${ROOT_DIR}/disk-health" --list-disks > /dev/null
 echo "  [OK] disk-health --list-disks"
 
+"${ROOT_DIR}/disk-health" --list-rules > "${BUILD_CACHE}/list_rules_output.txt"
+if grep -q "DECLARATIVE AUTOMATION RULES" "${BUILD_CACHE}/list_rules_output.txt"; then
+    echo "  [OK] disk-health --list-rules"
+else
+    echo "  [FAIL] disk-health --list-rules failed"
+    cat "${BUILD_CACHE}/list_rules_output.txt"
+    exit 1
+fi
+
+"${ROOT_DIR}/disk-health" --simulate-rule 1 > "${BUILD_CACHE}/sim_rule_output.txt"
+if grep -q "AUTOMATION RULE DRY-RUN SIMULATION" "${BUILD_CACHE}/sim_rule_output.txt" && grep -q "DRY_RUN" "${BUILD_CACHE}/sim_rule_output.txt"; then
+    echo "  [OK] disk-health --simulate-rule 1"
+else
+    echo "  [FAIL] disk-health --simulate-rule 1 failed"
+    cat "${BUILD_CACHE}/sim_rule_output.txt"
+    exit 1
+fi
+
+"${ROOT_DIR}/disk-health" --top-io > "${BUILD_CACHE}/top_io_output.txt"
+if grep -q "TOP ACTIVE DISK I/O PROCESSES" "${BUILD_CACHE}/top_io_output.txt"; then
+    echo "  [OK] disk-health --top-io"
+else
+    echo "  [FAIL] disk-health --top-io failed"
+    cat "${BUILD_CACHE}/top_io_output.txt"
+    exit 1
+fi
+
 set +e
 "${ROOT_DIR}/disk-health" --status > "${BUILD_CACHE}/status_output.txt"
 STATUS_EXIT=$?

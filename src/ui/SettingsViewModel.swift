@@ -45,6 +45,15 @@ final class SettingsViewModel: ObservableObject {
     @Published var keychainStatusMessage: String? = nil
     @Published var keychainStatusIsError: Bool = false
 
+    // Automation Rules Tab State (avoiding @State macro plugin requirement)
+    @Published var isEditingAutomationRule: Bool = false
+    @Published var draftAutomationRule: ActionRule = ActionRule(name: "Custom Disk Action Rule")
+    @Published var editingAutomationRuleId: String? = nil
+    @Published var simulationBannerText: String? = nil
+    @Published var simulationBannerStatus: ActionExecutionStatus = .dryRun
+    @Published var isSamplingIoProcesses: Bool = false
+    @Published var topIoCulprits: [ProcessIoCulprit] = []
+
     init() {
         self.botToken = ConfigManager.shared.resolvedTelegramBotToken
         self.webhookUrl = ConfigManager.shared.resolvedWebhookUrl
@@ -98,7 +107,7 @@ final class SettingsViewModel: ObservableObject {
                 try? FileManager.default.createDirectory(atPath: logsDir, withIntermediateDirectories: true)
                 let plistDict = SettingsViewModel.makeLaunchAgentPlistDict(bundleId: bundleId, binaryPath: binaryPath, logsDir: logsDir)
                 if let plistData = try? PropertyListSerialization.data(fromPropertyList: plistDict, format: .xml, options: 0) {
-                    try? plistData.write(to: URL(fileURLWithPath: plistPath), options: .atomic)
+                    _ = AtomicFileWriter.writeRestricted(data: plistData, toPath: plistPath, permissions: 0o600)
                 }
                 // Ensure any stale registration is unloaded before bootstrapping
                 let bootout = Process()
@@ -123,8 +132,8 @@ final class SettingsViewModel: ObservableObject {
     func refreshDiskList() {
         DispatchQueue.global(qos: .userInitiated).async {
             var items: [(id: String, name: String)] = []
-            let devices = IOKitTelemetryProvider.shared.listAllDevices(maxCount: 16)
-            for d in devices {
+            let devices = IOKitTelemetryProvider.shared.listAllDevices(maxCount: 32)
+            for d in devices where d.found && !DiskHealthMonitor.isVirtualDiskMetrics(d) {
                 let prod = cStringToSwift(d.productName)
                 let vendor = cStringToSwift(d.vendorName)
                 let bsd = cStringToSwift(d.bsdName)
@@ -188,9 +197,10 @@ final class SettingsViewModel: ObservableObject {
 
     func commitBotTokenNow(_ val: String) {
         debounceLock.lock()
-        defer { debounceLock.unlock() }
         tokenSaveWorkItem?.cancel()
         tokenSaveWorkItem = nil
+        debounceLock.unlock()
+
         if val.isEmpty {
             _ = SecretStore.shared.deleteSecret(forKey: "telegramBotToken", allowInteractiveKeychain: false)
             ConfigManager.shared.updateConfig { $0.telegramBotToken = "" }
@@ -216,9 +226,10 @@ final class SettingsViewModel: ObservableObject {
 
     func commitWebhookUrlNow(_ val: String) {
         debounceLock.lock()
-        defer { debounceLock.unlock() }
         webhookSaveWorkItem?.cancel()
         webhookSaveWorkItem = nil
+        debounceLock.unlock()
+
         let trimmed = val.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
             _ = SecretStore.shared.deleteSecret(forKey: "webhookUrl", allowInteractiveKeychain: false)
@@ -375,12 +386,14 @@ final class SettingsViewModel: ObservableObject {
         panel.nameFieldStringValue = "disk-health-config.json"
         panel.allowedContentTypes = [.json]
         if panel.runModal() == .OK, let url = panel.url {
-            let json = ConfigManager.shared.exportSanitizedConfigJSON(includeSecrets: false)
-            if let data = json.data(using: .utf8),
-               AtomicFileWriter.writeRestricted(data: data, toPath: url.path, permissions: 0o600) {
-                diagnosticsStatusMsg = "Saved configuration to \(url.lastPathComponent)"
-            } else {
-                diagnosticsStatusMsg = "Failed to save configuration."
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let json = ConfigManager.shared.exportSanitizedConfigJSON(includeSecrets: false)
+                let ok = json.data(using: .utf8).map {
+                    AtomicFileWriter.writeRestricted(data: $0, toPath: url.path, permissions: 0o600)
+                } ?? false
+                DispatchQueue.main.async {
+                    self?.diagnosticsStatusMsg = ok ? "Saved configuration to \(url.lastPathComponent)" : "Failed to save configuration."
+                }
             }
         }
     }
@@ -407,10 +420,15 @@ final class SettingsViewModel: ObservableObject {
         panel.nameFieldStringValue = "diagnostic-report.json"
         panel.allowedContentTypes = [.json]
         if panel.runModal() == .OK, let url = panel.url {
-            if let savedPath = DiagnosticExporter.shared.saveDiagnosticReportToFile(at: url.path) {
-                diagnosticsStatusMsg = "Saved diagnostic report to \((savedPath as NSString).lastPathComponent)"
-            } else {
-                diagnosticsStatusMsg = "Failed to save diagnostic report."
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let savedPath = DiagnosticExporter.shared.saveDiagnosticReportToFile(at: url.path)
+                DispatchQueue.main.async {
+                    if let savedPath = savedPath {
+                        self?.diagnosticsStatusMsg = "Saved diagnostic report to \((savedPath as NSString).lastPathComponent)"
+                    } else {
+                        self?.diagnosticsStatusMsg = "Failed to save diagnostic report."
+                    }
+                }
             }
         }
     }
@@ -421,10 +439,15 @@ final class SettingsViewModel: ObservableObject {
         panel.nameFieldStringValue = "disk-health-report.html"
         panel.allowedContentTypes = [.html]
         if panel.runModal() == .OK, let url = panel.url {
-            if let savedPath = DiagnosticExporter.shared.saveDiagnosticReportHTMLToFile(at: url.path) {
-                diagnosticsStatusMsg = "Saved HTML report to \((savedPath as NSString).lastPathComponent)"
-            } else {
-                diagnosticsStatusMsg = "Failed to save HTML report."
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let savedPath = DiagnosticExporter.shared.saveDiagnosticReportHTMLToFile(at: url.path)
+                DispatchQueue.main.async {
+                    if let savedPath = savedPath {
+                        self?.diagnosticsStatusMsg = "Saved HTML report to \((savedPath as NSString).lastPathComponent)"
+                    } else {
+                        self?.diagnosticsStatusMsg = "Failed to save HTML report."
+                    }
+                }
             }
         }
     }
@@ -463,8 +486,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let window = NSWindow(contentViewController: hostingController)
         window.title = "Disk Health Monitor Settings"
         window.styleMask = [.titled, .closable, .miniaturizable]
-        window.setContentSize(NSSize(width: 700, height: 650))
-        window.minSize = NSSize(width: 700, height: 650)
+        window.setContentSize(NSSize(width: 820, height: 700))
+        window.minSize = NSSize(width: 760, height: 660)
         window.center()
         window.isReleasedWhenClosed = false
         window.delegate = self
