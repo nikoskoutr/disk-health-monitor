@@ -102,72 +102,23 @@ final class VolumeVerifierService: @unchecked Sendable {
         completion: @escaping (Bool, String) -> Void
     ) {
         DispatchQueue.global(qos: .utility).async {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
-            proc.arguments = ["verifyVolume", target]
-            let pipe = Pipe()
-            proc.standardOutput = pipe
-            proc.standardError = pipe
-            let readHandle = pipe.fileHandleForReading
+            PowerManagementService.shared.withPreventIdleSleepAssertion(reason: "DiskHealthMonitor Volume Verification") {
+                let result = SubprocessRunner.run(
+                    executable: "/usr/sbin/diskutil",
+                    arguments: ["verifyVolume", target],
+                    timeoutSeconds: timeoutSec
+                )
 
-            var ok = false
-            var summary = ""
-            do {
-                try proc.run()
-
-                // Watchdog timer in case diskutil or child fsck hangs on a wedged USB bridge
-                let timeoutLock = NSLock()
-                var timedOut = false
-                var killWorkItem: DispatchWorkItem?
-                let watchdog = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-                watchdog.schedule(deadline: .now() + timeoutSec)
-                watchdog.setEventHandler {
-                    if proc.isRunning {
-                        timeoutLock.lock()
-                        timedOut = true
-                        timeoutLock.unlock()
-                        let pid = proc.processIdentifier
-                        VolumeVerifierService.terminateProcessAndChildren(pid: pid, signal: SIGTERM)
-                        proc.terminate()
-                        // Escalate to SIGKILL after 2s if still alive
-                        let escalation = DispatchWorkItem {
-                            if pid > 0 {
-                                VolumeVerifierService.terminateProcessAndChildren(pid: pid, signal: SIGKILL)
-                            }
-                        }
-                        timeoutLock.lock()
-                        killWorkItem = escalation
-                        timeoutLock.unlock()
-                        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0, execute: escalation)
-                    }
-                }
-                watchdog.resume()
-
-                let data = (try? readHandle.readToEnd()) ?? Data()
-                proc.waitUntilExit()
-                watchdog.cancel()
-                timeoutLock.lock()
-                killWorkItem?.cancel()
-                let didTimeout = timedOut
-                timeoutLock.unlock()
-                try? readHandle.close()
-
-                let output = String(decoding: data, as: UTF8.self)
                 let timeStr = shortMonthDateFormatter.string(from: Date())
+                let combinedOutput = result.stdout + "\n" + result.stderr
                 let classified = VolumeVerifierService.classifyVolumeVerificationOutput(
-                    terminationStatus: proc.terminationStatus,
-                    output: output,
-                    didTimeout: didTimeout,
+                    terminationStatus: result.exitCode,
+                    output: combinedOutput,
+                    didTimeout: result.timedOut,
                     timeStr: timeStr
                 )
-                ok = classified.isHealthy
-                summary = classified.summary
-            } catch {
-                ok = true
-                summary = "Skipped: Could not launch diskutil (\(error.localizedDescription))"
+                completion(classified.isHealthy, classified.summary)
             }
-
-            completion(ok, summary)
         }
     }
 }

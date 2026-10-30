@@ -115,6 +115,44 @@ struct SmartInspectorTab: View {
                                 .foregroundColor(.secondary)
                         }
                     }
+
+                    SettingsCard(title: "Bus & PHY Signal Integrity (USB / PCIe / Thunderbolt)", icon: "cable.connector.horizontal", iconColor: .purple) {
+                        VStack(spacing: 6) {
+                            smartAttributeRow(id: "PHY-1", name: "Physical Layer / Port CRC Errors", raw: "\(snap.busErrorCount) error packets", status: snap.busErrorCount == 0 ? "0 Errors" : "\(snap.busErrorCount) ERR", isGood: snap.busErrorCount == 0)
+                            smartAttributeRow(id: "PHY-2", name: "Bus / Port Recovery Resets", raw: "\(snap.busResetCount) link recovery resets", status: snap.busResetCount == 0 ? "0 Resets" : "\(snap.busResetCount) WARN", isGood: snap.busResetCount == 0)
+                        }
+                    }
+
+                    if !snap.damagedExtents.isEmpty {
+                        SettingsCard(title: "Pinpointed Bad Extents (Physical LBA Mapping)", icon: "exclamationmark.triangle.fill", iconColor: .red) {
+                            VStack(alignment: .leading, spacing: 6) {
+                                ForEach(snap.damagedExtents) { ext in
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(ext.filePath)
+                                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                                .foregroundColor(.red)
+                                                .lineLimit(1)
+                                            Text("Logical Offset: \(ext.logicalOffset) • Physical LBA: 0x\(String(ext.physicalLbaOffset, radix: 16, uppercase: true)) • Size: \(formatBytes(ext.contiguousBytes))")
+                                                .font(.system(size: 10, design: .monospaced))
+                                                .foregroundColor(.secondary)
+                                        }
+                                        Spacer()
+                                        Text("CORRUPTED")
+                                            .font(.system(size: 9.5, weight: .heavy, design: .monospaced))
+                                            .foregroundColor(.red)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(RoundedRectangle(cornerRadius: 4).fill(Color.red.opacity(0.12)))
+                                    }
+                                    .padding(.vertical, 2)
+                                    if ext.id != snap.damagedExtents.last?.id {
+                                        Divider()
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 .padding(8)
             } else {

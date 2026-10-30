@@ -95,7 +95,7 @@ if [[ "${1:-}" == "--package" ]] || [[ "${1:-}" == "--universal" ]]; then
         -import-objc-header "${SCRIPT_DIR}/src/bridge/DiskHealthBridge.h" \
         "${SWIFT_SOURCES[@]}" \
         "${BUILD_CACHE_DIR}/DiskHealthBridge.o" \
-        -framework Cocoa -framework SwiftUI -framework IOKit -framework CoreFoundation -framework UserNotifications -framework Security \
+        -framework Cocoa -framework SwiftUI -framework IOKit -framework CoreFoundation -framework UserNotifications -framework Security -framework DiskArbitration -framework Network \
         -o "${BUILD_CACHE_DIR}/${APP_NAME}-arm64"
 
     swiftc -O -whole-module-optimization -Xlinker -dead_strip -target x86_64-apple-macos13.0 \
@@ -103,7 +103,7 @@ if [[ "${1:-}" == "--package" ]] || [[ "${1:-}" == "--universal" ]]; then
         -import-objc-header "${SCRIPT_DIR}/src/bridge/DiskHealthBridge.h" \
         "${SWIFT_SOURCES[@]}" \
         "${BUILD_CACHE_DIR}/DiskHealthBridge.o" \
-        -framework Cocoa -framework SwiftUI -framework IOKit -framework CoreFoundation -framework UserNotifications -framework Security \
+        -framework Cocoa -framework SwiftUI -framework IOKit -framework CoreFoundation -framework UserNotifications -framework Security -framework DiskArbitration -framework Network \
         -o "${BUILD_CACHE_DIR}/${APP_NAME}-x86_64"
 
     lipo -create -output "${BINARY_PATH}" "${BUILD_CACHE_DIR}/${APP_NAME}-arm64" "${BUILD_CACHE_DIR}/${APP_NAME}-x86_64"
@@ -122,6 +122,8 @@ else
         -framework CoreFoundation \
         -framework UserNotifications \
         -framework Security \
+        -framework DiskArbitration \
+        -framework Network \
         -o "${BINARY_PATH}"
 fi
 
@@ -145,9 +147,9 @@ cat << EOF > "${CONTENTS_DIR}/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.8.0</string>
+    <string>3.0.0</string>
     <key>CFBundleVersion</key>
-    <string>11</string>
+    <string>13</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>NSPrincipalClass</key>

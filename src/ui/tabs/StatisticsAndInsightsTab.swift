@@ -15,6 +15,7 @@ import AppKit
 struct StatisticsAndInsightsTab: View {
     @ObservedObject var monitor: DiskHealthMonitor
     @ObservedObject var configMgr: ConfigManager = ConfigManager.shared
+    @ObservedObject var viewModel: SettingsViewModel
 
     private var currentMulti: MultiDiskHealthSnapshot? {
         monitor.publishedMultiSnapshot
@@ -48,7 +49,16 @@ struct StatisticsAndInsightsTab: View {
                 // 5. Historical Telemetry Ring Buffer & Sparklines
                 historicalTrendSparklinesCard
 
-                // 6. Per-Drive Raw S.M.A.R.T. Register Breakdown
+                // 6. 90-Day Rolling Forecasts & Long-Term Trend Model (HIST-01)
+                rollingForecastCard
+
+                // 7. APFS Container Space-Sharing & Volume Roles (APFS-03)
+                apfsContainerCard
+
+                // 8. APFS Local Snapshots (APFS-02)
+                apfsSnapshotsCard
+
+                // 9. Per-Drive Raw S.M.A.R.T. Register Breakdown
                 smartRegisterBreakdownCard
             }
             .padding(.bottom, 16)
@@ -277,6 +287,80 @@ struct StatisticsAndInsightsTab: View {
         }
     }
 
+    // MARK: - 6. APFS Local Snapshots Inventory & Pruning (APFS-02)
+
+    @ViewBuilder
+    private var apfsSnapshotsCard: some View {
+        SettingsCard(title: "APFS Local Snapshots & Retention (Time Machine)", icon: "camera.metering.matrix", iconColor: .teal) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Local Time Machine Snapshots")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text(viewModel.apfsSnapshots.isEmpty ? "No active local snapshots found on root volume." : "\(viewModel.apfsSnapshots.count) local snapshot\(viewModel.apfsSnapshots.count == 1 ? "" : "s") retaining historical volume state.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+
+                    HStack(spacing: 8) {
+                        Button(action: { viewModel.loadApfsSnapshots() }) {
+                            HStack(spacing: 4) {
+                                if viewModel.isLoadingSnapshots {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    Image(systemName: "arrow.clockwise")
+                                }
+                                Text("Scan Snapshots")
+                            }
+                            .font(.system(size: 11))
+                        }
+                        .disabled(viewModel.isLoadingSnapshots)
+
+                        Button(action: { viewModel.thinApfsSnapshots(targetGB: 20) }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "trash")
+                                Text("Thin Snapshots (20 GB)")
+                            }
+                            .font(.system(size: 11))
+                        }
+                        .disabled(viewModel.isLoadingSnapshots || viewModel.apfsSnapshots.isEmpty)
+                    }
+                }
+
+                if let status = viewModel.snapshotThinningStatus {
+                    HStack(spacing: 6) {
+                        Image(systemName: "info.circle.fill")
+                            .foregroundColor(.accentColor)
+                        Text(status)
+                            .font(.system(size: 11, weight: .medium))
+                    }
+                    .padding(6)
+                    .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.accentColor.opacity(0.1)))
+                }
+
+                if !viewModel.apfsSnapshots.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(viewModel.apfsSnapshots.prefix(5)) { snap in
+                            HStack {
+                                Text(snap.snapshotName)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .lineLimit(1)
+                                Spacer()
+                                Text(snap.formattedAge)
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundColor(.secondary)
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                    .padding(8)
+                    .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.primary.opacity(0.04)))
+                }
+            }
+        }
+    }
+
     // MARK: - 5. Historical Telemetry Ring Buffer & Trend Sparklines
 
     @ViewBuilder
@@ -365,6 +449,177 @@ struct StatisticsAndInsightsTab: View {
         .padding(6)
         .frame(maxWidth: .infinity)
         .background(RoundedRectangle(cornerRadius: 6).fill(tint.opacity(0.08)))
+    }
+
+    // MARK: - 6. 90-Day Rolling Forecasts & Long-Term Trend Model (HIST-01)
+
+    @ViewBuilder
+    private var rollingForecastCard: some View {
+        SettingsCard(title: "90-Day Rolling Forecasts & Wear Regression (HIST-01)", icon: "chart.line.uptrend.xyaxis", iconColor: .blue) {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(activeDisks) { disk in
+                    let sampleCount = TelemetryHistoryStore.shared.points(forDriveKey: disk.driveKey).count
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("\(disk.vendorName) \(disk.productName) (\(disk.bsdName))")
+                                .font(.system(size: 12, weight: .semibold))
+                            Spacer()
+                            Text("Archive: \(sampleCount) samples")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundColor(.secondary)
+                        }
+
+                        HStack(spacing: 8) {
+                            forecastMetricPill(
+                                title: "7-DAY BURN",
+                                value: String(format: "%.2f GB/d", disk.rolling7dTerabytesWrittenPerDay * 1000.0),
+                                sub: "Short-term rate",
+                                color: .purple
+                            )
+                            forecastMetricPill(
+                                title: "30-DAY REGRESSION",
+                                value: String(format: "%.2f GB/d", disk.rolling30dTerabytesWrittenPerDay * 1000.0),
+                                sub: "OLS trend slope",
+                                color: .blue
+                            )
+                            forecastMetricPill(
+                                title: "P95 LATENCY",
+                                value: String(format: "%.1f ms", disk.p95WriteLatencyMs),
+                                sub: "Tail latency",
+                                color: disk.p95WriteLatencyMs > 50.0 ? .orange : .green
+                            )
+                            forecastMetricPill(
+                                title: "P95 THERMAL",
+                                value: "\(disk.p95TemperatureCelsius) °C",
+                                sub: "Peak operating",
+                                color: disk.p95TemperatureCelsius >= configMgr.config.tempWarningCelsius ? .orange : .teal
+                            )
+                            forecastMetricPill(
+                                title: "ESTIMATED LIFE",
+                                value: disk.estimatedRemainingLifeFormatted,
+                                sub: "Based on wear",
+                                color: .indigo
+                            )
+                        }
+
+                        if disk.id != activeDisks.last?.id {
+                            Divider().padding(.top, 4)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func forecastMetricPill(title: String, value: String, sub: String, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 8.5, weight: .bold))
+                .foregroundColor(.secondary)
+            Text(value)
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .foregroundColor(color)
+                .lineLimit(1)
+            Text(sub)
+                .font(.system(size: 8))
+                .foregroundColor(.secondary)
+        }
+        .padding(6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 6).fill(color.opacity(0.08)))
+    }
+
+    // MARK: - 7. APFS Container Space-Sharing & Volume Roles (APFS-03)
+
+    @ViewBuilder
+    private var apfsContainerCard: some View {
+        let containers = activeDisks.compactMap { disk -> (DiskHealthSnapshot, ApfsContainerFleetMetrics)? in
+            guard let cont = disk.apfsContainer else { return nil }
+            return (disk, cont)
+        }
+
+        if !containers.isEmpty {
+            SettingsCard(title: "APFS Container Space-Sharing & Volume Roles (APFS-03)", icon: "square.stack.3d.down.right.fill", iconColor: .teal) {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(containers, id: \.0.id) { disk, container in
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("\(container.containerBsd.isEmpty ? "Container" : container.containerBsd) on \(disk.vendorName) \(disk.productName)")
+                                    .font(.system(size: 12, weight: .semibold))
+                                Spacer()
+                                Text("Pool: \(formatBytes(container.totalCapacityBytes)) • Free: \(formatBytes(container.freeSpaceBytes)) (\(String(format: "%.1f%%", container.freePercent)) free)")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                            }
+
+                            // Horizontal Allocation Bar
+                            GeometryReader { geo in
+                                HStack(spacing: 1) {
+                                    let total = max(1, container.totalCapacityBytes)
+                                    ForEach(container.volumes) { vol in
+                                        let width = max(4, CGFloat(vol.usedBytes) / CGFloat(total) * geo.size.width)
+                                        Rectangle()
+                                            .fill(roleColor(vol.role))
+                                            .frame(width: width)
+                                    }
+                                    let freeWidth = max(2, CGFloat(container.freeSpaceBytes) / CGFloat(total) * geo.size.width)
+                                    Rectangle()
+                                        .fill(Color.secondary.opacity(0.2))
+                                        .frame(width: freeWidth)
+                                }
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                            }
+                            .frame(height: 12)
+
+                            // Volume Table
+                            VStack(spacing: 4) {
+                                ForEach(container.volumes) { vol in
+                                    HStack {
+                                        Circle()
+                                            .fill(roleColor(vol.role))
+                                            .frame(width: 6, height: 6)
+                                        Text(vol.name.isEmpty ? vol.bsdName : vol.name)
+                                            .font(.system(size: 11, weight: .medium))
+                                            .frame(width: 140, alignment: .leading)
+                                            .lineLimit(1)
+                                        Text("(\(vol.bsdName))")
+                                            .font(.system(size: 10, design: .monospaced))
+                                            .foregroundColor(.secondary)
+                                            .frame(width: 65, alignment: .leading)
+                                        Text(vol.role)
+                                            .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                                            .foregroundColor(roleColor(vol.role))
+                                            .frame(width: 80, alignment: .leading)
+                                        Spacer()
+                                        Text("\(formatBytes(vol.usedBytes)) (\(String(format: "%.1f%%", vol.percentOfContainer(total: container.totalCapacityBytes))))")
+                                            .font(.system(size: 10.5, design: .monospaced))
+                                            .foregroundColor(.secondary)
+                                    }
+                                    .padding(.vertical, 1)
+                                }
+                            }
+                            .padding(6)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.03)))
+
+                            if disk.id != containers.last?.0.id {
+                                Divider().padding(.top, 4)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func roleColor(_ role: String) -> Color {
+        switch role.lowercased() {
+        case "data": return .blue
+        case "system": return .indigo
+        case "vm": return .orange
+        case "recovery": return .purple
+        case "preboot": return .mint
+        default: return .teal
+        }
     }
 
     // MARK: - 5. Per-Drive Raw S.M.A.R.T. Register Breakdown

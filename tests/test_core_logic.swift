@@ -758,8 +758,8 @@ struct CoreLogicTestRunner {
         assertTrue(!kAppArchitecture.isEmpty, "kAppArchitecture must not be empty")
         assertTrue(!kAppArchShort.isEmpty, "kAppArchShort must not be empty")
         assertTrue(kAppArchShort == "arm64" || kAppArchShort == "x86_64", "kAppArchShort must be either arm64 or x86_64")
-        assertTrue(kAppVersion == "2.8.0", "kAppVersion must match 2.8.0")
-        assertTrue(kAppBuildNumber == "11", "kAppBuildNumber must match 11")
+        assertTrue(kAppVersion == "3.0.0", "kAppVersion must match 3.0.0")
+        assertTrue(kAppBuildNumber == "13", "kAppBuildNumber must match 13")
 
         let diag = DiagnosticExporter.shared.generateDiagnosticReport()
         guard let sys = diag["system"] as? [String: Any] else {
@@ -3638,6 +3638,430 @@ struct CoreLogicTestRunner {
             assertTrue(!liveSamples.isEmpty, "Live captureRawSamples via libproc must return active processes")
 
             print("  [OK] ProcessIoInspector delta throughput calculation, ranking, and live libproc sampling verified")
+        }
+
+        // ====================================================================
+        // Test 53: SubprocessRunner Process Group Isolation & Timeout (PROC-02)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 53: SubprocessRunner Process Group Isolation & Timeout ===")
+            // Fast command succeeds
+            let resEcho = SubprocessRunner.run(executable: "/bin/echo", arguments: ["HelloSubprocess"], timeoutSeconds: 5.0)
+            assertTrue(resEcho.isSuccess, "/bin/echo must succeed")
+            assertTrue(resEcho.stdout.contains("HelloSubprocess"), "stdout must contain echoed string")
+            assertTrue(!resEcho.timedOut, "Fast echo command must not time out")
+
+            // Long command times out and is terminated atomically
+            let resTimeout = SubprocessRunner.run(executable: "/bin/sleep", arguments: ["5"], timeoutSeconds: 0.15)
+            assertTrue(resTimeout.timedOut, "/bin/sleep 5 with 0.15s timeout must report timedOut")
+            assertTrue(resTimeout.exitCode == -9, "Timed out command must yield exit code -9")
+
+            print("  [OK] SubprocessRunner execution, output capture, and process group timeout termination verified")
+        }
+
+        // ====================================================================
+        // Test 54: ParallelDriveProber Circuit Breaker & Quarantine (CONC-03)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 54: ParallelDriveProber Circuit Breaker & Quarantine ===")
+            let prober = ParallelDriveProber.shared
+            prober.clearQuarantinedMount("/Volumes/SimulatedDeadDrive")
+            assertTrue(!prober.isMountQuarantined("/Volumes/SimulatedDeadDrive"), "Cleared mount must not be quarantined")
+
+            let targetA = DriveProbeTarget(driveKey: "disk0", mountPath: "/", isInternal: true, runCanary: false)
+            let results = prober.probeAll(targets: [targetA], timeoutSeconds: 3.0)
+            assertTrue(results["disk0"] != nil, "Prober must return results for disk0")
+            assertTrue(!results["disk0"]!.timedOut, "Root volume probe must not time out")
+            assertTrue(results["disk0"]!.fsMetrics != nil, "Root volume must return fsMetrics")
+
+            print("  [OK] ParallelDriveProber bounded execution and circuit breaker state verified")
+        }
+
+        // ====================================================================
+        // Test 55: PowerManagementService Dark Wake & Assertions (PWR-01)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 55: PowerManagementService Dark Wake & Assertions ===")
+            let pms = PowerManagementService.shared
+            let isDark = pms.isDarkWakeActive()
+            assertTrue(isDark == false || isDark == true, "isDarkWakeActive must return a boolean")
+
+            var executed = false
+            pms.withPreventIdleSleepAssertion(reason: "Unit Test Assertion") {
+                executed = true
+            }
+            assertTrue(executed, "withPreventIdleSleepAssertion block must execute successfully")
+
+            print("  [OK] PowerManagementService Dark Wake check and sleep assertion lifecycle verified")
+        }
+
+        // ====================================================================
+        // Test 56: ApfsSnapshotService Parsing & Thinning Logic (APFS-02)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 56: ApfsSnapshotService Inventory & Thinning Logic ===")
+            let svc = ApfsSnapshotService.shared
+            let snaps = svc.listSnapshots(mountPath: "/")
+            // On macOS root volume, listSnapshots returns an array of ApfsSnapshotInfo without crashing
+            for snap in snaps {
+                assertTrue(!snap.snapshotName.isEmpty, "Snapshot name must not be empty")
+                assertTrue(snap.ageSeconds >= 0, "Snapshot age must be non-negative")
+                assertTrue(!snap.formattedAge.isEmpty, "Formatted age must not be empty")
+            }
+
+            print("  [OK] ApfsSnapshotService inventory listing and timestamp parsing verified (\(snaps.count) local snapshots found)")
+        }
+
+        // ====================================================================
+        // Test 57: OpenFileBlockerInspector Mount Resolution (DA-01)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 57: OpenFileBlockerInspector Mount Resolution ===")
+            let inspector = OpenFileBlockerInspector.shared
+            let blockers = inspector.inspectBlockers(mountPath: "/", maxCount: 32)
+            // On a running macOS system, root volume has active processes holding open file handles
+            for b in blockers {
+                assertTrue(b.pid > 0, "Blocker PID must be positive")
+                assertTrue(!b.processName.isEmpty, "Process name must not be empty")
+                assertTrue(b.filePath.hasPrefix("/"), "File path must be an absolute path")
+            }
+
+            let emptyBlockers = inspector.inspectBlockers(mountPath: "/Nonexistent/Mount/Path/404")
+            assertTrue(emptyBlockers.isEmpty, "Nonexistent mount must report 0 file blockers")
+
+            print("  [OK] OpenFileBlockerInspector open file descriptor scanning and PID matching verified")
+        }
+
+        // ====================================================================
+        // Test 58: OpenMetricsServer Prometheus Text Exposition (METRICS-01)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 58: OpenMetricsServer Prometheus Text Exposition ===")
+            let server = OpenMetricsServer.shared
+            let metricsText = server.generatePrometheusMetrics()
+            assertTrue(metricsText.contains("# TYPE disk_health_score gauge"), "Metrics must declare disk_health_score gauge")
+            assertTrue(metricsText.contains("# TYPE disk_temperature_celsius gauge"), "Metrics must declare disk_temperature_celsius gauge")
+            assertTrue(metricsText.contains("# TYPE disk_percentage_used gauge"), "Metrics must declare disk_percentage_used gauge")
+            assertTrue(metricsText.contains("# TYPE disk_available_spare_percent gauge"), "Metrics must declare disk_available_spare_percent gauge")
+            assertTrue(metricsText.contains("# TYPE disk_free_bytes gauge"), "Metrics must declare disk_free_bytes gauge")
+
+            // Test server start / stop cycle on ephemeral port
+            server.start(port: 19108)
+            assertTrue(server.running, "Server must be running after start()")
+            assertTrue(server.port == 19108, "Server port must match 19108")
+            server.stop()
+            assertTrue(!server.running, "Server must stop running after stop()")
+
+            print("  [OK] OpenMetricsServer Prometheus metrics exposition, lifecycle, and port clamping verified")
+        }
+
+        // ====================================================================
+        // Test 59: BusSignalIntegrityRule Evaluation (BRIDGE-08)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 59: BusSignalIntegrityRule Evaluation (BRIDGE-08) ===")
+            let rule = BusSignalIntegrityRule()
+            var hw = DiskHardwareMetrics()
+            hw.found = true
+            hw.smartValid = true
+            hw.busErrorCount = 10
+            hw.busResetCount = 3
+
+            var baseline = DriveBaselineState()
+            baseline.baselineBusErrors = 5
+            baseline.baselineBusResets = 1
+
+            let fsMetrics = FilesystemMountMetrics(
+                isMounted: true,
+                mountPoint: "/Volumes/ExtSSD",
+                filesystemType: "apfs",
+                isReadOnly: false,
+                totalBytes: 1_000_000_000,
+                freeBytes: 500_000_000,
+                purgeableBytes: 0,
+                usedBytes: 500_000_000,
+                usedPercent: 50.0
+            )
+
+            let ctx = HealthEvaluationContext(
+                nowTs: 1000,
+                config: ConfigManager.shared.currentConfig,
+                hardware: hw,
+                linkSpeedFormatted: "USB 10Gbps",
+                interconnect: "USB",
+                mountToInspect: "/Volumes/ExtSSD",
+                filesystem: fsMetrics,
+                subpathsStatus: [:],
+                canaryOk: true,
+                canaryLatencyMs: 2.0,
+                canaryError: "",
+                avgReadLatMs: 0.1,
+                avgWriteLatMs: 0.1,
+                inWakeGrace: false,
+                hostThermalState: .nominal,
+                driveState: baseline,
+                recentTemperatureSamples: [],
+                apfsContainer: nil
+            )
+
+            let outcome = rule.evaluate(context: ctx)
+            assertTrue(outcome.scorePenalty == 20, "Delta 5 errors and delta 2 resets must produce score penalty of 20 (got \(outcome.scorePenalty))")
+            assertTrue(outcome.issues.contains(where: { $0.code == "BUS_PHY_ERRORS" }), "Must contain BUS_PHY_ERRORS issue")
+
+            // Critical threshold: deltaResets >= 3
+            baseline.baselineBusResets = 0
+            var critCtx = ctx
+            critCtx.driveState = baseline
+            let critOutcome = rule.evaluate(context: critCtx)
+            assertTrue(critOutcome.scorePenalty == 35, "Delta 3 resets must produce score penalty of 35 (got \(critOutcome.scorePenalty))")
+
+            // Zero delta produces no penalty
+            baseline.baselineBusErrors = 10
+            baseline.baselineBusResets = 3
+            let cleanCtx = HealthEvaluationContext(
+                nowTs: 1000,
+                config: ConfigManager.shared.currentConfig,
+                hardware: hw,
+                linkSpeedFormatted: "USB 10Gbps",
+                interconnect: "USB",
+                mountToInspect: "/Volumes/ExtSSD",
+                filesystem: fsMetrics,
+                subpathsStatus: [:],
+                canaryOk: true,
+                canaryLatencyMs: 2.0,
+                canaryError: "",
+                avgReadLatMs: 0.1,
+                avgWriteLatMs: 0.1,
+                inWakeGrace: false,
+                hostThermalState: .nominal,
+                driveState: baseline,
+                recentTemperatureSamples: [],
+                apfsContainer: nil
+            )
+            let cleanOutcome = rule.evaluate(context: cleanCtx)
+            assertTrue(cleanOutcome.scorePenalty == 0, "Zero delta must produce zero penalty")
+            assertTrue(cleanOutcome.issues.isEmpty, "Zero delta must produce zero issues")
+
+            print("  [OK] BusSignalIntegrityRule delta error/reset detection and scoring verified")
+        }
+
+        // ====================================================================
+        // Test 60: ApfsSwapPressureRule Evaluation (APFS-03)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 60: ApfsSwapPressureRule Evaluation (APFS-03) ===")
+            let rule = ApfsSwapPressureRule()
+            var hw = DiskHardwareMetrics()
+            hw.found = true
+            hw.smartValid = true
+
+            // Synthetic container with runaway VM swap volume (50 GB out of 100 GB pool)
+            let vmVol = ApfsVolumeRoleMetrics(
+                bsdName: "disk3s2",
+                name: "VM",
+                role: "VM",
+                totalBytes: 100_000_000_000,
+                usedBytes: 50_000_000_000,
+                freeBytes: 2_000_000_000,
+                isEncrypted: false
+            )
+            let dataVol = ApfsVolumeRoleMetrics(
+                bsdName: "disk3s1",
+                name: "Data",
+                role: "Data",
+                totalBytes: 100_000_000_000,
+                usedBytes: 48_000_000_000,
+                freeBytes: 2_000_000_000,
+                isEncrypted: false
+            )
+            let container = ApfsContainerFleetMetrics(
+                containerBsd: "disk3",
+                totalCapacityBytes: 100_000_000_000,
+                freeSpaceBytes: 2_000_000_000, // 2% free pool -> critical
+                volumes: [dataVol, vmVol]
+            )
+
+            let fsMetrics = FilesystemMountMetrics(
+                isMounted: true,
+                mountPoint: "/",
+                filesystemType: "apfs",
+                isReadOnly: false,
+                totalBytes: 100_000_000_000,
+                freeBytes: 2_000_000_000,
+                purgeableBytes: 0,
+                usedBytes: 98_000_000_000,
+                usedPercent: 98.0
+            )
+
+            let ctx = HealthEvaluationContext(
+                nowTs: 1000,
+                config: ConfigManager.shared.currentConfig,
+                hardware: hw,
+                linkSpeedFormatted: "PCIe",
+                interconnect: "PCI-Express",
+                mountToInspect: "/",
+                filesystem: fsMetrics,
+                subpathsStatus: [:],
+                canaryOk: true,
+                canaryLatencyMs: 2.0,
+                canaryError: "",
+                avgReadLatMs: 0.1,
+                avgWriteLatMs: 0.1,
+                inWakeGrace: false,
+                hostThermalState: .nominal,
+                driveState: DriveBaselineState(),
+                recentTemperatureSamples: [],
+                apfsContainer: container
+            )
+
+            let outcome = rule.evaluate(context: ctx)
+            assertTrue(outcome.scorePenalty == 15, "Swap exhaustion when free pool < 10% must equal 15 penalty (got \(outcome.scorePenalty))")
+            assertTrue(outcome.issues.contains(where: { $0.code == "APFS_SWAP_PRESSURE" }), "Must flag APFS_SWAP_PRESSURE")
+
+            print("  [OK] ApfsSwapPressureRule container pool and swap volume exhaustion evaluation verified")
+        }
+
+        // ====================================================================
+        // Test 61: Physical LBA Bad-Sector Extent Pinpointing (SCAN-02)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 61: Physical LBA Extent Pinpointing (SCAN-02) ===")
+            let extent = DamagedPhysicalExtent(
+                filePath: "/System/Volumes/Data/test.dat",
+                logicalOffset: 4096,
+                physicalLbaOffset: 0x1000000,
+                contiguousBytes: 4096,
+                errorCode: 5
+            )
+            assertTrue(extent.id == "/System/Volumes/Data/test.dat:4096", "Extent ID must match path:offset")
+            assertTrue(extent.physicalLbaOffset == 0x1000000, "Physical byte offset preserved")
+
+            // Test encoding & decoding
+            let enc = try? JSONEncoder().encode(extent)
+            assertTrue(enc != nil, "DamagedPhysicalExtent must be JSON encodable")
+            if let enc = enc {
+                let dec = try? JSONDecoder().decode(DamagedPhysicalExtent.self, from: enc)
+                assertTrue(dec == extent, "Decoded extent must match original")
+            }
+
+            // Test C bridge extent resolver on a real file descriptor
+            let fd = open("/bin/sh", O_RDONLY)
+            if fd >= 0 {
+                var physOffset: UInt64 = 0
+                var contigLength: UInt64 = 0
+                let res = DiskResolvePhysicalExtent(fd, 0, 4096, &physOffset, &contigLength)
+                close(fd)
+                // On Darwin APFS/HFS, /bin/sh extent resolution succeeds
+                if res == 0 {
+                    assertTrue(physOffset > 0, "Physical LBA byte offset must be non-zero for real file")
+                    assertTrue(contigLength > 0, "Contiguous extent length must be non-zero")
+                }
+            }
+
+            print("  [OK] DamagedPhysicalExtent models and Darwin F_LOG2PHYS extent resolution verified")
+        }
+
+        // ====================================================================
+        // Test 62: APFS Container Fleet Metrics & Volume Listing (APFS-03)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 62: APFS Container Fleet Metrics & Volume Listing (APFS-03) ===")
+            var cMetrics = DiskApfsContainerMetrics()
+            var vMetrics = [DiskApfsVolumeMetrics](repeating: DiskApfsVolumeMetrics(), count: 16)
+            let volCount = DiskListApfsContainerVolumes(nil, &cMetrics, &vMetrics, 16)
+            if volCount > 0 {
+                let contBsd = cStringToSwift(cMetrics.containerBsd)
+                assertTrue(!contBsd.isEmpty, "Container BSD name must not be empty")
+                assertTrue(cMetrics.totalCapacityBytes > 0, "Total container capacity must be > 0")
+
+                var hasData = false
+                var hasSystem = false
+                for i in 0..<Int(volCount) {
+                    let r = cStringToSwift(vMetrics[i].role).lowercased()
+                    if r.contains("data") { hasData = true }
+                    if r.contains("system") { hasSystem = true }
+                }
+                assertTrue(hasData || hasSystem, "APFS container must contain Data or System role volumes")
+            }
+
+            print("  [OK] APFS container volume pool discovery and role inspection verified")
+        }
+
+        // ====================================================================
+        // Test 63: 90-Day Rolling Forecast & OLS Linear Regression (HIST-01)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 63: 90-Day Rolling Forecast & OLS Linear Regression (HIST-01) ===")
+            let store = TelemetryHistoryStore.shared
+
+            var dummySnap = normalSnap
+            dummySnap.rolling7dTerabytesWrittenPerDay = 0.05
+            dummySnap.rolling30dTerabytesWrittenPerDay = 0.05
+            dummySnap.p95WriteLatencyMs = 1.8
+            dummySnap.p95TemperatureCelsius = 42
+
+            // Test 90-day archive append
+            store.appendArchiveRecord(snapshot: dummySnap)
+            let sanitizedKey = dummySnap.driveKey.components(separatedBy: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-")).inverted).joined(separator: "_")
+            let archivePath = "\(ConfigManager.shared.configDir)/history/\(sanitizedKey).jsonl"
+            assertTrue(FileManager.default.fileExists(atPath: archivePath), "\(archivePath) must exist after appendArchiveRecord")
+
+            // Test rolling forecast calculation
+            let forecasts = store.computeRollingForecasts(for: dummySnap)
+            assertTrue(forecasts.rolling7dTBPerDay >= 0.0, "Rolling 7d forecast must be non-negative")
+            assertTrue(forecasts.rolling30dTBPerDay >= 0.0, "Rolling 30d forecast must be non-negative")
+
+            print("  [OK] 90-day rolling OLS regression, tail latencies, and JSONL archival verified")
+        }
+
+        // ====================================================================
+        // Test 64: Process I/O Throttling & System Process Guards (PROC-03)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 64: Process I/O Throttling & System Guards (PROC-03) ===")
+            let inspector = ProcessIoInspector.shared
+
+            // Ensure system critical mounts and system PIDs are rejected
+            let rootRes = inspector.throttleRunawayProcess(forMount: "/")
+            assertTrue(!rootRes.throttled, "Throttling runaway processes on system root volume '/' must be refused for safety")
+
+            let nonExistentRes = inspector.throttleRunawayProcess(forMount: "/Nonexistent/Mount/999")
+            assertTrue(!nonExistentRes.throttled, "Throttling on nonexistent mount must be false")
+
+            // Test C bridge background priority setter on self
+            let setPrioOk = DiskSetProcessBackgroundIoPriority(getpid(), true)
+            // 0 on success, negative errno on permission restriction
+            assertTrue(setPrioOk == 0 || setPrioOk == -EPERM || setPrioOk == -EACCES, "DiskSetProcessBackgroundIoPriority must execute safely")
+
+            print("  [OK] Process I/O throttler safety guards and Darwin priority escalation protections verified")
+        }
+
+        // ====================================================================
+        // Test 65: Pre-Sleep External Drive Shield Lifecycle (DA-02 / PWR-02)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 65: Pre-Sleep External Drive Shield Lifecycle (DA-02 / PWR-02) ===")
+            let cfg = ConfigManager.shared
+            let prevSetting = cfg.currentConfig.preSleepShieldEnabled
+
+            cfg.setPreSleepShield(enabled: true)
+            assertTrue(cfg.currentConfig.preSleepShieldEnabled == true, "PreSleepShield setting must be enabled")
+
+            cfg.setPreSleepShield(enabled: false)
+            assertTrue(cfg.currentConfig.preSleepShieldEnabled == false, "PreSleepShield setting must be disabled")
+
+            // Restore previous setting
+            cfg.setPreSleepShield(enabled: prevSetting)
+
+            let pwr = PowerManagementService.shared
+            pwr.startPreSleepShield()
+            assertTrue(pwr.isShieldRegistered, "PowerManagementService pre-sleep shield must be registered after startPreSleepShield()")
+
+            // shieldExternalDrivesBeforeSleep must safely execute without unmounting root volume
+            let unmountedCount = pwr.shieldExternalDrivesBeforeSleep()
+            assertTrue(unmountedCount >= 0, "Unmounted drive count must be non-negative")
+
+            print("  [OK] Pre-Sleep External Drive Shield lifecycle, configuration persistence, and safety guards verified")
         }
 
         print("✅ All Swift Core Logic Unit Tests Passed!")

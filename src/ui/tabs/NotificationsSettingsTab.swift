@@ -45,6 +45,58 @@ struct NotificationsSettingsTab: View {
                     }
                 }
 
+                SettingsCard(title: "Prometheus & OpenMetrics Server", icon: "server.rack", iconColor: .orange) {
+                    SettingsRow(
+                        title: "Enable Loopback HTTP Metrics Server",
+                        subtitle: "Expose live disk telemetry for Prometheus, Grafana, and homelab monitoring tools."
+                    ) {
+                        Toggle("", isOn: Binding(
+                            get: { viewModel.metricsServerEnabled },
+                            set: { val in
+                                viewModel.updateMetricsServer(enabled: val, portString: viewModel.metricsServerPortString)
+                            }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                    }
+
+                    if viewModel.metricsServerEnabled {
+                        Divider()
+
+                        HStack(alignment: .center, spacing: 14) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("HTTP Server Port")
+                                    .font(.system(size: 13, weight: .medium))
+                                Text("Port number (1024–65535)")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.secondary)
+                            }
+                            .frame(width: 175, alignment: .leading)
+
+                            HStack(spacing: 8) {
+                                TextField("9108", text: $viewModel.metricsServerPortString)
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(width: 80)
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .onSubmit {
+                                        viewModel.updateMetricsServer(enabled: viewModel.metricsServerEnabled, portString: viewModel.metricsServerPortString)
+                                    }
+
+                                Button("Apply Port") {
+                                    viewModel.updateMetricsServer(enabled: viewModel.metricsServerEnabled, portString: viewModel.metricsServerPortString)
+                                }
+                                .font(.system(size: 12))
+
+                                Spacer()
+
+                                Text("http://127.0.0.1:\(viewModel.metricsServerPortString)/metrics")
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                }
+
                 SettingsCard(title: "Credential Storage & Security", icon: "lock.shield.fill", iconColor: .green) {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(alignment: .center) {

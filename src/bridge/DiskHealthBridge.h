@@ -48,6 +48,7 @@ typedef struct {
     // NVMe Base Specification 1.4+ S.M.A.R.T. / Health Information Log
     // ========================================================================
     bool smartValid;                    ///< True if IONVMeSMARTUserClient successfully returned SMART logs.
+    uint8_t smartSourceType;            ///< Source: 0 = Native NVMe, 1 = SAT ATA (0x85), 2 = USB Vendor NVMe.
     uint8_t criticalWarning;            ///< Bitmask of critical warnings (0x01: spare below threshold, 0x02: temp, etc.).
     int32_t temperatureCelsius;         ///< Composite controller temperature in degrees Celsius (validated & clamped).
     int32_t temperatureKelvin;          ///< Raw composite temperature in Kelvin as reported by NVMe controller.
@@ -79,7 +80,26 @@ typedef struct {
     uint64_t retriesWritten;            ///< Cumulative driver write retry attempts.
     uint64_t totalTimeReadNs;           ///< Cumulative nanoseconds spent servicing read I/O requests.
     uint64_t totalTimeWriteNs;          ///< Cumulative nanoseconds spent servicing write I/O requests.
+    uint32_t busErrorCount;             ///< Cumulative hardware PHY/link error counter (USB/Thunderbolt).
+    uint32_t busResetCount;             ///< Cumulative bus/port reset counter.
 } DiskHardwareMetrics;
+
+typedef struct {
+    char bsdName[64];                   ///< Volume BSD name (e.g. "disk3s5").
+    char name[128];                     ///< Volume display name (e.g. "Macintosh HD", "Data").
+    char role[64];                      ///< Volume role ("Data", "System", "VM", "Preboot", "Recovery", "Update", "User").
+    uint64_t totalBytes;                ///< Total capacity allocated or available to volume.
+    uint64_t usedBytes;                 ///< Bytes physically consumed by volume.
+    uint64_t freeBytes;                 ///< Free space available in shared container pool.
+    bool isEncrypted;                   ///< True if FileVault / APFS encryption is active.
+} DiskApfsVolumeMetrics;
+
+typedef struct {
+    char containerBsd[64];              ///< Container BSD name (e.g. "disk3").
+    uint64_t totalCapacityBytes;        ///< Total physical pool capacity of the APFS container.
+    uint64_t freeSpaceBytes;            ///< Shared free space remaining in container.
+    uint32_t volumeCount;               ///< Number of APFS volumes in this container.
+} DiskApfsContainerMetrics;
 
 /**
  * @brief Reads low-level hardware telemetry and SMART health metrics for a target drive.
@@ -178,6 +198,75 @@ typedef struct {
  * @note Thread-safe. Zero dynamic memory leaks.
  */
 int DiskSampleProcessIoMetrics(DiskProcessIoMetric *outArray, int maxCount);
+
+/**
+ * @brief Describes an active process holding open file descriptors on a volume mount.
+ */
+typedef struct {
+    int32_t pid;                        ///< Process ID holding the open file descriptor.
+    char processName[128];              ///< Executable process name (from proc_name).
+    char filePath[512];                 ///< Resolved absolute file path on the targeted mount.
+    int32_t fd;                         ///< Open file descriptor index.
+} DiskFileBlocker;
+
+/**
+ * @brief Lists active processes holding open file descriptors on a specific volume mount path.
+ *
+ * Uses Darwin <libproc.h> (proc_listallpids, PROC_PIDLISTFDS, and PROC_PIDFDVNODEPATHINFO)
+ * to locate all processes actively holding open file handles pointing inside mountPath.
+ *
+ * @param mountPath Target mount directory (e.g. "/Volumes/T7" or "/").
+ * @param outList Pre-allocated array of DiskFileBlocker structs.
+ * @param maxCount Maximum number of entries to populate.
+ * @return Number of open file blockers populated (or 0 if none/error).
+ */
+int DiskListOpenFileBlockers(const char *mountPath, DiskFileBlocker *outList, int maxCount);
+
+/**
+ * @brief Checks whether the macOS system is currently in Dark Wake (Power Nap) state.
+ *
+ * Inspects system display and power session state to detect if display is asleep
+ * while system is awake, allowing background daemons to avoid waking external mechanical drives.
+ *
+ * @return 1 if Dark Wake / display-sleep state is active, 0 if display is active or on error.
+ */
+int DiskIsDarkWakeActive(void);
+
+/**
+ * @brief Resolves logical file offset and extent length to underlying physical disk LBA/byte offset (SCAN-02).
+ *
+ * Uses Darwin fcntl(F_LOG2PHYS_EXT) to query kernel block extents.
+ *
+ * @param fd Open file descriptor to query.
+ * @param logicalOffset Byte offset within the file.
+ * @param length Extent length in bytes to query.
+ * @param outPhysOffset Output pointer for physical byte offset on the raw block device.
+ * @param outContigBytes Output pointer for contiguous bytes available at this extent.
+ * @return 0 on success, negative errno on failure.
+ */
+int DiskResolvePhysicalExtent(int fd, off_t logicalOffset, off_t length, uint64_t *outPhysOffset, uint64_t *outContigBytes);
+
+/**
+ * @brief Enumerates APFS volume roles and capacity sharing for a container (APFS-03).
+ *
+ * @param targetBsdOrMount Container BSD name (e.g. "disk3"), slice ("disk3s1"), or mount ("/").
+ * @param outContainer Pointer to container summary struct to populate.
+ * @param outVolumes Pre-allocated array of DiskApfsVolumeMetrics structs.
+ * @param maxVolumes Maximum number of volume structs to populate.
+ * @return Number of volumes populated.
+ */
+int DiskListApfsContainerVolumes(const char *targetBsdOrMount, DiskApfsContainerMetrics *outContainer, DiskApfsVolumeMetrics *outVolumes, int maxVolumes);
+
+/**
+ * @brief Downgrades or restores a process's scheduling and disk I/O tier (PROC-03).
+ *
+ * Uses Darwin setpriority(PRIO_DARWIN_PROCESS, pid, PRIO_DARWIN_BG) to throttle runaway I/O.
+ *
+ * @param pid Process ID to adjust.
+ * @param enable True to throttle into background I/O tier; false to restore normal tier.
+ * @return 0 on success, negative errno on failure.
+ */
+int DiskSetProcessBackgroundIoPriority(pid_t pid, bool enable);
 
 #ifdef __APPLE__
 /**

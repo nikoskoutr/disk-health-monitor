@@ -48,7 +48,7 @@ struct GeneralSettingsTab: View {
                                     if let d = configMgr.config.targetDeviceQuery, !d.isEmpty { return d }
                                     return "auto"
                                 },
-                                set: { newVal in
+                                set: { (newVal: String) in
                                     if newVal == "auto" {
                                         DiskHealthMonitor.shared.setMonitoredTarget(volumePath: nil, deviceQuery: nil)
                                     } else if newVal.hasPrefix("/") {
@@ -139,6 +139,20 @@ struct GeneralSettingsTab: View {
                         }
                         .labelsHidden()
                         .frame(width: 210)
+                    }
+
+                    Divider()
+
+                    SettingsRow(
+                        title: "Pre-Sleep External Drive Shield (DA-02 / PWR-02)",
+                        subtitle: "Safely unmounts external USB/Thunderbolt drives before macOS sleep to prevent filesystem corruption and kernel panics from sudden USB 5V rail cut."
+                    ) {
+                        Toggle("", isOn: Binding(
+                            get: { configMgr.config.preSleepShieldEnabled },
+                            set: { val in configMgr.setPreSleepShield(enabled: val) }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
                     }
                 }
 

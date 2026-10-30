@@ -54,6 +54,19 @@ final class SettingsViewModel: ObservableObject {
     @Published var isSamplingIoProcesses: Bool = false
     @Published var topIoCulprits: [ProcessIoCulprit] = []
 
+    // Prometheus / OpenMetrics Server (METRICS-01)
+    @Published var metricsServerEnabled: Bool = ConfigManager.shared.currentConfig.metricsServerEnabled
+    @Published var metricsServerPortString: String = String(ConfigManager.shared.currentConfig.metricsServerPort)
+
+    // APFS Local Snapshots (APFS-02)
+    @Published var apfsSnapshots: [ApfsSnapshotInfo] = []
+    @Published var isLoadingSnapshots: Bool = false
+    @Published var snapshotThinningStatus: String? = nil
+
+    // Open File Blocker Inspector (DA-01)
+    @Published var openFileBlockers: [OpenFileBlocker] = []
+    @Published var inspectingBlockerTarget: String? = nil
+
     init() {
         self.botToken = ConfigManager.shared.resolvedTelegramBotToken
         self.webhookUrl = ConfigManager.shared.resolvedWebhookUrl
@@ -463,6 +476,56 @@ final class SettingsViewModel: ObservableObject {
             "StandardErrorPath": "\(logsDir)/launchd.err.log",
             "ProcessType": "Interactive"
         ]
+    }
+
+    func updateMetricsServer(enabled: Bool, portString: String) {
+        let portVal = Int(portString.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 9108
+        let safePort = max(1024, min(portVal, 65535))
+        ConfigManager.shared.setMetricsServer(enabled: enabled, port: safePort)
+        metricsServerEnabled = enabled
+        metricsServerPortString = String(safePort)
+        if enabled {
+            OpenMetricsServer.shared.start(port: safePort)
+        } else {
+            OpenMetricsServer.shared.stop()
+        }
+    }
+
+    func loadApfsSnapshots(mountPath: String = "/") {
+        isLoadingSnapshots = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let list = ApfsSnapshotService.shared.listSnapshots(mountPath: mountPath)
+            DispatchQueue.main.async {
+                self.apfsSnapshots = list
+                self.isLoadingSnapshots = false
+            }
+        }
+    }
+
+    func thinApfsSnapshots(mountPath: String = "/", targetGB: UInt64 = 20) {
+        snapshotThinningStatus = "Thinning snapshots..."
+        DispatchQueue.global(qos: .userInitiated).async {
+            let bytes = targetGB * 1_000_000_000
+            let res = ApfsSnapshotService.shared.thinSnapshots(mountPath: mountPath, targetPurgeBytes: bytes, urgency: 4)
+            let updated = ApfsSnapshotService.shared.listSnapshots(mountPath: mountPath)
+            DispatchQueue.main.async {
+                self.apfsSnapshots = updated
+                self.snapshotThinningStatus = res.isSuccess ? "Thinned successfully" : "Thinning completed"
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+                    self.snapshotThinningStatus = nil
+                }
+            }
+        }
+    }
+
+    func inspectOpenFileBlockers(mountPath: String) {
+        inspectingBlockerTarget = mountPath
+        DispatchQueue.global(qos: .userInitiated).async {
+            let list = OpenFileBlockerInspector.shared.inspectBlockers(mountPath: mountPath)
+            DispatchQueue.main.async {
+                self.openFileBlockers = list
+            }
+        }
     }
 }
 

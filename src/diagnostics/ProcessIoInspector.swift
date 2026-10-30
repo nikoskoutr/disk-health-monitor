@@ -174,4 +174,37 @@ final class ProcessIoInspector: @unchecked Sendable {
             topN: topN
         )
     }
+
+    /// Pinpoints and throttles the highest disk I/O process actively writing to `mountPath` (PROC-03).
+    func throttleRunawayProcess(forMount mountPath: String) -> (throttled: Bool, culprit: ProcessIoCulprit?, message: String) {
+        let blockers = OpenFileBlockerInspector.shared.inspectBlockers(mountPath: mountPath)
+        guard !blockers.isEmpty else {
+            return (false, nil, "No open file blockers detected on '\(mountPath)'")
+        }
+
+        let blockingPids = Set(blockers.map { $0.pid })
+        let culprits = sampleActiveCulpritsWindow(durationSec: 0.35, topN: 16)
+        guard let topCulprit = culprits.first(where: { blockingPids.contains($0.pid) }) else {
+            return (false, nil, "No high-throughput process found among open file handles on '\(mountPath)'")
+        }
+
+        // Hard safety checks: never throttle protected system processes
+        if topCulprit.pid <= 100 {
+            return (false, topCulprit, "Process \(topCulprit.processName) (PID \(topCulprit.pid)) is a protected system process (PID <= 100)")
+        }
+        let exemptNames: Set<String> = [
+            "kernel_task", "launchd", "WindowServer", "loginwindow", "Finder", "backupd", "fsck_apfs",
+            "DiskHealthMonitor", "diskutil", "syslogd", "opendirectoryd"
+        ]
+        if exemptNames.contains(topCulprit.processName) {
+            return (false, topCulprit, "Process \(topCulprit.processName) is exempted from throttling")
+        }
+
+        let res = DiskSetProcessBackgroundIoPriority(topCulprit.pid, true)
+        if res == 0 {
+            return (true, topCulprit, "Throttled \(topCulprit.processName) (PID \(topCulprit.pid)) to Darwin background I/O tier (writing \(String(format: "%.2f", topCulprit.writeMBps)) MB/s)")
+        } else {
+            return (false, topCulprit, "Failed to throttle \(topCulprit.processName) (PID \(topCulprit.pid)): errno \(-res)")
+        }
+    }
 }

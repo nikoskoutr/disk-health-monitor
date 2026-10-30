@@ -30,6 +30,21 @@ struct HistoryRateMetrics: Sendable, Equatable {
     static let zero = HistoryRateMetrics(freeSpaceDropGBPerHour: 0.0, terabytesWrittenLast24h: 0.0)
 }
 
+/// Rolling statistical telemetry forecasts and percentiles (HIST-01).
+struct RollingForecastMetrics: Sendable, Equatable {
+    let rolling7dTBPerDay: Double
+    let rolling30dTBPerDay: Double
+    let p95WriteLatencyMs: Double
+    let p95TempCelsius: Int
+
+    static let zero = RollingForecastMetrics(
+        rolling7dTBPerDay: 0.0,
+        rolling30dTBPerDay: 0.0,
+        p95WriteLatencyMs: 0.0,
+        p95TempCelsius: 0
+    )
+}
+
 /// Top-level JSON container stored in `~/.config/disk-health-monitor/history.json`.
 struct TelemetryHistoryContainer: Codable, Sendable, Equatable {
     var pointsByDriveKey: [String: [TelemetryHistoryPoint]] = [:]
@@ -103,6 +118,7 @@ final class TelemetryHistoryStore: @unchecked Sendable {
 
         if persistToDisk {
             saveLocked()
+            appendArchiveRecord(snapshot: snapshot)
         }
         return true
     }
@@ -150,6 +166,125 @@ final class TelemetryHistoryStore: @unchecked Sendable {
             freeSpaceDropGBPerHour: max(0.0, freeSpaceDropGBPerHour),
             terabytesWrittenLast24h: max(0.0, tbw24h)
         )
+    }
+
+    /// Computes rolling OLS linear regressions and p95 latency/temperature percentiles (HIST-01).
+    func computeRollingForecasts(for snapshot: DiskHealthSnapshot) -> RollingForecastMetrics {
+        lock.lock()
+        let series = container.pointsByDriveKey[snapshot.driveKey] ?? []
+        lock.unlock()
+
+        guard !series.isEmpty else { return .zero }
+        let nowTs = snapshot.timestamp
+
+        // OLS regression helper over window: (timestamp, TBW)
+        func computeOlsSlope(windowSeconds: TimeInterval) -> Double {
+            let windowPoints = series.filter { (nowTs - $0.timestamp) <= windowSeconds }
+            guard windowPoints.count >= 2 else { return snapshot.dailyTerabytesWritten }
+
+            var sumX: Double = 0.0
+            var sumY: Double = 0.0
+            let t0 = windowPoints[0].timestamp
+
+            let xyPairs = windowPoints.map { p -> (Double, Double) in
+                let xDays = (p.timestamp - t0) / 86400.0
+                let y = p.totalTerabytesWritten
+                sumX += xDays
+                sumY += y
+                return (xDays, y)
+            }
+
+            let n = Double(xyPairs.count)
+            let meanX = sumX / n
+            let meanY = sumY / n
+
+            var numerator: Double = 0.0
+            var denominator: Double = 0.0
+
+            for (x, y) in xyPairs {
+                let dx = x - meanX
+                let dy = y - meanY
+                numerator += dx * dy
+                denominator += dx * dx
+            }
+
+            if denominator > 0.000001 {
+                let slope = numerator / denominator
+                return max(0.0, slope)
+            }
+
+            // Fallback: simple delta
+            if let first = windowPoints.first, let last = windowPoints.last, last.timestamp > first.timestamp {
+                let dtDays = (last.timestamp - first.timestamp) / 86400.0
+                return max(0.0, (last.totalTerabytesWritten - first.totalTerabytesWritten) / dtDays)
+            }
+            return snapshot.dailyTerabytesWritten
+        }
+
+        let rolling7d = computeOlsSlope(windowSeconds: 7 * 86400)
+        let rolling30d = computeOlsSlope(windowSeconds: 30 * 86400)
+
+        // Percentiles: p95 of write latency and temperature
+        let writeLatencies = series.map(\.avgWriteLatencyMs).sorted()
+        let p95Lat: Double = {
+            guard !writeLatencies.isEmpty else { return snapshot.avgWriteLatencyMs }
+            let idx = min(writeLatencies.count - 1, Int(Double(writeLatencies.count - 1) * 0.95))
+            return writeLatencies[idx]
+        }()
+
+        let temps = series.map(\.temperatureCelsius).sorted()
+        let p95Tmp: Int = {
+            guard !temps.isEmpty else { return snapshot.temperatureCelsius }
+            let idx = min(temps.count - 1, Int(Double(temps.count - 1) * 0.95))
+            return temps[idx]
+        }()
+
+        return RollingForecastMetrics(
+            rolling7dTBPerDay: rolling7d,
+            rolling30dTBPerDay: rolling30d,
+            p95WriteLatencyMs: p95Lat,
+            p95TempCelsius: p95Tmp
+        )
+    }
+
+    /// Appends a compact JSON record to the 90-day archive file ~/.config/disk-health-monitor/history/<driveKey>.jsonl.
+    func appendArchiveRecord(snapshot: DiskHealthSnapshot) {
+        let sanitizedKey = snapshot.driveKey.components(separatedBy: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-")).inverted).joined(separator: "_")
+        let dir = "\(ConfigManager.shared.configDir)/history"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [
+            .posixPermissions: 0o700
+        ])
+        let filePath = "\(dir)/\(sanitizedKey).jsonl"
+
+        let point = TelemetryHistoryPoint(
+            timestamp: snapshot.timestamp,
+            overallSeverity: snapshot.overallSeverity,
+            healthScore: snapshot.healthScore,
+            temperatureCelsius: snapshot.temperatureCelsius,
+            freeBytes: snapshot.freeBytes,
+            usedPercent: snapshot.usedPercent,
+            totalTerabytesWritten: snapshot.totalTerabytesWritten,
+            avgReadLatencyMs: snapshot.avgReadLatencyMs,
+            avgWriteLatencyMs: snapshot.avgWriteLatencyMs
+        )
+
+        let encoder = JSONEncoder()
+        guard let data = try? encoder.encode(point),
+              let jsonStr = String(data: data, encoding: .utf8) else { return }
+
+        let line = jsonStr + "\n"
+        if let lineData = line.data(using: .utf8) {
+            let url = URL(fileURLWithPath: filePath)
+            if FileManager.default.fileExists(atPath: filePath) {
+                if let handle = try? FileHandle(forWritingTo: url) {
+                    _ = try? handle.seekToEnd()
+                    try? handle.write(contentsOf: lineData)
+                    try? handle.close()
+                }
+            } else {
+                _ = AtomicFileWriter.writeRestricted(data: lineData, toPath: filePath, permissions: 0o600)
+            }
+        }
     }
 
     /// Clears stored history for testing or user reset.

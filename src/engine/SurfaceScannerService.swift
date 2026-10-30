@@ -16,6 +16,9 @@ final class SurfaceScannerService: @unchecked Sendable {
     /// Shared singleton instance.
     static let shared = SurfaceScannerService()
 
+    private let lock = NSLock()
+    private(set) var lastDamagedExtents: [DamagedPhysicalExtent] = []
+
     init() {}
 
     /// Operational tiers for non-destructive surface scanning.
@@ -165,7 +168,8 @@ final class SurfaceScannerService: @unchecked Sendable {
             scanRoot = mountPoint
         }
 
-        let effectiveMaxBytes = maxBytesToScan ?? mode.maxBytes
+        return PowerManagementService.shared.withPreventIdleSleepAssertion(reason: "DiskHealthMonitor Surface Scan (\(mode.displayName))") {
+            let effectiveMaxBytes = maxBytesToScan ?? mode.maxBytes
         let effectiveMaxFiles = mode.maxFiles
         let maxPerFile = mode.maxBytesPerFile
         let bufSize = mode.chunkSize
@@ -201,6 +205,7 @@ final class SurfaceScannerService: @unchecked Sendable {
         var bytesScanned: UInt64 = 0
         var readErrors = 0
         var wasCancelled = false
+        var currentDamagedExtents: [DamagedPhysicalExtent] = []
 
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: bufSize, alignment: 4096)
         defer { buffer.deallocate() }
@@ -293,6 +298,19 @@ final class SurfaceScannerService: @unchecked Sendable {
                     }
                     if err == EIO || err == ENXIO || err == ETIMEDOUT {
                         readErrors += 1
+                        var physOffset: UInt64 = 0
+                        var contigBytes: UInt64 = 0
+                        if DiskResolvePhysicalExtent(fd, off_t(fileBytesRead), off_t(toRead), &physOffset, &contigBytes) == 0 {
+                            let damaged = DamagedPhysicalExtent(
+                                filePath: path,
+                                logicalOffset: UInt64(fileBytesRead),
+                                physicalLbaOffset: physOffset,
+                                contiguousBytes: contigBytes,
+                                errorCode: err
+                            )
+                            currentDamagedExtents.append(damaged)
+                            ConfigManager.shared.log("DAMAGED EXTENT (SCAN-02): '\(path)' @ logical offset \(fileBytesRead) -> physical offset \(physOffset) (\(contigBytes) bytes, errno: \(err))")
+                        }
                     }
                     break
                 } else if n == 0 {
@@ -331,6 +349,10 @@ final class SurfaceScannerService: @unchecked Sendable {
             return (false, 0, 0, readErrors, elapsedMs, summary)
         }
 
+        lock.lock()
+        self.lastDamagedExtents = currentDamagedExtents
+        lock.unlock()
+
         let ok = (readErrors == 0)
         let timeStr = elapsedMs >= 1000.0 ? String(format: "%.2f s", elapsedSec) : String(format: "%.1f ms", elapsedMs)
         let summary = ok
@@ -338,6 +360,7 @@ final class SurfaceScannerService: @unchecked Sendable {
             : String(format: "FAILED [%@] (%d physical read errors across %d files, %@ read)", mode.shortLabel, readErrors, filesScanned, formatBytes(bytesScanned))
         ConfigManager.shared.log("Surface read scan on '\(scanRoot)': \(summary)")
         return (ok, filesScanned, bytesScanned, readErrors, elapsedMs, summary)
+        }
     }
 }
 

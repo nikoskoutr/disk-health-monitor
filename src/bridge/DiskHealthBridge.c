@@ -14,6 +14,7 @@
 #include <strings.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <dlfcn.h>
 #include <sys/param.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
@@ -357,6 +358,45 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
             }
         }
 
+        // PHY Link Errors and Bus Resets (USB / Thunderbolt - BRIDGE-08)
+        CFTypeRef portStatsRef = IORegistryEntryCreateCFProperty(parent, CFSTR("port-statistics"), kCFAllocatorDefault, 0);
+        if (portStatsRef) {
+            if (CFGetTypeID(portStatsRef) == CFDictionaryGetTypeID()) {
+                CFDictionaryRef dict = (CFDictionaryRef)portStatsRef;
+                outMetrics->busErrorCount += (uint32_t)DiskExtractCFNumberU64(dict, CFSTR("kPortStatEnumerationFailureCount"));
+                outMetrics->busErrorCount += (uint32_t)DiskExtractCFNumberU64(dict, CFSTR("kPortStatOverCurrentCount"));
+                outMetrics->busErrorCount += (uint32_t)DiskExtractCFNumberU64(dict, CFSTR("kPortStatAddressFailureCount"));
+                outMetrics->busErrorCount += (uint32_t)DiskExtractCFNumberU64(dict, CFSTR("kPortStatEOF2ViolationCount"));
+                outMetrics->busResetCount += (uint32_t)DiskExtractCFNumberU64(dict, CFSTR("kPortStatEOF2ViolationDuringResetCount"));
+            }
+            CFRelease(portStatsRef);
+        }
+
+        CFTypeRef errCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("PortErrorCount"), kCFAllocatorDefault, 0);
+        if (!errCountRef) errCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("LinkErrorCount"), kCFAllocatorDefault, 0);
+        if (!errCountRef) errCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("RxErrorCount"), kCFAllocatorDefault, 0);
+        if (errCountRef) {
+            if (CFGetTypeID(errCountRef) == CFNumberGetTypeID()) {
+                int64_t val = 0;
+                if (CFNumberGetValue((CFNumberRef)errCountRef, kCFNumberSInt64Type, &val) && val > 0) {
+                    outMetrics->busErrorCount += (uint32_t)val;
+                }
+            }
+            CFRelease(errCountRef);
+        }
+
+        CFTypeRef resetCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("USBPortResetCount"), kCFAllocatorDefault, 0);
+        if (!resetCountRef) resetCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("ResetCount"), kCFAllocatorDefault, 0);
+        if (resetCountRef) {
+            if (CFGetTypeID(resetCountRef) == CFNumberGetTypeID()) {
+                int64_t val = 0;
+                if (CFNumberGetValue((CFNumberRef)resetCountRef, kCFNumberSInt64Type, &val) && val > 0) {
+                    outMetrics->busResetCount += (uint32_t)val;
+                }
+            }
+            CFRelease(resetCountRef);
+        }
+
         IOObjectRelease(current);
         current = parent;
     }
@@ -646,6 +686,7 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
             memset(&data, 0, sizeof(data));
             if ((*smart)->SMARTReadData(smart, &data) == kIOReturnSuccess) {
                 outMetrics->smartValid = true;
+                outMetrics->smartSourceType = 0; // Native NVMe
                 outMetrics->criticalWarning = data.CRITICAL_WARNING;
 
                 uint16_t tempRaw = CFSwapInt16LittleToHost(data.TEMPERATURE);
@@ -674,6 +715,14 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
     } else {
         if (outMetrics->protocolType[0] == '\0') {
             strlcpy(outMetrics->protocolType, "SCSI/Block", sizeof(outMetrics->protocolType));
+        }
+        // Fallback: If external USB or SATA drive without native NVMeSMARTUserClient, tag SAT / USB source
+        if (!outMetrics->isInternal) {
+            if (strcasecmp(outMetrics->interconnectType, "SATA") == 0) {
+                outMetrics->smartSourceType = 1; // SAT ATA (0x85)
+            } else if (strcasecmp(outMetrics->interconnectType, "USB") == 0) {
+                outMetrics->smartSourceType = 2; // USB Vendor NVMe / UASP
+            }
         }
     }
 }
@@ -1090,5 +1139,311 @@ int DiskSampleProcessIoMetrics(DiskProcessIoMetric *outArray, int maxCount) {
     }
 
     if (pids != stackPids) free(pids);
+    return populated;
+}
+
+// ============================================================================
+// MARK: - Open File Blocker Inspector (DA-01) & Dark Wake Power State (PWR-01)
+// ============================================================================
+
+int DiskListOpenFileBlockers(const char *mountPath, DiskFileBlocker *outList, int maxCount) {
+    if (!mountPath || mountPath[0] == '\0' || !outList || maxCount <= 0) return 0;
+
+    int numBytes = proc_listallpids(NULL, 0);
+    if (numBytes <= 0) return 0;
+
+    size_t pidCapacity = (size_t)(numBytes / (int)sizeof(pid_t)) + 64;
+    pid_t stackPids[512];
+    pid_t *pids = stackPids;
+    if (pidCapacity > 512) {
+        pids = (pid_t *)calloc(pidCapacity, sizeof(pid_t));
+        if (!pids) return 0;
+    }
+
+    int actualBytes = proc_listallpids(pids, (int)(pidCapacity * sizeof(pid_t)));
+    if (actualBytes <= 0) {
+        if (pids != stackPids) free(pids);
+        return 0;
+    }
+
+    int pidCount = actualBytes / (int)sizeof(pid_t);
+    int populated = 0;
+    size_t mountLen = strlen(mountPath);
+
+    for (int i = 0; i < pidCount && populated < maxCount; i++) {
+        pid_t pid = pids[i];
+        if (pid <= 0 || pid == getpid()) continue;
+
+        int numFdsBytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, NULL, 0);
+        if (numFdsBytes <= 0) continue;
+
+        int fdCount = numFdsBytes / (int)sizeof(struct proc_fdinfo);
+        if (fdCount <= 0) continue;
+
+        struct proc_fdinfo stackFdList[128];
+        struct proc_fdinfo *fdList = stackFdList;
+        if ((size_t)fdCount > 128) {
+            fdList = (struct proc_fdinfo *)calloc((size_t)fdCount, sizeof(struct proc_fdinfo));
+            if (!fdList) continue;
+        }
+
+        int readFdBytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fdList, (int)(fdCount * sizeof(struct proc_fdinfo)));
+        int actualFds = readFdBytes / (int)sizeof(struct proc_fdinfo);
+
+        char procNameBuf[128] = {0};
+        bool fetchedProcName = false;
+
+        for (int j = 0; j < actualFds && populated < maxCount; j++) {
+            if (fdList[j].proc_fdtype != PROX_FDTYPE_VNODE) continue;
+
+            struct vnode_fdinfowithpath vnodeInfo;
+            memset(&vnodeInfo, 0, sizeof(vnodeInfo));
+            int vnodeRet = proc_pidfdinfo(pid, fdList[j].proc_fd, PROC_PIDFDVNODEPATHINFO, &vnodeInfo, sizeof(vnodeInfo));
+            if (vnodeRet < (int)sizeof(vnodeInfo)) continue;
+
+            const char *filePath = vnodeInfo.pvip.vip_path;
+            if (!filePath || filePath[0] == '\0') continue;
+
+            // Check if filePath is inside mountPath
+            bool matches = false;
+            if (strcmp(mountPath, "/") == 0) {
+                matches = true;
+            } else if (strncmp(filePath, mountPath, mountLen) == 0) {
+                if (filePath[mountLen] == '/' || filePath[mountLen] == '\0') {
+                    matches = true;
+                }
+            }
+
+            if (matches) {
+                if (!fetchedProcName) {
+                    if (proc_name(pid, procNameBuf, sizeof(procNameBuf) - 1) <= 0 || procNameBuf[0] == '\0') {
+                        snprintf(procNameBuf, sizeof(procNameBuf), "pid-%d", (int)pid);
+                    }
+                    fetchedProcName = true;
+                }
+
+                DiskFileBlocker *entry = &outList[populated];
+                entry->pid = (int32_t)pid;
+                strlcpy(entry->processName, procNameBuf, sizeof(entry->processName));
+                entry->processName[sizeof(entry->processName) - 1] = '\0';
+                strlcpy(entry->filePath, filePath, sizeof(entry->filePath));
+                entry->filePath[sizeof(entry->filePath) - 1] = '\0';
+                entry->fd = fdList[j].proc_fd;
+                populated++;
+            }
+        }
+
+        if (fdList != stackFdList) free(fdList);
+    }
+
+    if (pids != stackPids) free(pids);
+    return populated;
+}
+
+int DiskIsDarkWakeActive(void) {
+    typedef CFDictionaryRef (*CGSessionCopyCurrentDictionaryFn)(void);
+    static CGSessionCopyCurrentDictionaryFn sFn = NULL;
+    static bool sResolved = false;
+
+    if (!sResolved) {
+        sFn = (CGSessionCopyCurrentDictionaryFn)dlsym(RTLD_DEFAULT, "CGSessionCopyCurrentDictionary");
+        sResolved = true;
+    }
+
+    if (!sFn) return 0;
+    CFDictionaryRef sessionDict = sFn();
+    if (!sessionDict) return 0;
+
+    int isDark = 0;
+    CFBooleanRef onConsole = (CFBooleanRef)CFDictionaryGetValue(sessionDict, CFSTR("kCGSSessionOnConsoleKey"));
+    if (!onConsole) {
+        onConsole = (CFBooleanRef)CFDictionaryGetValue(sessionDict, CFSTR("kCGSessionOnConsoleKey"));
+    }
+
+    if (onConsole && CFGetTypeID(onConsole) == CFBooleanGetTypeID()) {
+        if (!CFBooleanGetValue(onConsole)) {
+            isDark = 1;
+        }
+    }
+
+    CFRelease(sessionDict);
+    return isDark;
+}
+
+int DiskResolvePhysicalExtent(int fd, off_t logicalOffset, off_t length, uint64_t *outPhysOffset, uint64_t *outContigBytes) {
+    if (fd < 0 || !outPhysOffset || !outContigBytes) {
+        return -EINVAL;
+    }
+
+    struct log2phys l2p;
+    memset(&l2p, 0, sizeof(l2p));
+    l2p.l2p_flags = 0;
+    l2p.l2p_contigbytes = length;
+    l2p.l2p_devoffset = logicalOffset;
+
+    if (fcntl(fd, F_LOG2PHYS_EXT, &l2p) == 0) {
+        *outPhysOffset = (uint64_t)l2p.l2p_devoffset;
+        *outContigBytes = (uint64_t)l2p.l2p_contigbytes;
+        return 0;
+    }
+
+    // Fallback to F_LOG2PHYS using lseek offset
+    off_t prev = lseek(fd, logicalOffset, SEEK_SET);
+    if (prev >= 0) {
+        memset(&l2p, 0, sizeof(l2p));
+        if (fcntl(fd, F_LOG2PHYS, &l2p) == 0) {
+            *outPhysOffset = (uint64_t)l2p.l2p_devoffset;
+            *outContigBytes = (l2p.l2p_contigbytes > 0) ? (uint64_t)l2p.l2p_contigbytes : (uint64_t)length;
+            lseek(fd, prev, SEEK_SET);
+            return 0;
+        }
+        lseek(fd, prev, SEEK_SET);
+    }
+
+    return -errno;
+}
+
+int DiskSetProcessBackgroundIoPriority(pid_t pid, bool enable) {
+    if (pid <= 0) return -EINVAL;
+    int res = setpriority(PRIO_DARWIN_PROCESS, (id_t)pid, enable ? PRIO_DARWIN_BG : 0);
+    if (res != 0) {
+        if (pid == getpid()) {
+            if (setpriority(PRIO_DARWIN_THREAD, 0, enable ? PRIO_DARWIN_BG : 0) == 0) {
+                return 0;
+            }
+        }
+        return -errno;
+    }
+    return 0;
+}
+
+int DiskListApfsContainerVolumes(const char *targetBsdOrMount, DiskApfsContainerMetrics *outContainer, DiskApfsVolumeMetrics *outVolumes, int maxVolumes) {
+    if (!outContainer || !outVolumes || maxVolumes <= 0) return 0;
+    memset(outContainer, 0, sizeof(*outContainer));
+    memset(outVolumes, 0, sizeof(DiskApfsVolumeMetrics) * (size_t)maxVolumes);
+
+    char targetContainer[64] = {0};
+    char targetBsd[64] = {0};
+
+    // 1. Resolve target container BSD prefix from mount or device
+    if (targetBsdOrMount && targetBsdOrMount[0] != '\0') {
+        if (targetBsdOrMount[0] == '/') {
+            struct statfs st;
+            if (statfs(targetBsdOrMount, &st) == 0) {
+                const char *p = strstr(st.f_mntfromname, "/dev/");
+                strlcpy(targetBsd, p ? (p + 5) : st.f_mntfromname, sizeof(targetBsd));
+            }
+        } else {
+            const char *p = strstr(targetBsdOrMount, "/dev/");
+            strlcpy(targetBsd, p ? (p + 5) : targetBsdOrMount, sizeof(targetBsd));
+        }
+
+        // Extract container prefix: e.g. "disk3s5" -> "disk3"
+        strlcpy(targetContainer, targetBsd, sizeof(targetContainer));
+        char *s = strchr(targetContainer, 's');
+        if (s) *s = '\0';
+    }
+
+    CFMutableDictionaryRef matching = IOServiceMatching("AppleAPFSVolume");
+    if (!matching) return 0;
+
+    io_iterator_t iter = 0;
+    kern_return_t kr = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iter);
+    if (kr != KERN_SUCCESS || !iter) return 0;
+
+    int populated = 0;
+    io_service_t service = 0;
+
+    while ((service = IOIteratorNext(iter)) != 0 && populated < maxVolumes) {
+        DiskApfsVolumeMetrics *vol = &outVolumes[populated];
+
+        // BSD Name
+        CFTypeRef bsdRef = IORegistryEntryCreateCFProperty(service, CFSTR("BSD Name"), kCFAllocatorDefault, 0);
+        if (bsdRef) {
+            copyCFStringRefToBuffer(bsdRef, vol->bsdName, sizeof(vol->bsdName));
+            CFRelease(bsdRef);
+        }
+
+        // Filter by container if specified
+        if (targetContainer[0] != '\0' && vol->bsdName[0] != '\0') {
+            if (strncmp(vol->bsdName, targetContainer, strlen(targetContainer)) != 0) {
+                IOObjectRelease(service);
+                continue;
+            }
+        }
+
+        // FullName / Volume Name
+        CFTypeRef nameRef = IORegistryEntryCreateCFProperty(service, CFSTR("FullName"), kCFAllocatorDefault, 0);
+        if (!nameRef) nameRef = IORegistryEntryCreateCFProperty(service, CFSTR("VolName"), kCFAllocatorDefault, 0);
+        if (nameRef) {
+            copyCFStringRefToBuffer(nameRef, vol->name, sizeof(vol->name));
+            CFRelease(nameRef);
+        }
+
+        // Volume Role
+        CFTypeRef roleRef = IORegistryEntryCreateCFProperty(service, CFSTR("Role"), kCFAllocatorDefault, 0);
+        if (roleRef) {
+            if (CFGetTypeID(roleRef) == CFArrayGetTypeID()) {
+                CFArrayRef arr = (CFArrayRef)roleRef;
+                if (CFArrayGetCount(arr) > 0) {
+                    CFStringRef roleStr = (CFStringRef)CFArrayGetValueAtIndex(arr, 0);
+                    if (roleStr && CFGetTypeID(roleStr) == CFStringGetTypeID()) {
+                        copyCFStringRefToBuffer(roleStr, vol->role, sizeof(vol->role));
+                    }
+                }
+            } else if (CFGetTypeID(roleRef) == CFStringGetTypeID()) {
+                copyCFStringRefToBuffer(roleRef, vol->role, sizeof(vol->role));
+            }
+            CFRelease(roleRef);
+        }
+        if (vol->role[0] == '\0') {
+            strlcpy(vol->role, "User", sizeof(vol->role));
+        }
+
+        // Size / Allocation
+        CFTypeRef sizeRef = IORegistryEntryCreateCFProperty(service, CFSTR("Size"), kCFAllocatorDefault, 0);
+        if (sizeRef) {
+            if (CFGetTypeID(sizeRef) == CFNumberGetTypeID()) {
+                int64_t sz = 0;
+                if (CFNumberGetValue((CFNumberRef)sizeRef, kCFNumberSInt64Type, &sz) && sz > 0) {
+                    vol->totalBytes = (uint64_t)sz;
+                }
+            }
+            CFRelease(sizeRef);
+        }
+
+        // If volume is mounted, query statfs for exact space
+        char mountPath[MAXPATHLEN] = {0};
+        if (vol->bsdName[0] != '\0' && DiskFindMountForBlockDevice(vol->bsdName, mountPath, sizeof(mountPath))) {
+            struct statfs st;
+            if (statfs(mountPath, &st) == 0) {
+                uint64_t poolTotal = (uint64_t)st.f_blocks * (uint64_t)st.f_bsize;
+                uint64_t poolFree = (uint64_t)st.f_bfree * (uint64_t)st.f_bsize;
+                uint64_t poolAvail = (uint64_t)st.f_bavail * (uint64_t)st.f_bsize;
+                vol->freeBytes = (poolAvail > 0) ? poolAvail : poolFree;
+                if (poolTotal > vol->freeBytes) {
+                    vol->usedBytes = poolTotal - vol->freeBytes;
+                }
+                if (outContainer->totalCapacityBytes == 0) {
+                    outContainer->totalCapacityBytes = poolTotal;
+                    outContainer->freeSpaceBytes = vol->freeBytes;
+                }
+            }
+        }
+
+        populated++;
+        IOObjectRelease(service);
+    }
+    IOObjectRelease(iter);
+
+    if (targetContainer[0] != '\0') {
+        strlcpy(outContainer->containerBsd, targetContainer, sizeof(outContainer->containerBsd));
+    } else if (populated > 0) {
+        strlcpy(outContainer->containerBsd, outVolumes[0].bsdName, sizeof(outContainer->containerBsd));
+        char *s = strchr(outContainer->containerBsd, 's');
+        if (s) *s = '\0';
+    }
+    outContainer->volumeCount = (uint32_t)populated;
+
     return populated;
 }

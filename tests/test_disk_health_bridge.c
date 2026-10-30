@@ -419,6 +419,99 @@ int main(void) {
     assert(foundSelfPid);
     printf("  DiskSampleProcessIoMetrics verified (%d processes sampled, self PID %d found)\n", procCount, (int)getpid());
 
-    printf("\n=== All 17 Bridge Tests Passed Successfully! ===\n");
+    printf("\n=== Test 18: SAT ATA & NVMe SMART Source Types (v2.9.0) ===\n");
+    for (int i = 0; i < count; i++) {
+        // smartSourceType must be one of 0 (Native NVMe), 1 (SAT ATA), 2 (USB Vendor NVMe)
+        assert(devices[i].smartSourceType <= 2);
+    }
+    printf("  SMART source types verified across all block devices\n");
+
+    printf("\n=== Test 19: Open File Blocker Inspector DiskListOpenFileBlockers (DA-01) ===\n");
+    // Boundary checks
+    assert(DiskListOpenFileBlockers(NULL, NULL, 0) == 0);
+    assert(DiskListOpenFileBlockers("/", NULL, 10) == 0);
+    DiskFileBlocker singleBlocker;
+    assert(DiskListOpenFileBlockers("/", &singleBlocker, 0) == 0);
+    assert(DiskListOpenFileBlockers("/", &singleBlocker, -1) == 0);
+    assert(DiskListOpenFileBlockers("/nonexistent/mount/path/404", &singleBlocker, 1) == 0);
+
+    // List open files on root volume "/"
+    DiskFileBlocker blockerList[64];
+    int blockerCount = DiskListOpenFileBlockers("/", blockerList, 64);
+    assert(blockerCount >= 0 && blockerCount <= 64);
+    if (blockerCount > 0) {
+        assert(blockerList[0].pid > 0);
+        assert(blockerList[0].processName[0] != '\0');
+        assert(blockerList[0].filePath[0] == '/');
+    }
+    printf("  DiskListOpenFileBlockers verified (%d active file blockers found on '/')\n", blockerCount);
+
+    printf("\n=== Test 20: Dark Wake Power State Query DiskIsDarkWakeActive (PWR-01) ===\n");
+    int darkWake = DiskIsDarkWakeActive();
+    assert(darkWake == 0 || darkWake == 1);
+    printf("  DiskIsDarkWakeActive verified (state: %d)\n", darkWake);
+
+    printf("\n=== Test 21: Physical LBA Extent Resolution DiskResolvePhysicalExtent (SCAN-02) ===\n");
+    uint64_t physOffset = 0, contigBytes = 0;
+    // Boundary check: invalid fd
+    assert(DiskResolvePhysicalExtent(-1, 0, 4096, &physOffset, &contigBytes) != 0);
+    assert(DiskResolvePhysicalExtent(0, 0, 4096, NULL, &contigBytes) != 0);
+    assert(DiskResolvePhysicalExtent(0, 0, 4096, &physOffset, NULL) != 0);
+
+    // Create a temporary file in workspace cache, write some data, and query extent
+    char tempPath[] = ".build-cache/test_extent_XXXXXX";
+    int tempFd = mkstemp(tempPath);
+    if (tempFd < 0) {
+        // Fallback to /tmp
+        char altPath[] = "/tmp/test_extent_XXXXXX";
+        tempFd = mkstemp(altPath);
+        if (tempFd >= 0) strlcpy(tempPath, altPath, sizeof(tempPath));
+    }
+    assert(tempFd >= 0);
+    char buf[8192];
+    memset(buf, 0xAB, sizeof(buf));
+    ssize_t written = write(tempFd, buf, sizeof(buf));
+    assert(written == sizeof(buf));
+    fsync(tempFd);
+
+    int resExt = DiskResolvePhysicalExtent(tempFd, 0, 4096, &physOffset, &contigBytes);
+    // On APFS, extent query succeeds and returns valid physical offset and extent
+    if (resExt == 0) {
+        assert(contigBytes > 0);
+    }
+    close(tempFd);
+    unlink(tempPath);
+    printf("  DiskResolvePhysicalExtent boundary safety & resolution verified\n");
+
+    printf("\n=== Test 22: APFS Container Volumes Inspection DiskListApfsContainerVolumes (APFS-03) ===\n");
+    DiskApfsContainerMetrics containerMetrics;
+    DiskApfsVolumeMetrics volumeList[32];
+    // Boundary checks
+    assert(DiskListApfsContainerVolumes(NULL, NULL, NULL, 0) == 0);
+    assert(DiskListApfsContainerVolumes("/", &containerMetrics, NULL, 10) == 0);
+    assert(DiskListApfsContainerVolumes("/", NULL, volumeList, 10) == 0);
+
+    int volCount = DiskListApfsContainerVolumes("/", &containerMetrics, volumeList, 32);
+    assert(volCount >= 0 && volCount <= 32);
+    if (volCount > 0) {
+        assert(containerMetrics.containerBsd[0] != '\0');
+        assert(volumeList[0].bsdName[0] != '\0');
+        assert(volumeList[0].role[0] != '\0');
+    }
+    printf("  DiskListApfsContainerVolumes verified (%d volumes found in container '%s')\n", volCount, containerMetrics.containerBsd);
+
+    printf("\n=== Test 23: Process Background I/O Priority Throttler DiskSetProcessBackgroundIoPriority (PROC-03) ===\n");
+    // Boundary check
+    assert(DiskSetProcessBackgroundIoPriority(-1, true) != 0);
+    assert(DiskSetProcessBackgroundIoPriority(0, true) != 0);
+
+    // Throttle and restore self
+    int prioBg = DiskSetProcessBackgroundIoPriority(getpid(), true);
+    assert(prioBg == 0 || prioBg == -EPERM);
+    int prioRestore = DiskSetProcessBackgroundIoPriority(getpid(), false);
+    assert(prioRestore == 0 || prioRestore == -EPERM);
+    printf("  DiskSetProcessBackgroundIoPriority background throttle & restore verified\n");
+
+    printf("\n=== All 23 Bridge Tests Passed Successfully! ===\n");
     return 0;
 }

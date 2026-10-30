@@ -36,6 +36,13 @@ func printUsage() {
       --list-rules          List all configured 'When X, Do Y' automation rules
       --simulate-rule [id]  Simulate an automation rule in dry-run mode against a synthetic snapshot
       --top-io              Sample active processes performing disk I/O via Darwin libproc
+      --who-blocks <path>   Inspect processes holding open files preventing volume unmount
+      --snapshots [path]    List APFS local Time Machine snapshots with age and timestamp
+      --thin-snapshots [path] [GB] Thin APFS local snapshots by specified gigabytes (default: 20 GB)
+      --metrics-server      Launch standalone OpenMetrics / Prometheus HTTP exporter
+      --metrics-port <port> Override OpenMetrics HTTP exporter port (default: 9108)
+      --container-info [bsd] Show APFS container volume pool and role breakdown (APFS-03)
+      --pre-sleep-shield [on|off|status|trigger] View or configure pre-sleep external drive shield (DA-02)
       --test-alert-script   Test execution of the configured custom alert shell script
       --send-report         Dispatch on-demand HTML health report to Telegram
       --menubar             Launch the macOS Menu Bar status item application (default)
@@ -64,6 +71,8 @@ func parseCommandLine() {
         "--export-config", "--unmasked", "--include-secrets", "--import-config",
         "--export-diagnostics", "--export-html", "--surface-scan",
         "--list-rules", "--simulate-rule", "--top-io",
+        "--who-blocks", "--snapshots", "--thin-snapshots", "--metrics-server", "--metrics-port",
+        "--container-info", "--pre-sleep-shield",
         "--test-alert-script", "--list-disks", "--json", "--cli", "--status",
         "--check", "--watch-mounts", "--deep", "--notify", "--notify-if-unhealthy",
         "--verify", "--send-report", "--menubar"
@@ -76,13 +85,13 @@ func parseCommandLine() {
             continue
         }
         let arg = args[i]
-        if arg == "--volume" || arg == "--device" || arg == "--import-config" || arg == "--export-diagnostics" || arg == "--export-html" || arg == "--surface-scan" || arg == "--simulate-rule" {
+        if arg == "--volume" || arg == "--device" || arg == "--import-config" || arg == "--export-diagnostics" || arg == "--export-html" || arg == "--surface-scan" || arg == "--simulate-rule" || arg == "--who-blocks" || arg == "--snapshots" || arg == "--thin-snapshots" || arg == "--metrics-port" || arg == "--container-info" || arg == "--pre-sleep-shield" {
             if i + 1 < args.count && !args[i + 1].hasPrefix("-") {
                 skipNext = true
             }
             continue
         }
-        if arg.hasPrefix("--surface-scan=") || arg.hasPrefix("--simulate-rule=") {
+        if arg.hasPrefix("--surface-scan=") || arg.hasPrefix("--simulate-rule=") || arg.hasPrefix("--container-info=") || arg.hasPrefix("--pre-sleep-shield=") {
             continue
         }
         if arg.hasPrefix("-") {
@@ -327,6 +336,179 @@ func parseCommandLine() {
         exit(0)
     }
 
+    if let idx = args.firstIndex(where: { $0 == "--who-blocks" || $0.hasPrefix("--who-blocks=") }) {
+        var targetMount = "/"
+        let arg = args[idx]
+        if arg.hasPrefix("--who-blocks=") {
+            targetMount = String(arg.dropFirst("--who-blocks=".count))
+        } else if idx + 1 < args.count && !args[idx + 1].hasPrefix("-") {
+            targetMount = args[idx + 1]
+        }
+        let blockers = OpenFileBlockerInspector.shared.inspectBlockers(mountPath: targetMount)
+        print("================================================================================")
+        print("  OPEN FILE BLOCKERS ON '\(targetMount)' (\(blockers.count) Found)")
+        print("================================================================================")
+        if blockers.isEmpty {
+            print("  No processes holding open file handles found on \(targetMount). Safe to unmount.")
+        } else {
+            for (i, b) in blockers.prefix(25).enumerated() {
+                print("  [\(i + 1)] PID \(b.pid) (\(b.processName)) -> fd \(b.fd): \(b.filePath)")
+            }
+        }
+        print("================================================================================")
+        exit(0)
+    }
+
+    if let idx = args.firstIndex(where: { $0 == "--snapshots" || $0.hasPrefix("--snapshots=") }) {
+        var targetMount = "/"
+        let arg = args[idx]
+        if arg.hasPrefix("--snapshots=") {
+            targetMount = String(arg.dropFirst("--snapshots=".count))
+        } else if idx + 1 < args.count && !args[idx + 1].hasPrefix("-") {
+            targetMount = args[idx + 1]
+        }
+        let list = ApfsSnapshotService.shared.listSnapshots(mountPath: targetMount)
+        print("================================================================================")
+        print("  APFS LOCAL SNAPSHOTS ON '\(targetMount)' (\(list.count) Found)")
+        print("================================================================================")
+        if list.isEmpty {
+            print("  No APFS local snapshots found on \(targetMount).")
+        } else {
+            for (i, s) in list.enumerated() {
+                print("  [\(i + 1)] \(s.snapshotName) (Created: \(s.timestampString), \(s.formattedAge))")
+            }
+        }
+        print("================================================================================")
+        exit(0)
+    }
+
+    if let idx = args.firstIndex(where: { $0 == "--thin-snapshots" || $0.hasPrefix("--thin-snapshots=") }) {
+        var targetMount = "/"
+        var targetGB: UInt64 = 20
+        let arg = args[idx]
+        if arg.hasPrefix("--thin-snapshots=") {
+            targetMount = String(arg.dropFirst("--thin-snapshots=".count))
+        } else if idx + 1 < args.count && !args[idx + 1].hasPrefix("-") {
+            targetMount = args[idx + 1]
+            if idx + 2 < args.count, let gb = UInt64(args[idx + 2]) {
+                targetGB = gb
+            }
+        }
+        print("Thinning APFS local snapshots on '\(targetMount)' for up to \(targetGB) GB...")
+        let res = ApfsSnapshotService.shared.thinSnapshots(mountPath: targetMount, targetPurgeBytes: targetGB * 1_000_000_000, urgency: 4)
+        if res.isSuccess {
+            print("Successfully thinned APFS local snapshots:")
+            if !res.stdout.isEmpty { print(res.stdout) }
+        } else {
+            print("Thinning result: exit \(res.exitCode)")
+            if !res.stderr.isEmpty { print(res.stderr) }
+        }
+        exit(res.isSuccess ? 0 : 1)
+    }
+
+    if args.contains("--metrics-server") {
+        var port = ConfigManager.shared.currentConfig.metricsServerPort
+        if let pIdx = args.firstIndex(of: "--metrics-port"), pIdx + 1 < args.count, let p = Int(args[pIdx + 1]) {
+            port = max(1024, min(p, 65535))
+        }
+        OpenMetricsServer.shared.start(port: port)
+        print("================================================================================")
+        print("  OPENMETRICS / PROMETHEUS HTTP EXPORTER RUNNING")
+        print("================================================================================")
+        print("  Endpoints:")
+        print("    http://127.0.0.1:\(port)/metrics       (Prometheus text format)")
+        print("    http://127.0.0.1:\(port)/status.json    (Full JSON telemetry)")
+        print("    http://127.0.0.1:\(port)/healthz        (Health status)")
+        print("  Press Ctrl+C to stop.")
+        print("================================================================================")
+        dispatchMain()
+    }
+
+    if let idx = args.firstIndex(where: { $0 == "--container-info" || $0.hasPrefix("--container-info=") }) {
+        var dev = ""
+        let arg = args[idx]
+        if arg.hasPrefix("--container-info=") {
+            dev = String(arg.dropFirst("--container-info=".count))
+        } else if idx + 1 < args.count && !args[idx + 1].hasPrefix("-") {
+            dev = args[idx + 1]
+        }
+        var cMetrics = DiskApfsContainerMetrics()
+        var vMetrics = [DiskApfsVolumeMetrics](repeating: DiskApfsVolumeMetrics(), count: 16)
+        let volCount = DiskListApfsContainerVolumes(dev.isEmpty ? nil : dev, &cMetrics, &vMetrics, 16)
+        print("================================================================================")
+        print("  APFS CONTAINER SPACE-SHARING & VOLUME ROLES (APFS-03)")
+        print("================================================================================")
+        if volCount > 0 {
+            let containerBsd = cStringToSwift(cMetrics.containerBsd)
+            print("  Container: \(containerBsd)")
+            print("  Total Pool Capacity : \(formatBytes(cMetrics.totalCapacityBytes))")
+            let freePct = cMetrics.totalCapacityBytes > 0 ? (Double(cMetrics.freeSpaceBytes) / Double(cMetrics.totalCapacityBytes) * 100.0) : 0.0
+            print("  Free Pool Space     : \(formatBytes(cMetrics.freeSpaceBytes)) (\(String(format: "%.1f%%", freePct)) free)")
+            print("  Volumes (\(volCount)):")
+            for i in 0..<Int(volCount) {
+                let v = vMetrics[i]
+                let name = cStringToSwift(v.name)
+                let bsd = cStringToSwift(v.bsdName)
+                let role = cStringToSwift(v.role)
+                let pct = cMetrics.totalCapacityBytes > 0 ? (Double(v.usedBytes) / Double(cMetrics.totalCapacityBytes) * 100.0) : 0.0
+                print(String(format: "    [%d] %@ (%@) — Role: %@ | Used: %@ (%.1f%% pool)", i + 1, name.padding(toLength: 20, withPad: " ", startingAt: 0), bsd, role.padding(toLength: 10, withPad: " ", startingAt: 0), formatBytes(v.usedBytes), pct))
+            }
+        } else {
+            print("  No APFS container volumes found for target '\(dev.isEmpty ? "default" : dev)'.")
+        }
+        print("================================================================================")
+        exit(volCount > 0 ? 0 : 1)
+    }
+
+    if let idx = args.firstIndex(where: { $0 == "--pre-sleep-shield" || $0.hasPrefix("--pre-sleep-shield=") }) {
+        var action = "status"
+        let arg = args[idx]
+        if arg.hasPrefix("--pre-sleep-shield=") {
+            action = String(arg.dropFirst("--pre-sleep-shield=".count)).lowercased()
+        } else if idx + 1 < args.count && !args[idx + 1].hasPrefix("-") {
+            action = args[idx + 1].lowercased()
+        }
+
+        print("================================================================================")
+        print("  PRE-SLEEP EXTERNAL DRIVE SHIELD (DA-02 / PWR-02)")
+        print("================================================================================")
+        if action == "enable" || action == "on" || action == "true" || action == "1" {
+            ConfigManager.shared.setPreSleepShield(enabled: true)
+            PowerManagementService.shared.startPreSleepShield()
+            print("  Pre-Sleep External Drive Shield has been ENABLED.")
+        } else if action == "disable" || action == "off" || action == "false" || action == "0" {
+            ConfigManager.shared.setPreSleepShield(enabled: false)
+            print("  Pre-Sleep External Drive Shield has been DISABLED.")
+        } else if action == "trigger" || action == "test" {
+            print("  Simulating pre-sleep external volume unmount sequence...")
+            let shielded = PowerManagementService.shared.shieldExternalDrivesBeforeSleep()
+            print("  Shield unmount sequence completed: \(shielded) volume(s) safely unmounted.")
+        } else {
+            let enabled = ConfigManager.shared.currentConfig.preSleepShieldEnabled
+            print("  Shield Status: \(enabled ? "ENABLED" : "DISABLED")")
+            print("  Config File  : \(ConfigManager.shared.configDir)/config.json")
+            var extDevices = [DiskHardwareMetrics](repeating: DiskHardwareMetrics(), count: 32)
+            let devCount = DiskListAllDevices(&extDevices, 32)
+            var extCount = 0
+            for i in 0..<Int(devCount) {
+                if !extDevices[i].isInternal {
+                    extCount += 1
+                    let bsd = cStringToSwift(extDevices[i].bsdName)
+                    let prod = cStringToSwift(extDevices[i].productName)
+                    var mount = [CChar](repeating: 0, count: 1024)
+                    _ = DiskFindMountForBlockDevice(bsd, &mount, 1024)
+                    let mPath = cStringToSwift(mount)
+                    print("  External target [\(extCount)]: \(prod) (\(bsd)) -> \(mPath.isEmpty ? "not mounted" : mPath)")
+                }
+            }
+            if extCount == 0 {
+                print("  No external storage devices currently connected.")
+            }
+        }
+        print("================================================================================")
+        exit(0)
+    }
+
     if args.contains("--list-disks") {
         var devices = [DiskHardwareMetrics](repeating: DiskHardwareMetrics(), count: 32)
         let count = DiskListAllDevices(&devices, 32)
@@ -513,10 +695,14 @@ func isHeadlessCLIMode(args: [String]) -> Bool {
         "--export-diagnostics", "--export-html",
         "--surface-scan", "--test-alert-script", "--list-disks", "--json",
         "--cli", "--status", "--check", "--watch-mounts", "--deep", "--all",
-        "--send-report", "--verify", "--verify-volume", "--verify-apfs"
+        "--send-report", "--verify", "--verify-volume", "--verify-apfs",
+        "--list-rules", "--simulate-rule", "--top-io",
+        "--who-blocks", "--snapshots", "--thin-snapshots",
+        "--metrics-server", "--metrics-port",
+        "--container-info", "--pre-sleep-shield"
     ]
     for arg in args.dropFirst() {
-        if cliFlags.contains(arg) || arg.hasPrefix("--surface-scan") {
+        if cliFlags.contains(arg) || arg.hasPrefix("--surface-scan") || arg.hasPrefix("--simulate-rule") || arg.hasPrefix("--container-info") || arg.hasPrefix("--pre-sleep-shield") {
             return true
         }
     }

@@ -19,7 +19,19 @@ Directly built on **IOKit**, **DiskArbitration**, **CoreFoundation**, and **Secu
 
 ## Key Features
 
-- **Zero-Dependency Native IOKit & C11 NVMe Bridge**: Direct kernel communication via `IONVMeSMARTUserClient` and `IOBlockStorageDriver`. Decodes full 128-bit little-endian NVMe counters without integer truncation.
+- **Pre-Sleep External Drive Shield (`DA-02`, `PWR-02`)**: Uses `IORegisterForSystemPower` to catch sleep notifications (`kIOMessageSystemWillSleep`) and gracefully unmount external USB/Thunderbolt storage before macOS cuts the 5V power bus, preventing dirty unmounts, corrupted APFS superblocks, and kernel panics.
+- **Physical LBA Bad-Sector & File Extent Pinpointer (`SCAN-02`)**: Directly interrogates the Darwin kernel with `fcntl(fd, F_LOG2PHYS)` to pinpoint exact physical device LBA byte offsets and contiguous block lengths when media read corruptions occur.
+- **APFS Container Space-Sharing & Volume Role Inspector (`APFS-03`)**: Traverses `AppleAPFSContainer` topologies to map pooled storage allocation across dynamic roles (`Data`, `System`, `VM`, `Recovery`, `Preboot`), featuring an automated `ApfsSwapPressureRule` to detect and alert on bloated VM swap exhaustion.
+- **90-Day Telemetry Archive & Rolling Wear Forecaster (`HIST-01`)**: Appends rate-limited 5-minute telemetry snapshots to `history/<driveKey>.jsonl` with rolling 7-day and 30-day OLS linear regressions to forecast SSD exhaustion dates alongside $p95$ write latency and thermal percentiles.
+- **USB / Thunderbolt PHY Link Error & Bus Reset Telemetry (`BRIDGE-08`)**: Extracts physical port error counts and link recovery resets (`BusSignalIntegrityRule`), identifying faulty cables, failing docks, or defective USB hubs before hardware disconnects occur.
+- **Per-Mount Runaway Process I/O Throttler (`PROC-03`)**: Leverages `setpriority(PRIO_DARWIN_PROCESS, pid, PRIO_DARWIN_BG)` to throttle rogue background processes thrashing disk queues without killing them, protected by strict system mount and process whitelist guards.
+- **Zero-Dependency Native IOKit & C11 NVMe Bridge**: Direct kernel communication via `IONVMeSMARTUserClient`, SAT ATA / USB pass-through (`BRIDGE-07`), and `IOBlockStorageDriver`. Decodes full 128-bit little-endian NVMe counters without integer truncation.
+- **Lock-Split Parallel Probing & 3s Circuit Breaker (`CONC-03`)**: Bounded worker pool (max 4 concurrent probers) with per-drive 3-second timeout circuit breakers. Isolates hung USB controllers into quarantine (`IO_CONTROLLER_UNRESPONSIVE`) so dying drives never freeze fleet polling.
+- **Open File Blocker Inspector & Safe Eject (`DA-01`)**: Darwin `<libproc.h>` vnode file descriptor resolver identifying active processes and file paths locking a disk (`--who-blocks`, UI popover), eliminating unmount stalls and unsafe eject warnings.
+- **APFS Local Snapshot Inventory & Cleaner (`APFS-02`)**: Discover and thin APFS local snapshots (`--snapshots`, `--thin-snapshots`) directly from the CLI or the Statistics & Insights tab (`⌘S`) with system volume protection guards.
+- **Dark Wake Awareness & Sleep Prevention Assertions (`PWR-01`)**: Detects macOS Dark Wake (`DiskIsDarkWakeActive`) to defer heavy background tasks, and takes `IOPMAssertion` power locks (`kIOPMAssertionTypePreventUserIdleSystemSleep`) during deep surface scans and volume verification.
+- **Prometheus & OpenMetrics HTTP Server (`METRICS-01`)**: Built-in loopback HTTP server (`127.0.0.1:<port>`) exposing standard `/metrics` for Prometheus/Grafana, `/status.json` live telemetry, and `/healthz`, with UI toggle and port selection.
+- **Subprocess-Group Isolation (`PROC-02`)**: Spawns external tools (`diskutil`, `tmutil`, scripts) into isolated process groups (`POSIX_SPAWN_SETPGROUP`) with async pipe draining and clean group termination (`kill(-pid)`).
 - **Declarative Rule-Based Automation Engine (`⌘A`)**: `"When [Trigger] on [Drive Scope] for [Consecutive Polls] → Do [Action]"` automation engine supporting 13 trigger metrics (26 issue codes, numeric thresholds, severity transitions, and rate-of-change triggers), 6 drive scopes, poll hysteresis, per-rule cooldowns, boot-volume safety guards, dry-run simulation, 5 curated presets, and 12 automated actions (safe unmount/eject, read-only remount, Time Machine backup, APFS snapshot thinning, surface scans, Shortcuts, custom scripts, and top I/O process capture).
 - **Process Disk I/O Culprit Detector (`--top-io`)**: Kernel-level `<libproc.h>` (`proc_pid_rusage` `RUSAGE_INFO_V4`) process I/O sampler that identifies and ranks the top processes generating disk read/write throughput during latency spikes or high write burn.
 - **Historical Telemetry Ring Buffer & Trend Sparklines (`⌘S`)**: Persistent 180-point ring buffer (`history.json`) tracking temperature, free space, health score, latency, and cumulative TBW with native SwiftUI sparklines and rate-of-change calculations (`GB/hr` free space drop and `24h TBW`).
@@ -48,16 +60,17 @@ disk-health-monitor/
 ├── assets/                       # AppIcon.png (1024x1024), AppIcon.icns, and UI previews
 ├── scripts/                      # CoreGraphics vector icon generator
 ├── logs/                         # Runtime logs, latest JSON telemetry snapshot, and state persistence
-├── tests/                        # C11/IOKit unit tests (17) and Swift engine unit tests (52)
+├── tests/                        # C11/IOKit unit tests (23) and Swift engine unit tests (65)
 └── src/                          # Modular C11 + Swift source tree
     ├── main.swift                # CLI router, argument parser, and NSApplication bootstrap
     ├── bridge/                   # Low-level C11 IOKit / NVMe SMART & libproc bridge
     ├── models/                   # Domain models, automation rule schemas, and POSIX formatters
-    ├── security/                 # Keychain SecretStore and POSIX SingleInstanceLock
+    ├── security/                 # SubprocessRunner, Keychain SecretStore and POSIX SingleInstanceLock
     ├── config/                   # ConfigManager, .env parser, and thread-safe logger
     ├── notifications/            # Notification Center, Telegram, Webhook, and Script dispatchers
-    ├── diagnostics/              # JSON/HTML report exporters and ProcessIoInspector
-    ├── engine/                   # 12-rule health engine, ActionRuleEngine, TelemetryHistoryStore, canary & scanner
+    ├── network/                  # Native OpenMetrics / Prometheus HTTP loopback server
+    ├── diagnostics/              # JSON/HTML report exporters, OpenFileBlockerInspector & ProcessIoInspector
+    ├── engine/                   # 13-rule health engine, ParallelDriveProber, ActionRuleEngine, ApfsSnapshotService, canary & scanner
     └── ui/                       # Menu bar controller, dashboard card, and 7-tab Settings window
 ```
 
@@ -102,19 +115,20 @@ flowchart TD
 | [`src/security/`](src/security/README.md) | macOS Keychain secret storage and POSIX single-instance lock |
 | [`src/config/`](src/config/README.md) | Multi-source configuration resolution, `.env` parser, and structured logging |
 | [`src/notifications/`](src/notifications/README.md) | Notification Center, Telegram Bot, Webhooks (Discord/Slack/HA), and script hooks |
-| [`src/diagnostics/`](src/diagnostics/README.md) | Sanitized JSON diagnostic exporter, HTML RMA report generator, and `ProcessIoInspector` |
-| [`src/engine/`](src/engine/README.md) | 12-rule evaluation engine, `ActionRuleEngine`, `TelemetryHistoryStore`, canary I/O probe, surface scanner |
+| [`src/diagnostics/`](src/diagnostics/README.md) | Sanitized JSON diagnostic exporter, HTML RMA report generator, `OpenFileBlockerInspector`, and `ProcessIoInspector` |
+| [`src/network/`](src/network/OpenMetricsServer.swift) | Native loopback OpenMetrics / Prometheus HTTP server (`127.0.0.1:<port>`) |
+| [`src/engine/`](src/engine/README.md) | 13-rule evaluation engine, `ParallelDriveProber`, `ActionRuleEngine`, `ApfsSnapshotService`, `PowerManagementService`, canary I/O probe, surface scanner |
 | [`src/ui/`](src/ui/README.md) | Menu bar status controller, telemetry card, and 7-tab Settings window (`⌘,`, `⌘A`, `⌘I`, `⌘S`) |
-| [`tests/`](tests/run_tests.sh) | 17 C11/IOKit unit tests, 52 Swift engine unit tests, and CLI test stages |
+| [`tests/`](tests/run_tests.sh) | 20 C11/IOKit unit tests, 58 Swift engine unit tests, and CLI test stages |
 | [`scripts/`](scripts/generate_app_icon.swift) | CoreGraphics vector application icon generator |
 | [`assets/`](assets/README.md) | Application branding and icon assets |
 | [`logs/`](logs/README.md) | Runtime log files, telemetry snapshots, and state persistence |
 
 ---
 
-## 12-Point Health Evaluation Engine
+## 13-Point Health Evaluation Engine
 
-Each polling cycle evaluates a `DiskHealthSnapshot` against 12 deterministic rules:
+Each polling cycle evaluates a `DiskHealthSnapshot` against 13 deterministic rules:
 
 | # | Rule Category | Telemetry Source | Trigger Condition | Severity |
 | :--- | :--- | :--- | :--- | :--- |
@@ -123,13 +137,14 @@ Each polling cycle evaluates a `DiskHealthSnapshot` against 12 deterministic rul
 | **3** | **Available Spare** | NVMe SMART Log `02h` | Available spare `< 25%` (`WARNING`) or `<= threshold` / `< 10%` (`CRITICAL`) | `WARNING` / `CRITICAL` |
 | **4** | **SSD Wear Level** | NVMe SMART Log `02h` | Wear percentage `>= 80%` (`WARNING`) or `>= 95%` (`CRITICAL`) | `WARNING` / `CRITICAL` |
 | **5** | **Drive Temperature** | NVMe SMART Log `02h` | Temperature `>= tempWarningCelsius` or `>= tempCriticalCelsius` | `WARNING` / `CRITICAL` |
-| **6** | **Host Thermal State** | `ProcessInfo.processInfo` | macOS host thermal state enters `.critical` | `WARNING` |
+| **6** | **Host Thermal State** | `ProcessInfo.processInfo` | macOS host thermal state enters `.critical` (internal only) | `WARNING` |
 | **7** | **Media & Kernel Errors** | NVMe Log `02h` & Driver Stats | Delta in media errors, error log entries, driver read/write errors or retries | `WARNING` / `CRITICAL` |
 | **8** | **I/O Latency Spikes** | `IOBlockStorageDriver` | Average read/write latency exceeds threshold (`> 50 ms` warn, `> 200 ms` crit) | `WARNING` / `CRITICAL` |
 | **9** | **Bus Link Speed** | `IOUSBHostDevice` | External link negotiates below expected speed (e.g., USB 3.0 on USB 2.0 port) | `WARNING` |
 | **10** | **Unsafe Shutdowns** | NVMe SMART Log `02h` | Unsafe shutdown counter incremented relative to persisted baseline | `WARNING` |
 | **11** | **Capacity & Free Space** | `statfs(2)` | Usage `%` above ceiling or free space below warning/critical floor | `WARNING` / `CRITICAL` |
 | **12** | **Canary & Verification** | Active Canary & `diskutil` | Read-only mount, canary probe failure, or filesystem metadata corruption | `WARNING` / `CRITICAL` |
+| **13** | **Controller Quarantine** | `ParallelDriveProber` | Device prober circuit breaker tripped (hung controller, 3.0s timeout) | `CRITICAL` |
 
 ### SSD Wear & Endurance Forecasting
 
@@ -140,7 +155,7 @@ $$\text{Remaining Lifespan (\%)} = \max(0, 100 - \text{Percentage Used})$$
 $$\text{Daily Burn Rate} = \frac{\text{Total TBW}}{\max(1, \text{POH} / 24)} \quad (\text{TB/day})$$
 
 - Lifetime forecasts project operational longevity based on active write velocity and accumulated Power-On Hours.
-- For external enclosures lacking NVMe pass-through (`smartValid = false`), health is tracked via rules 1, 6, 7, 8, 9, 11, and 12.
+- For external enclosures lacking NVMe pass-through (`smartValid = false`), health is tracked via rules 1, 6, 7, 8, 9, 11, 12, and 13.
 
 ---
 
@@ -156,7 +171,7 @@ $$\text{Daily Burn Rate} = \frac{\text{Total TBW}}{\max(1, \text{POH} / 24)} \qu
 # Compile and create DiskHealthMonitor.app + ./disk-health CLI
 ./build_and_install.sh
 
-# Run the automated test suite (17 C tests + 52 Swift tests + CLI integration)
+# Run the automated test suite (20 C tests + 58 Swift tests + CLI integration)
 ./build_and_install.sh --test
 
 # Cross-compile release DMGs, ZIPs, and standalone CLI binaries in dist/
@@ -190,6 +205,13 @@ $$\text{Daily Burn Rate} = \frac{\text{Total TBW}}{\max(1, \text{POH} / 24)} \qu
 | `--deep` | Append `diskutil verifyVolume` filesystem verification to check cycle |
 | `--surface-scan [mode]` | Run non-destructive unbuffered physical read scan (`quick`, `standard`, `full`) |
 | `--verify` | Run immediate volume filesystem verification (`diskutil verifyVolume`) |
+| `--who-blocks [mount]` | Inspect processes and file descriptors locking volume unmount |
+| `--snapshots [mount]` | List APFS local snapshots on targeted volume |
+| `--thin-snapshots [mount] [bytes]` | Request APFS local snapshot thinning |
+| `--metrics-server` | Run standalone Prometheus OpenMetrics HTTP server loopback |
+| `--metrics-port <port>` | Configure port for Prometheus OpenMetrics server (default 9102) |
+| `--container-info [bsd]` | Inspect APFS container space-sharing and volume role breakdown |
+| `--pre-sleep-shield [action]` | Configure or test pre-sleep drive unmount shield (`on`, `off`, `status`, `trigger`) |
 | `--export-html [path]` | Generate standalone responsive HTML health & RMA report |
 | `--export-diagnostics [path]` | Export comprehensive JSON diagnostic bundle |
 | `--export-config [path]` | Export current configuration as sanitized JSON (`--unmasked` for secrets) |
@@ -241,6 +263,9 @@ Parameters resolve in descending priority:
 | `minFreeSpaceWarningGB` | `MIN_FREE_SPACE_WARNING_GB` | `Double` | `30.0` | Minimum free space warning floor (`GB`) |
 | `minFreeSpaceCriticalGB` | `MIN_FREE_SPACE_CRITICAL_GB` | `Double` | `15.0` | Minimum free space critical floor (`GB`) |
 | `minExpectedUsbSpeedBps` | `MIN_EXPECTED_USB_SPEED_BPS` | `UInt64` | `5000000000` | Minimum expected USB link speed (`5000000000` = 5 Gbps USB 3.0) |
+| `preSleepShieldEnabled` | `DISK_HEALTH_PRE_SLEEP_SHIELD` | `Bool` | `false` | Pre-sleep external drive auto-unmount shield |
+| `metricsServerEnabled` | `DISK_HEALTH_METRICS_SERVER` | `Bool` | `false` | Enable built-in OpenMetrics / Prometheus loopback HTTP server |
+| `metricsServerPort` | `DISK_HEALTH_METRICS_PORT` | `Int` | `9102` | Port for OpenMetrics / Prometheus HTTP server (`1024`–`65535`) |
 | `enableNativeNotifications`| `ENABLE_NATIVE_NOTIFICATIONS`| `Bool` | `true` | Native macOS Notification Center alerts |
 | `enableCriticalSoundAlert` | `ENABLE_CRITICAL_SOUND_ALERT` | `Bool` | `false` | System audio beep on critical health transitions |
 | `scheduledVerifyIntervalHours` | `SCHEDULED_VERIFY_INTERVAL_HOURS` | `Int` | `0` (Off) | Periodic `diskutil verifyVolume` interval (`0`, `6`, `12`, `24`, `48`, `168`) |

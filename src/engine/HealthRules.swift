@@ -29,6 +29,7 @@ struct HealthEvaluationContext: Sendable {
     let hostThermalState: ProcessInfo.ThermalState
     var driveState: DriveBaselineState
     var recentTemperatureSamples: [(timestamp: TimeInterval, tempC: Int)]
+    var apfsContainer: ApfsContainerFleetMetrics? = nil
 }
 
 struct HealthRuleOutcome: Sendable {
@@ -157,13 +158,23 @@ struct CanaryProbeRule: HealthRule {
         if context.inWakeGrace {
             outcome.logMessages.append("Canary probe issue suppressed during wake grace period (8s).")
         } else if !context.canaryOk {
-            outcome.issues.append(HealthIssue(
-                code: "CANARY_IO_FAILED",
-                severity: .critical,
-                title: "Filesystem Canary Probe Failed",
-                detail: "Canary write/sync/read probe on \(context.filesystem.mountPoint) failed: \(context.canaryError)"
-            ))
-            outcome.scorePenalty += 40
+            if context.canaryError.contains("CIRCUIT_OPEN") || context.canaryError.contains("TIMEOUT") {
+                outcome.issues.append(HealthIssue(
+                    code: "IO_CONTROLLER_UNRESPONSIVE",
+                    severity: .critical,
+                    title: "I/O Controller Unresponsive",
+                    detail: "Storage controller on \(context.filesystem.mountPoint) timed out after 3000ms. Quarantined."
+                ))
+                outcome.scorePenalty += 55
+            } else {
+                outcome.issues.append(HealthIssue(
+                    code: "CANARY_IO_FAILED",
+                    severity: .critical,
+                    title: "Filesystem Canary Probe Failed",
+                    detail: "Canary write/sync/read probe on \(context.filesystem.mountPoint) failed: \(context.canaryError)"
+                ))
+                outcome.scorePenalty += 40
+            }
         } else if context.canaryLatencyMs > 300.0 {
             outcome.issues.append(HealthIssue(
                 code: "CANARY_HIGH_LATENCY",
@@ -560,6 +571,81 @@ struct HostThermalAndVerifyRule: HealthRule {
     }
 }
 
+// MARK: - Rule 13: Bus Signal & PHY Integrity (BRIDGE-08)
+
+struct BusSignalIntegrityRule: HealthRule {
+    let ruleId = "BusSignalIntegrity"
+
+    func evaluate(context: HealthEvaluationContext) -> HealthRuleOutcome {
+        var outcome = HealthRuleOutcome()
+        guard context.hardware.found else { return outcome }
+
+        let hw = context.hardware
+        let driveState = context.driveState
+
+        let baseErrors = driveState.baselineBusErrors
+        let baseResets = driveState.baselineBusResets
+
+        let deltaErrors = (hw.busErrorCount >= baseErrors) ? (hw.busErrorCount - baseErrors) : hw.busErrorCount
+        let deltaResets = (hw.busResetCount >= baseResets) ? (hw.busResetCount - baseResets) : hw.busResetCount
+
+        if deltaResets >= 3 {
+            outcome.issues.append(HealthIssue(
+                code: "BUS_PHY_ERRORS",
+                severity: .critical,
+                title: "Frequent Storage Bus Resets Detected",
+                detail: "Hardware reported \(deltaResets) bus reset(s) (baseline: \(baseResets)). Inspect physical cable, port, or hub power."
+            ))
+            outcome.scorePenalty += 35
+        } else if deltaErrors >= 5 || deltaResets >= 1 {
+            outcome.issues.append(HealthIssue(
+                code: "BUS_PHY_ERRORS",
+                severity: .warning,
+                title: "Storage Bus Signal / PHY Errors Detected",
+                detail: "Hardware reported +\(deltaErrors) PHY link error(s) and +\(deltaResets) reset(s). Possible cable degradation or loose port."
+            ))
+            outcome.scorePenalty += 20
+        }
+
+        return outcome
+    }
+}
+
+// MARK: - Rule 14: APFS Swap & Container Space Pressure (APFS-03)
+
+struct ApfsSwapPressureRule: HealthRule {
+    let ruleId = "ApfsSwapPressure"
+
+    func evaluate(context: HealthEvaluationContext) -> HealthRuleOutcome {
+        var outcome = HealthRuleOutcome()
+        guard context.filesystem.isMounted && context.filesystem.filesystemType == "apfs" else { return outcome }
+
+        if let container = context.apfsContainer {
+            for vol in container.volumes {
+                if vol.role.uppercased() == "VM" {
+                    // Check if VM swap volume exceeds 16 GB (17,179,869,184 bytes)
+                    let vm16GB: UInt64 = 16 * 1024 * 1024 * 1024
+                    if vol.usedBytes >= vm16GB && container.totalCapacityBytes > 0 {
+                        let freeRatio = Double(container.freeSpaceBytes) / Double(container.totalCapacityBytes)
+                        if freeRatio < 0.10 {
+                            outcome.issues.append(HealthIssue(
+                                code: "APFS_SWAP_PRESSURE",
+                                severity: .warning,
+                                title: "APFS Swap Volume Pressure",
+                                detail: "VM swap volume has grown to \(ByteCountFormatter.string(fromByteCount: Int64(vol.usedBytes), countStyle: .file)) while shared container free space is under 10%."
+                            ))
+                            outcome.scorePenalty += 15
+                            break
+                        }
+                    }
+                }
+            }
+        }
+
+        return outcome
+    }
+}
+
 // MARK: - Standard Health Rule Pipeline
 
 struct StandardHealthRulePipeline: Sendable {
@@ -575,6 +661,8 @@ struct StandardHealthRulePipeline: Sendable {
         EnduranceAndSpareRule(),
         SMARTIntegrityAndShutdownRule(),
         DriverStatsAndLatencyRule(),
-        HostThermalAndVerifyRule()
+        HostThermalAndVerifyRule(),
+        BusSignalIntegrityRule(),
+        ApfsSwapPressureRule()
     ]
 }

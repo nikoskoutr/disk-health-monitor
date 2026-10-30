@@ -50,6 +50,8 @@ swiftc -O -whole-module-optimization -Xlinker -dead_strip \
     -framework CoreFoundation \
     -framework UserNotifications \
     -framework Security \
+    -framework DiskArbitration \
+    -framework Network \
     -o "${BUILD_CACHE}/test_core_logic"
 "${BUILD_CACHE}/test_core_logic"
 rm -f "${BUILD_CACHE}/DiskHealthBridge_test.o"
@@ -101,6 +103,42 @@ if grep -q "TOP ACTIVE DISK I/O PROCESSES" "${BUILD_CACHE}/top_io_output.txt"; t
 else
     echo "  [FAIL] disk-health --top-io failed"
     cat "${BUILD_CACHE}/top_io_output.txt"
+    exit 1
+fi
+
+"${ROOT_DIR}/disk-health" --who-blocks / > "${BUILD_CACHE}/who_blocks_output.txt"
+if grep -q "OPEN FILE BLOCKERS ON '/'" "${BUILD_CACHE}/who_blocks_output.txt"; then
+    echo "  [OK] disk-health --who-blocks /"
+else
+    echo "  [FAIL] disk-health --who-blocks / failed"
+    cat "${BUILD_CACHE}/who_blocks_output.txt"
+    exit 1
+fi
+
+"${ROOT_DIR}/disk-health" --snapshots / > "${BUILD_CACHE}/snapshots_output.txt"
+if grep -q "APFS LOCAL SNAPSHOTS ON '/'" "${BUILD_CACHE}/snapshots_output.txt"; then
+    echo "  [OK] disk-health --snapshots /"
+else
+    echo "  [FAIL] disk-health --snapshots / failed"
+    cat "${BUILD_CACHE}/snapshots_output.txt"
+    exit 1
+fi
+
+"${ROOT_DIR}/disk-health" --container-info > "${BUILD_CACHE}/container_info_output.txt"
+if grep -q "APFS CONTAINER SPACE-SHARING" "${BUILD_CACHE}/container_info_output.txt"; then
+    echo "  [OK] disk-health --container-info"
+else
+    echo "  [FAIL] disk-health --container-info failed"
+    cat "${BUILD_CACHE}/container_info_output.txt"
+    exit 1
+fi
+
+"${ROOT_DIR}/disk-health" --pre-sleep-shield status > "${BUILD_CACHE}/pre_sleep_shield_output.txt"
+if grep -q "PRE-SLEEP EXTERNAL DRIVE SHIELD" "${BUILD_CACHE}/pre_sleep_shield_output.txt"; then
+    echo "  [OK] disk-health --pre-sleep-shield status"
+else
+    echo "  [FAIL] disk-health --pre-sleep-shield status failed"
+    cat "${BUILD_CACHE}/pre_sleep_shield_output.txt"
     exit 1
 fi
 

@@ -21,8 +21,8 @@ public let kAppArchitecture = "unknown"
 public let kAppArchShort = "unknown"
 #endif
 
-public let kAppVersion = "2.8.0"
-public let kAppBuildNumber = "11"
+public let kAppVersion = "3.0.0"
+public let kAppBuildNumber = "13"
 
 // MARK: - Data Models
 
@@ -56,6 +56,66 @@ struct HealthIssue: Codable, Identifiable, Sendable, Equatable {
     let detail: String
 }
 
+public struct DamagedPhysicalExtent: Codable, Sendable, Equatable, Identifiable {
+    public var id: String { "\(filePath):\(logicalOffset)" }
+    public let filePath: String
+    public let logicalOffset: UInt64
+    public let physicalLbaOffset: UInt64
+    public let contiguousBytes: UInt64
+    public let errorCode: Int32
+
+    public init(filePath: String, logicalOffset: UInt64, physicalLbaOffset: UInt64, contiguousBytes: UInt64, errorCode: Int32) {
+        self.filePath = filePath
+        self.logicalOffset = logicalOffset
+        self.physicalLbaOffset = physicalLbaOffset
+        self.contiguousBytes = contiguousBytes
+        self.errorCode = errorCode
+    }
+}
+
+public struct ApfsVolumeRoleMetrics: Codable, Sendable, Equatable, Identifiable {
+    public var id: String { bsdName }
+    public let bsdName: String
+    public let name: String
+    public let role: String
+    public let totalBytes: UInt64
+    public let usedBytes: UInt64
+    public let freeBytes: UInt64
+    public let isEncrypted: Bool
+
+    public init(bsdName: String, name: String, role: String, totalBytes: UInt64, usedBytes: UInt64, freeBytes: UInt64, isEncrypted: Bool) {
+        self.bsdName = bsdName
+        self.name = name
+        self.role = role
+        self.totalBytes = totalBytes
+        self.usedBytes = usedBytes
+        self.freeBytes = freeBytes
+        self.isEncrypted = isEncrypted
+    }
+
+    public func percentOfContainer(total: UInt64) -> Double {
+        total > 0 ? (Double(usedBytes) / Double(total) * 100.0) : 0.0
+    }
+}
+
+public struct ApfsContainerFleetMetrics: Codable, Sendable, Equatable {
+    public let containerBsd: String
+    public let totalCapacityBytes: UInt64
+    public let freeSpaceBytes: UInt64
+    public let volumes: [ApfsVolumeRoleMetrics]
+
+    public var freePercent: Double {
+        totalCapacityBytes > 0 ? (Double(freeSpaceBytes) / Double(totalCapacityBytes) * 100.0) : 0.0
+    }
+
+    public init(containerBsd: String, totalCapacityBytes: UInt64, freeSpaceBytes: UInt64, volumes: [ApfsVolumeRoleMetrics]) {
+        self.containerBsd = containerBsd
+        self.totalCapacityBytes = totalCapacityBytes
+        self.freeSpaceBytes = freeSpaceBytes
+        self.volumes = volumes
+    }
+}
+
 struct DriveBaselineState: Codable, Sendable, Equatable {
     var bsdName: String = ""
     var serialNumber: String = ""
@@ -66,6 +126,8 @@ struct DriveBaselineState: Codable, Sendable, Equatable {
     var baselineIoWriteErrors: UInt64? = nil
     var baselineIoReadRetries: UInt64? = nil
     var baselineIoWriteRetries: UInt64? = nil
+    var baselineBusErrors: UInt32 = 0
+    var baselineBusResets: UInt32 = 0
     var peakTemperatureCelsius: Int = 0
     var lastVerifyTimestamp: TimeInterval = 0
     var lastVerifyResult: String = "Not run yet"
@@ -87,6 +149,7 @@ struct DriveBaselineState: Codable, Sendable, Equatable {
         case baselineUnsafeShutdowns, baselineMediaErrors, baselineErrorLogEntries
         case baselineIoReadErrors, baselineIoWriteErrors
         case baselineIoReadRetries, baselineIoWriteRetries
+        case baselineBusErrors, baselineBusResets
         case peakTemperatureCelsius, lastVerifyTimestamp, lastVerifyResult, lastVerifyOk
         case lastOverallSeverity
         case consecutiveUnhealthyPolls, consecutiveHealthyPolls, lastNotifiedSeverity
@@ -105,6 +168,8 @@ struct DriveBaselineState: Codable, Sendable, Equatable {
         baselineIoWriteErrors = try c.decodeIfPresent(UInt64.self, forKey: .baselineIoWriteErrors)
         baselineIoReadRetries = try c.decodeIfPresent(UInt64.self, forKey: .baselineIoReadRetries)
         baselineIoWriteRetries = try c.decodeIfPresent(UInt64.self, forKey: .baselineIoWriteRetries)
+        baselineBusErrors = try c.decodeIfPresent(UInt32.self, forKey: .baselineBusErrors) ?? def.baselineBusErrors
+        baselineBusResets = try c.decodeIfPresent(UInt32.self, forKey: .baselineBusResets) ?? def.baselineBusResets
         peakTemperatureCelsius = try c.decodeIfPresent(Int.self, forKey: .peakTemperatureCelsius) ?? def.peakTemperatureCelsius
         lastVerifyTimestamp = try c.decodeIfPresent(TimeInterval.self, forKey: .lastVerifyTimestamp) ?? def.lastVerifyTimestamp
         lastVerifyResult = try c.decodeIfPresent(String.self, forKey: .lastVerifyResult) ?? def.lastVerifyResult
@@ -251,6 +316,32 @@ struct DiskHealthSnapshot: Codable, Sendable, Equatable {
     var usbCurrentAvailableMa: UInt32 = 0
     var usbCurrentRequiredMa: UInt32 = 0
     var linkWidthLanes: UInt32 = 0
+
+    // S.M.A.R.T. Telemetry Source & Controller State (v2.9.0+)
+    var smartSourceType: UInt8 = 0
+    var isControllerUnresponsive: Bool = false
+
+    // Hardware PHY & Bus Link Errors (v3.0.0+)
+    var busErrorCount: UInt32 = 0
+    var busResetCount: UInt32 = 0
+
+    // Bad-Sector Physical Extents & APFS Container Insights (v3.0.0+)
+    var damagedExtents: [DamagedPhysicalExtent] = []
+    var apfsContainer: ApfsContainerFleetMetrics? = nil
+
+    // Rolling Telemetry Forecasts & Percentiles (v3.0.0+)
+    var rolling7dTerabytesWrittenPerDay: Double = 0.0
+    var rolling30dTerabytesWrittenPerDay: Double = 0.0
+    var p95WriteLatencyMs: Double = 0.0
+    var p95TemperatureCelsius: Int = 0
+
+    var smartSourceTypeFormatted: String {
+        switch smartSourceType {
+        case 1: return "SAT ATA (0x85)"
+        case 2: return "USB Vendor NVMe"
+        default: return "Native NVMe"
+        }
+    }
 
     // Computed SSD Endurance & Wear-Rate Projections
     var dailyTerabytesWritten: Double {
@@ -491,6 +582,7 @@ enum ActionTriggerMetric: String, Codable, CaseIterable, Sendable, Equatable {
     case dailyTerabytesWritten = "DAILY_TBW_RATE"
     case freeSpaceDropGBPerHour = "FREE_SPACE_DROP_GB_HR"
     case severityTransition = "SEVERITY_TRANSITION"
+    case systemWillSleep = "SYSTEM_WILL_SLEEP"
 
     var displayName: String {
         switch self {
@@ -507,12 +599,13 @@ enum ActionTriggerMetric: String, Codable, CaseIterable, Sendable, Equatable {
         case .dailyTerabytesWritten: return "24h Write Burn Rate (TB/day)"
         case .freeSpaceDropGBPerHour: return "Free Space Drop Rate (GB/hr)"
         case .severityTransition: return "Health Severity Transition"
+        case .systemWillSleep: return "System Power Pre-Sleep Event"
         }
     }
 
     var unitSuffix: String {
         switch self {
-        case .issueCode, .severityTransition: return ""
+        case .issueCode, .severityTransition, .systemWillSleep: return ""
         case .temperatureCelsius: return "°C"
         case .freeSpaceGB: return "GB"
         case .usedPercent, .percentageUsed, .availableSpare: return "%"
@@ -586,6 +679,8 @@ enum ActionExecutionType: String, Codable, CaseIterable, Sendable, Equatable {
     case runQuickSurfaceScan = "RUN_QUICK_SURFACE_SCAN"
     case exportHtmlReport = "EXPORT_HTML_REPORT"
     case captureTopIoProcesses = "CAPTURE_TOP_IO_PROCS"
+    case throttleTopIoProcess = "THROTTLE_TOP_IO_PROC"
+    case preSleepShield = "PRE_SLEEP_SHIELD"
     case runMacShortcut = "RUN_MAC_SHORTCUT"
     case runCustomScript = "RUN_CUSTOM_SCRIPT"
 
@@ -601,6 +696,8 @@ enum ActionExecutionType: String, Codable, CaseIterable, Sendable, Equatable {
         case .runQuickSurfaceScan: return "Run Quick Surface Read Scan (F_NOCACHE)"
         case .exportHtmlReport: return "Export Standalone HTML RMA Report"
         case .captureTopIoProcesses: return "Capture & Log Top Disk I/O Processes"
+        case .throttleTopIoProcess: return "Throttle Top Disk I/O Process to Background Tier"
+        case .preSleepShield: return "Pre-Sleep External Drive Shield (Safe Auto-Unmount)"
         case .runMacShortcut: return "Run macOS Shortcut"
         case .runCustomScript: return "Execute Custom Sandboxed Script"
         }
@@ -618,6 +715,8 @@ enum ActionExecutionType: String, Codable, CaseIterable, Sendable, Equatable {
         case .runQuickSurfaceScan: return "Quick Surface Scan"
         case .exportHtmlReport: return "Export HTML Report"
         case .captureTopIoProcesses: return "Capture Top I/O PIDs"
+        case .throttleTopIoProcess: return "Throttle Top I/O"
+        case .preSleepShield: return "Pre-Sleep Shield"
         case .runMacShortcut: return "macOS Shortcut"
         case .runCustomScript: return "Custom Script"
         }
@@ -634,7 +733,7 @@ enum ActionExecutionType: String, Codable, CaseIterable, Sendable, Equatable {
 
     var isMutatingMountAction: Bool {
         switch self {
-        case .safeUnmountDrive, .safeEjectDrive, .remountReadOnly:
+        case .safeUnmountDrive, .safeEjectDrive, .remountReadOnly, .preSleepShield:
             return true
         default:
             return false

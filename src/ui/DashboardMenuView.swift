@@ -271,6 +271,24 @@ struct DashboardMenuView: View {
                     }
                     .font(.system(size: 9.5))
                     .foregroundColor(.secondary)
+
+                    if !snap.isInternal && snap.isMounted {
+                        HStack {
+                            Spacer()
+                            Button(action: {
+                                SettingsWindowController.shared.showSettings(tab: 4)
+                            }) {
+                                HStack(spacing: 3) {
+                                    Image(systemName: "eject.circle.fill")
+                                    Text("Inspect Open Files & Eject")
+                                }
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(.accentColor)
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.top, 2)
+                        }
+                    }
                 }
             }
             .padding(12)

@@ -76,7 +76,7 @@ struct SettingsView: View {
                 case 3:
                     SmartInspectorTab(monitor: monitor)
                 case 4:
-                    StatisticsAndInsightsTab(monitor: monitor, configMgr: configMgr)
+                    StatisticsAndInsightsTab(monitor: monitor, configMgr: configMgr, viewModel: viewModel)
                 default:
                     DiagnosticsAndExportTab(configMgr: configMgr, viewModel: viewModel, monitor: monitor)
                 }

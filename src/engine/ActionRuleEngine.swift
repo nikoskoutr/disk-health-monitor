@@ -215,6 +215,9 @@ final class ActionRuleEngine: @unchecked Sendable {
             let actual = historyRates.freeSpaceDropGBPerHour
             let ok = op.evaluate(actual, targetVal)
             return (ok, String(format: "Free Space Drop %.2f GB/hr %@ %.2f GB/hr", actual, op.rawValue, targetVal))
+
+        case .systemWillSleep:
+            return (false, "System power sleep notification listener active")
         }
     }
 
@@ -481,6 +484,20 @@ final class ActionRuleEngine: @unchecked Sendable {
             let summary = culprits.map(\.formattedSummary).joined(separator: " | ")
             return (.succeeded, "Top Disk I/O Processes: \(summary)")
 
+        case .throttleTopIoProcess:
+            let targetMount = !snapshot.mountPoint.isEmpty ? snapshot.mountPoint : "/"
+            let (throttled, _, message) = ProcessIoInspector.shared.throttleRunawayProcess(forMount: targetMount)
+            return throttled ? (.succeeded, message) : (.failed, message)
+
+        case .preSleepShield:
+            if snapshot.isInternal || snapshot.mountPoint == "/" {
+                return (.failed, "Pre-sleep shield skipped: '\(snapshot.displayLabel)' is an internal system volume.")
+            }
+            let res = OpenFileBlockerInspector.shared.unmountVolume(mountPath: snapshot.mountPoint, force: false)
+            return res.exitCode == 0
+                ? (.succeeded, "Pre-sleep shield safely unmounted external volume '\(snapshot.mountPoint)'.")
+                : (.failed, "Pre-sleep shield unmount failed for '\(snapshot.mountPoint)': \(res.stderr)")
+
         case .runMacShortcut:
             let shortcutName = rule.actionParameter.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !shortcutName.isEmpty else {
@@ -639,6 +656,9 @@ final class ActionRuleEngine: @unchecked Sendable {
             historyRates = HistoryRateMetrics(freeSpaceDropGBPerHour: 0.0, terabytesWrittenLast24h: max(0.01, targetVal))
         case .freeSpaceDropGBPerHour:
             historyRates = HistoryRateMetrics(freeSpaceDropGBPerHour: max(0.01, targetVal), terabytesWrittenLast24h: 0.5)
+        case .systemWillSleep:
+            overallSeverity = .warning
+            healthScore = 85
         }
 
         let snap = DiskHealthSnapshot(
@@ -719,7 +739,7 @@ final class ActionRuleEngine: @unchecked Sendable {
         return (snap, prevSeverity, historyRates)
     }
 
-    // MARK: - 6. Sandboxed Subprocess Runner with Watchdog & Pipe Drain
+    // MARK: - 6. Sandboxed Subprocess Runner with Watchdog & Pipe Drain (PROC-04)
 
     static func runSandboxedCommand(
         executablePath: String,
@@ -731,66 +751,17 @@ final class ActionRuleEngine: @unchecked Sendable {
             return (false, "Executable not found at \(executablePath)")
         }
 
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: executablePath)
-        proc.arguments = arguments
-        if let env = environment {
-            proc.environment = env
+        let res = SubprocessRunner.run(
+            executable: executablePath,
+            arguments: arguments,
+            environment: environment,
+            timeoutSeconds: timeoutSec
+        )
+
+        let outCombined = (res.stdout + (res.stderr.isEmpty ? "" : "\n" + res.stderr)).trimmingCharacters(in: .whitespacesAndNewlines)
+        if res.timedOut {
+            return (false, "Timed out after \(Int(timeoutSec))s")
         }
-        let pipeOut = Pipe()
-        proc.standardInput = FileHandle.nullDevice
-        proc.standardOutput = pipeOut
-        proc.standardError = pipeOut
-        let readHandle = pipeOut.fileHandleForReading
-
-        do {
-            try proc.run()
-            let pid = proc.processIdentifier
-            let timeoutLock = NSLock()
-            var timedOut = false
-            var killWorkItem: DispatchWorkItem?
-            let watchdog = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-            watchdog.schedule(deadline: .now() + timeoutSec)
-            watchdog.setEventHandler {
-                if proc.isRunning {
-                    timeoutLock.lock()
-                    timedOut = true
-                    timeoutLock.unlock()
-                    VolumeVerifierService.terminateProcessAndChildren(pid: pid, signal: SIGTERM)
-                    proc.terminate()
-                    let escalation = DispatchWorkItem {
-                        if pid > 0 {
-                            VolumeVerifierService.terminateProcessAndChildren(pid: pid, signal: SIGKILL)
-                        }
-                    }
-                    timeoutLock.lock()
-                    killWorkItem = escalation
-                    timeoutLock.unlock()
-                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.0, execute: escalation)
-                }
-            }
-            watchdog.resume()
-
-            // Invariant (PROC-PIPE-01): Drain pipe BEFORE waitUntilExit() to prevent 64KB buffer deadlock
-            let outData = readHandle.readDataToEndOfFile()
-            try? readHandle.close()
-
-            proc.waitUntilExit()
-            watchdog.cancel()
-            timeoutLock.lock()
-            killWorkItem?.cancel()
-            let didTimeout = timedOut
-            timeoutLock.unlock()
-
-            let outStr = (String(data: outData, encoding: .utf8) ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if didTimeout {
-                return (false, "Timed out after \(Int(timeoutSec))s")
-            }
-            return (proc.terminationStatus == 0, outStr)
-        } catch {
-            try? readHandle.close()
-            return (false, error.localizedDescription)
-        }
+        return (res.exitCode == 0, outCombined)
     }
 }

@@ -590,13 +590,51 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             }
         }
 
+        if driveState.baselineBusErrors == 0 && hw.busErrorCount > 0 {
+            driveState.baselineBusErrors = hw.busErrorCount
+        }
+        if driveState.baselineBusResets == 0 && hw.busResetCount > 0 {
+            driveState.baselineBusResets = hw.busResetCount
+        }
+
         if fsMetrics.isMounted && !fsMetrics.isReadOnly {
             driveState.wasWritable = true
         }
 
         state.drives[driveKey] = driveState
 
-        // 8. Evaluate Health Rules Pipeline
+        // 8. APFS Container Telemetry Inspection (APFS-03)
+        var containerMetrics: ApfsContainerFleetMetrics? = nil
+        if fsMetrics.isMounted && fsMetrics.filesystemType == "apfs" {
+            var cMetrics = DiskApfsContainerMetrics()
+            var vMetrics = [DiskApfsVolumeMetrics](repeating: DiskApfsVolumeMetrics(), count: 32)
+            let vCount = mountToInspect.withCString { cMount in
+                DiskListApfsContainerVolumes(cMount, &cMetrics, &vMetrics, 32)
+            }
+            if vCount > 0 {
+                var vols: [ApfsVolumeRoleMetrics] = []
+                for i in 0..<Int(vCount) {
+                    let item = vMetrics[i]
+                    vols.append(ApfsVolumeRoleMetrics(
+                        bsdName: cStringToSwift(item.bsdName),
+                        name: cStringToSwift(item.name),
+                        role: cStringToSwift(item.role),
+                        totalBytes: item.totalBytes,
+                        usedBytes: item.usedBytes,
+                        freeBytes: item.freeBytes,
+                        isEncrypted: item.isEncrypted
+                    ))
+                }
+                containerMetrics = ApfsContainerFleetMetrics(
+                    containerBsd: cStringToSwift(cMetrics.containerBsd),
+                    totalCapacityBytes: cMetrics.totalCapacityBytes,
+                    freeSpaceBytes: cMetrics.freeSpaceBytes,
+                    volumes: vols
+                )
+            }
+        }
+
+        // 9. Evaluate Health Rules Pipeline
         let inWakeGrace = isSystemSleeping || (lastWakeTime > 0 && (nowTs - lastWakeTime < 8.0))
         let evaluationContext = HealthEvaluationContext(
             nowTs: nowTs,
@@ -615,7 +653,8 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             inWakeGrace: inWakeGrace,
             hostThermalState: provider.currentHostThermalState(),
             driveState: driveState,
-            recentTemperatureSamples: recentTemperatureSamples[driveKey] ?? []
+            recentTemperatureSamples: recentTemperatureSamples[driveKey] ?? [],
+            apfsContainer: containerMetrics
         )
 
         var issues: [HealthIssue] = []
@@ -744,6 +783,16 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         }
 
         var finalSnapshot = snapshot
+        finalSnapshot.busErrorCount = hw.busErrorCount
+        finalSnapshot.busResetCount = hw.busResetCount
+        finalSnapshot.apfsContainer = containerMetrics
+
+        let rolling = TelemetryHistoryStore.shared.computeRollingForecasts(for: finalSnapshot)
+        finalSnapshot.rolling7dTerabytesWrittenPerDay = rolling.rolling7dTBPerDay
+        finalSnapshot.rolling30dTerabytesWrittenPerDay = rolling.rolling30dTBPerDay
+        finalSnapshot.p95WriteLatencyMs = rolling.p95WriteLatencyMs
+        finalSnapshot.p95TemperatureCelsius = rolling.p95TempCelsius
+
         if let disambiguated = disambiguatedDriveKey, !disambiguated.isEmpty, disambiguated != finalSnapshot.serialNumber {
             finalSnapshot.customDriveKey = disambiguated
         }

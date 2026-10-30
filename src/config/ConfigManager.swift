@@ -40,6 +40,9 @@ struct DiskHealthConfig: Codable, Equatable {
     var useKeychainStorage: Bool = false
     var enableActionRulesEngine: Bool = true
     var actionRules: [ActionRule] = ActionRule.defaultStarterRules
+    var metricsServerEnabled: Bool = false
+    var metricsServerPort: Int = 9108
+    var preSleepShieldEnabled: Bool = false
 
     init() {}
 
@@ -71,6 +74,9 @@ struct DiskHealthConfig: Codable, Equatable {
         useKeychainStorage = try container.decodeIfPresent(Bool.self, forKey: .useKeychainStorage) ?? defaults.useKeychainStorage
         enableActionRulesEngine = try container.decodeIfPresent(Bool.self, forKey: .enableActionRulesEngine) ?? defaults.enableActionRulesEngine
         actionRules = try container.decodeIfPresent([ActionRule].self, forKey: .actionRules) ?? defaults.actionRules
+        metricsServerEnabled = try container.decodeIfPresent(Bool.self, forKey: .metricsServerEnabled) ?? defaults.metricsServerEnabled
+        metricsServerPort = try container.decodeIfPresent(Int.self, forKey: .metricsServerPort) ?? defaults.metricsServerPort
+        preSleepShieldEnabled = try container.decodeIfPresent(Bool.self, forKey: .preSleepShieldEnabled) ?? defaults.preSleepShieldEnabled
     }
 
     func validated() -> DiskHealthConfig {
@@ -83,6 +89,7 @@ struct DiskHealthConfig: Codable, Equatable {
         v.diskUsedCriticalPercent = max(v.diskUsedWarningPercent + 1.0, min(v.diskUsedCriticalPercent, 99.9))
         v.minFreeSpaceWarningGB = max(1.0, v.minFreeSpaceWarningGB)
         v.minFreeSpaceCriticalGB = max(0.5, min(v.minFreeSpaceCriticalGB, v.minFreeSpaceWarningGB - 0.5))
+        v.metricsServerPort = max(1024, min(v.metricsServerPort, 65535))
         for i in v.actionRules.indices {
             v.actionRules[i].requiredConsecutivePolls = max(1, min(v.actionRules[i].requiredConsecutivePolls, 20))
             v.actionRules[i].cooldownSeconds = max(60.0, min(v.actionRules[i].cooldownSeconds, 604_800.0))
@@ -436,6 +443,15 @@ final class ConfigManager: ObservableObject, @unchecked Sendable {
         if let v = env["DISK_USED_CRITICAL_PERCENT"], let val = Double(v) { result.diskUsedCriticalPercent = val }
         if let v = env["MIN_FREE_SPACE_CRITICAL_GB"], let val = Double(v) { result.minFreeSpaceCriticalGB = val }
         if let v = env["MIN_FREE_SPACE_WARNING_GB"], let val = Double(v) { result.minFreeSpaceWarningGB = val }
+        if let v = env["DISK_HEALTH_METRICS_ENABLED"], !v.isEmpty {
+            result.metricsServerEnabled = (v.lowercased() == "true" || v == "1" || v.lowercased() == "yes")
+        }
+        if let v = env["DISK_HEALTH_METRICS_PORT"], let val = Int(v), val >= 1024 && val <= 65535 {
+            result.metricsServerPort = val
+        }
+        if let v = env["DISK_HEALTH_PRE_SLEEP_SHIELD"], !v.isEmpty {
+            result.preSleepShieldEnabled = (v.lowercased() == "true" || v == "1" || v.lowercased() == "yes")
+        }
         return result
     }
 
@@ -462,6 +478,19 @@ final class ConfigManager: ObservableObject, @unchecked Sendable {
     func setMonitorAllDisks(_ all: Bool) {
         updateConfig { cfg in
             cfg.monitorAllDisks = all
+        }
+    }
+
+    func setMetricsServer(enabled: Bool, port: Int) {
+        updateConfig { cfg in
+            cfg.metricsServerEnabled = enabled
+            cfg.metricsServerPort = max(1024, min(port, 65535))
+        }
+    }
+
+    func setPreSleepShield(enabled: Bool) {
+        updateConfig { cfg in
+            cfg.preSleepShieldEnabled = enabled
         }
     }
 
