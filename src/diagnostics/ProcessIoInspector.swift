@@ -177,6 +177,12 @@ final class ProcessIoInspector: @unchecked Sendable {
 
     /// Pinpoints and throttles the highest disk I/O process actively writing to `mountPath` (PROC-03).
     func throttleRunawayProcess(forMount mountPath: String) -> (throttled: Bool, culprit: ProcessIoCulprit?, message: String) {
+        let trimmed = mountPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = (trimmed as NSString).standardizingPath
+        if trimmed.isEmpty || normalized == "/" || normalized.hasPrefix("/System") || normalized.hasPrefix("/private") {
+            return (false, nil, "Throttling runaway processes on system volume '\(mountPath)' is prohibited for safety")
+        }
+
         let blockers = OpenFileBlockerInspector.shared.inspectBlockers(mountPath: mountPath)
         guard !blockers.isEmpty else {
             return (false, nil, "No open file blockers detected on '\(mountPath)'")
