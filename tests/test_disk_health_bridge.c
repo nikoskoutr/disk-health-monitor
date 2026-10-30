@@ -1,9 +1,32 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <pthread.h>
 #include <sys/param.h>
 #include <sys/mount.h>
 #include "DiskHealthBridge.h"
+
+typedef struct {
+    bool expectedSmartValid[16];
+    int deviceCount;
+    int mismatchCount;
+} ConcurrentSmartTestContext;
+
+static void *concurrentSmartWorker(void *arg) {
+    ConcurrentSmartTestContext *ctx = (ConcurrentSmartTestContext *)arg;
+    for (int iter = 0; iter < 8; iter++) {
+        DiskHardwareMetrics devs[16];
+        int n = DiskListAllDevices(devs, 16);
+        if (n == ctx->deviceCount) {
+            for (int i = 0; i < n; i++) {
+                if (ctx->expectedSmartValid[i] && !devs[i].smartValid) {
+                    __sync_fetch_and_add(&ctx->mismatchCount, 1);
+                }
+            }
+        }
+    }
+    return NULL;
+}
 
 int main(void) {
     printf("=== Test 1: DiskListAllDevices ===\n");
@@ -512,6 +535,23 @@ int main(void) {
     assert(prioRestore == 0 || prioRestore == -EPERM);
     printf("  DiskSetProcessBackgroundIoPriority background throttle & restore verified\n");
 
-    printf("\n=== All 23 Bridge Tests Passed Successfully! ===\n");
+    printf("\n=== Test 24: Concurrent Multi-Thread NVMe SMART Contention Safety (BRIDGE-09) ===\n");
+    ConcurrentSmartTestContext smartCtx;
+    memset(&smartCtx, 0, sizeof(smartCtx));
+    smartCtx.deviceCount = count;
+    for (int i = 0; i < count && i < 16; i++) {
+        smartCtx.expectedSmartValid[i] = devices[i].smartValid;
+    }
+    pthread_t threads[3];
+    for (int t = 0; t < 3; t++) {
+        assert(pthread_create(&threads[t], NULL, concurrentSmartWorker, &smartCtx) == 0);
+    }
+    for (int t = 0; t < 3; t++) {
+        pthread_join(threads[t], NULL);
+    }
+    assert(smartCtx.mismatchCount == 0);
+    printf("  Concurrent 3-thread NVMe SMART queries verified (0 kIOReturnNotPermitted drops)\n");
+
+    printf("\n=== All 24 Bridge Tests Passed Successfully! ===\n");
     return 0;
 }

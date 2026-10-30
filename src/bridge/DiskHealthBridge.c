@@ -13,6 +13,9 @@
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
+#include <unistd.h>
+#include <time.h>
+#include <sys/time.h>
 #include <pthread.h>
 #include <dlfcn.h>
 #include <sys/param.h>
@@ -52,6 +55,25 @@ typedef struct {
     uint32_t usbCurrentAvailableMa; ///< USB bus current available in mA.
     uint32_t usbCurrentRequiredMa;  ///< USB bus current allocated/requested in mA.
     uint32_t linkWidthLanes;        ///< Active PCIe / Thunderbolt lane count.
+    bool hasValidSmartCache;        ///< True if NVMe SMART has succeeded for this entryId.
+    uint64_t lastSmartReadTimeNs;   ///< Monotonic timestamp (CLOCK_UPTIME_RAW) of last valid SMART read.
+    uint8_t smartSourceType;        ///< Cached SMART telemetry source (0 = Native NVMe).
+    uint8_t criticalWarning;        ///< Cached NVMe Critical Warning bitmask.
+    int32_t temperatureCelsius;     ///< Cached composite temperature in Celsius.
+    int32_t temperatureKelvin;      ///< Cached composite temperature in Kelvin.
+    uint8_t availableSpare;         ///< Cached Available Spare percentage.
+    uint8_t availableSpareThreshold;///< Cached Available Spare Threshold percentage.
+    uint8_t percentageUsed;         ///< Cached Percentage Used wear indicator.
+    uint64_t dataUnitsRead;         ///< Cached Data Units Read.
+    uint64_t dataUnitsWritten;      ///< Cached Data Units Written.
+    uint64_t hostReadCommands;      ///< Cached Host Read Commands.
+    uint64_t hostWriteCommands;     ///< Cached Host Write Commands.
+    uint64_t controllerBusyTime;    ///< Cached Controller Busy Time.
+    uint64_t powerCycles;           ///< Cached Power Cycles.
+    uint64_t powerOnHours;          ///< Cached Power On Hours.
+    uint64_t unsafeShutdowns;       ///< Cached Unsafe Shutdowns.
+    uint64_t mediaErrors;           ///< Cached Media and Data Integrity Errors.
+    uint64_t errorInfoLogEntries;   ///< Cached Error Information Log Entries.
 } StaticDeviceCacheEntry;
 
 #define MAX_STATIC_CACHE_ENTRIES 64
@@ -63,6 +85,13 @@ static int sStaticCacheNextIdx = 0;
 
 /** Mutex synchronizing access to sStaticCache across concurrent engine / CLI threads. */
 static pthread_mutex_t sStaticCacheMutex = PTHREAD_MUTEX_INITIALIZER;
+
+/**
+ * Mutex serializing IONVMeSMARTUserClient creation and SMARTReadData calls across threads (BRIDGE-09).
+ * Prevents kIOReturnNotPermitted (0xe00002be) / kIOReturnExclusiveAccess when UI cache refresh
+ * and background health evaluation query the same IOBlockStorageDevice concurrently.
+ */
+static pthread_mutex_t sSmartClientMutex = PTHREAD_MUTEX_INITIALIZER;
 
 /** Returns true if the device represents a virtual disk image or file-backed volume. */
 static bool isVirtualDiskDevice(const DiskHardwareMetrics *metrics) {
@@ -521,6 +550,9 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
     uint64_t entryId = 0;
     bool hasEntryId = (IORegistryEntryGetRegistryEntryID(service, &entryId) == KERN_SUCCESS && entryId != 0);
     bool cacheHit = false;
+    bool freshSmartHit = false;
+    uint64_t nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    const uint64_t kSmartCacheTtlNs = 2000000000ULL; // 2.0s TTL prevents back-to-back user client contention
 
     if (hasEntryId) {
         pthread_mutex_lock(&sStaticCacheMutex);
@@ -539,6 +571,31 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
                 outMetrics->usbCurrentAvailableMa = sStaticCache[i].usbCurrentAvailableMa;
                 outMetrics->usbCurrentRequiredMa = sStaticCache[i].usbCurrentRequiredMa;
                 outMetrics->linkWidthLanes = sStaticCache[i].linkWidthLanes;
+                if (sStaticCache[i].hasValidSmartCache &&
+                    sStaticCache[i].lastSmartReadTimeNs > 0 &&
+                    nowNs >= sStaticCache[i].lastSmartReadTimeNs &&
+                    (nowNs - sStaticCache[i].lastSmartReadTimeNs) < kSmartCacheTtlNs) {
+                    outMetrics->smartValid = true;
+                    outMetrics->smartSourceType = sStaticCache[i].smartSourceType;
+                    outMetrics->criticalWarning = sStaticCache[i].criticalWarning;
+                    outMetrics->temperatureCelsius = sStaticCache[i].temperatureCelsius;
+                    outMetrics->temperatureKelvin = sStaticCache[i].temperatureKelvin;
+                    outMetrics->availableSpare = sStaticCache[i].availableSpare;
+                    outMetrics->availableSpareThreshold = sStaticCache[i].availableSpareThreshold;
+                    outMetrics->percentageUsed = sStaticCache[i].percentageUsed;
+                    outMetrics->dataUnitsRead = sStaticCache[i].dataUnitsRead;
+                    outMetrics->dataUnitsWritten = sStaticCache[i].dataUnitsWritten;
+                    outMetrics->hostReadCommands = sStaticCache[i].hostReadCommands;
+                    outMetrics->hostWriteCommands = sStaticCache[i].hostWriteCommands;
+                    outMetrics->controllerBusyTime = sStaticCache[i].controllerBusyTime;
+                    outMetrics->powerCycles = sStaticCache[i].powerCycles;
+                    outMetrics->powerOnHours = sStaticCache[i].powerOnHours;
+                    outMetrics->unsafeShutdowns = sStaticCache[i].unsafeShutdowns;
+                    outMetrics->mediaErrors = sStaticCache[i].mediaErrors;
+                    outMetrics->errorInfoLogEntries = sStaticCache[i].errorInfoLogEntries;
+                    strlcpy(outMetrics->protocolType, "NVMe", sizeof(outMetrics->protocolType));
+                    freshSmartHit = true;
+                }
                 cacheHit = true;
                 break;
             }
@@ -643,6 +700,7 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
                 slot = &sStaticCache[sStaticCacheNextIdx];
                 sStaticCacheNextIdx = (sStaticCacheNextIdx + 1) % MAX_STATIC_CACHE_ENTRIES;
                 if (sStaticCacheCount < MAX_STATIC_CACHE_ENTRIES) sStaticCacheCount++;
+                memset(slot, 0, sizeof(*slot));
             }
             slot->entryId = entryId;
             strlcpy(slot->productName, outMetrics->productName, sizeof(slot->productName));
@@ -661,67 +719,160 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
         }
     }
 
-    // 5. Read NVMe SMART data via NVMeSMARTLib.plugin
-    IOCFPlugInInterface **plugin = NULL;
-    SInt32 score = 0;
-    IOReturn kr = IOCreatePlugInInterfaceForService(
-        service,
-        kIONVMeSMARTUserClientTypeID,
-        kIOCFPlugInInterfaceID,
-        &plugin,
-        &score
-    );
-
-    if (kr == kIOReturnSuccess && plugin) {
-        strlcpy(outMetrics->protocolType, "NVMe", sizeof(outMetrics->protocolType));
+    // 5. Read NVMe SMART data via NVMeSMARTLib.plugin (serialized via sSmartClientMutex, BRIDGE-09)
+    if (!freshSmartHit) {
+        pthread_mutex_lock(&sSmartClientMutex);
+        IOCFPlugInInterface **plugin = NULL;
         IONVMeSMARTInterface **smart = NULL;
-        HRESULT hr = (*plugin)->QueryInterface(
-            plugin,
-            CFUUIDGetUUIDBytes(kIONVMeSMARTInterfaceID),
-            (LPVOID *)&smart
-        );
+        SInt32 score = 0;
+        IOReturn kr = kIOReturnError;
+        NVMeSMARTData data;
+        bool readSuccess = false;
 
-        if (hr == S_OK && smart) {
-            NVMeSMARTData data;
-            memset(&data, 0, sizeof(data));
-            if ((*smart)->SMARTReadData(smart, &data) == kIOReturnSuccess) {
-                outMetrics->smartValid = true;
-                outMetrics->smartSourceType = 0; // Native NVMe
-                outMetrics->criticalWarning = data.CRITICAL_WARNING;
-
-                uint16_t tempRaw = CFSwapInt16LittleToHost(data.TEMPERATURE);
-                outMetrics->temperatureKelvin = (int32_t)tempRaw;
-                outMetrics->temperatureCelsius = DiskConvertNVMeTemperature(tempRaw);
-
-                outMetrics->availableSpare = data.AVAILABLE_SPARE;
-                outMetrics->availableSpareThreshold = data.AVAILABLE_SPARE_THRESHOLD;
-                outMetrics->percentageUsed = data.PERCENTAGE_USED;
-
-                // Safely convert full 128-bit little-endian fields to 64-bit integers with saturation
-                outMetrics->dataUnitsRead = nvmeLe128ToU64(&data.DATA_UNITS_READ);
-                outMetrics->dataUnitsWritten = nvmeLe128ToU64(&data.DATA_UNITS_WRITTEN);
-                outMetrics->hostReadCommands = nvmeLe128ToU64(&data.HOST_READ_COMMANDS);
-                outMetrics->hostWriteCommands = nvmeLe128ToU64(&data.HOST_WRITE_COMMANDS);
-                outMetrics->controllerBusyTime = nvmeLe128ToU64(&data.CONTROLLER_BUSY_TIME);
-                outMetrics->powerCycles = nvmeLe128ToU64(&data.POWER_CYCLES);
-                outMetrics->powerOnHours = nvmeLe128ToU64(&data.POWER_ON_HOURS);
-                outMetrics->unsafeShutdowns = nvmeLe128ToU64(&data.UNSAFE_SHUTDOWNS);
-                outMetrics->mediaErrors = nvmeLe128ToU64(&data.MEDIA_ERRORS);
-                outMetrics->errorInfoLogEntries = nvmeLe128ToU64(&data.NUM_ERROR_INFO_LOG_ENTRIES);
+        for (int attempt = 0; attempt < 6; attempt++) {
+            plugin = NULL;
+            smart = NULL;
+            score = 0;
+            kr = IOCreatePlugInInterfaceForService(
+                service,
+                kIONVMeSMARTUserClientTypeID,
+                kIOCFPlugInInterfaceID,
+                &plugin,
+                &score
+            );
+            if (kr == kIOReturnSuccess && plugin) {
+                HRESULT hr = (*plugin)->QueryInterface(
+                    plugin,
+                    CFUUIDGetUUIDBytes(kIONVMeSMARTInterfaceID),
+                    (LPVOID *)&smart
+                );
+                if (hr == S_OK && smart) {
+                    memset(&data, 0, sizeof(data));
+                    IOReturn readKr = (*smart)->SMARTReadData(smart, &data);
+                    if (readKr == kIOReturnSuccess) {
+                        readSuccess = true;
+                        break;
+                    }
+                    (*smart)->Release(smart);
+                    smart = NULL;
+                }
+                IODestroyPlugInInterface(plugin);
+                plugin = NULL;
+            } else if (kr == kIOReturnUnsupported) {
+                break;
             }
+            usleep(25000); // 25ms backoff while holding mutex to maintain serialized exclusion window
+        }
+
+        if (readSuccess && smart) {
+            strlcpy(outMetrics->protocolType, "NVMe", sizeof(outMetrics->protocolType));
+            outMetrics->smartValid = true;
+            outMetrics->smartSourceType = 0; // Native NVMe
+            outMetrics->criticalWarning = data.CRITICAL_WARNING;
+
+            uint16_t tempRaw = CFSwapInt16LittleToHost(data.TEMPERATURE);
+            outMetrics->temperatureKelvin = (int32_t)tempRaw;
+            outMetrics->temperatureCelsius = DiskConvertNVMeTemperature(tempRaw);
+
+            outMetrics->availableSpare = data.AVAILABLE_SPARE;
+            outMetrics->availableSpareThreshold = data.AVAILABLE_SPARE_THRESHOLD;
+            outMetrics->percentageUsed = data.PERCENTAGE_USED;
+
+            // Safely convert full 128-bit little-endian fields to 64-bit integers with saturation
+            outMetrics->dataUnitsRead = nvmeLe128ToU64(&data.DATA_UNITS_READ);
+            outMetrics->dataUnitsWritten = nvmeLe128ToU64(&data.DATA_UNITS_WRITTEN);
+            outMetrics->hostReadCommands = nvmeLe128ToU64(&data.HOST_READ_COMMANDS);
+            outMetrics->hostWriteCommands = nvmeLe128ToU64(&data.HOST_WRITE_COMMANDS);
+            outMetrics->controllerBusyTime = nvmeLe128ToU64(&data.CONTROLLER_BUSY_TIME);
+            outMetrics->powerCycles = nvmeLe128ToU64(&data.POWER_CYCLES);
+            outMetrics->powerOnHours = nvmeLe128ToU64(&data.POWER_ON_HOURS);
+            outMetrics->unsafeShutdowns = nvmeLe128ToU64(&data.UNSAFE_SHUTDOWNS);
+            outMetrics->mediaErrors = nvmeLe128ToU64(&data.MEDIA_ERRORS);
+            outMetrics->errorInfoLogEntries = nvmeLe128ToU64(&data.NUM_ERROR_INFO_LOG_ENTRIES);
+
             (*smart)->Release(smart);
+            IODestroyPlugInInterface(plugin);
+        } else {
+            if (plugin) {
+                if (smart) (*smart)->Release(smart);
+                IODestroyPlugInInterface(plugin);
+            }
         }
-        IODestroyPlugInInterface(plugin);
-    } else {
-        if (outMetrics->protocolType[0] == '\0') {
-            strlcpy(outMetrics->protocolType, "SCSI/Block", sizeof(outMetrics->protocolType));
-        }
-        // Fallback: If external USB or SATA drive without native NVMeSMARTUserClient, tag SAT / USB source
-        if (!outMetrics->isInternal) {
-            if (strcasecmp(outMetrics->interconnectType, "SATA") == 0) {
-                outMetrics->smartSourceType = 1; // SAT ATA (0x85)
-            } else if (strcasecmp(outMetrics->interconnectType, "USB") == 0) {
-                outMetrics->smartSourceType = 2; // USB Vendor NVMe / UASP
+        pthread_mutex_unlock(&sSmartClientMutex);
+
+        if (outMetrics->smartValid) {
+            if (hasEntryId && !isVirtualDiskDevice(outMetrics)) {
+                pthread_mutex_lock(&sStaticCacheMutex);
+                for (int i = 0; i < sStaticCacheCount; i++) {
+                    if (sStaticCache[i].entryId == entryId) {
+                        sStaticCache[i].hasValidSmartCache = true;
+                        sStaticCache[i].lastSmartReadTimeNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+                        sStaticCache[i].smartSourceType = outMetrics->smartSourceType;
+                        sStaticCache[i].criticalWarning = outMetrics->criticalWarning;
+                        sStaticCache[i].temperatureCelsius = outMetrics->temperatureCelsius;
+                        sStaticCache[i].temperatureKelvin = outMetrics->temperatureKelvin;
+                        sStaticCache[i].availableSpare = outMetrics->availableSpare;
+                        sStaticCache[i].availableSpareThreshold = outMetrics->availableSpareThreshold;
+                        sStaticCache[i].percentageUsed = outMetrics->percentageUsed;
+                        sStaticCache[i].dataUnitsRead = outMetrics->dataUnitsRead;
+                        sStaticCache[i].dataUnitsWritten = outMetrics->dataUnitsWritten;
+                        sStaticCache[i].hostReadCommands = outMetrics->hostReadCommands;
+                        sStaticCache[i].hostWriteCommands = outMetrics->hostWriteCommands;
+                        sStaticCache[i].controllerBusyTime = outMetrics->controllerBusyTime;
+                        sStaticCache[i].powerCycles = outMetrics->powerCycles;
+                        sStaticCache[i].powerOnHours = outMetrics->powerOnHours;
+                        sStaticCache[i].unsafeShutdowns = outMetrics->unsafeShutdowns;
+                        sStaticCache[i].mediaErrors = outMetrics->mediaErrors;
+                        sStaticCache[i].errorInfoLogEntries = outMetrics->errorInfoLogEntries;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&sStaticCacheMutex);
+            }
+        } else {
+            bool restoredFromCache = false;
+            pthread_mutex_lock(&sStaticCacheMutex);
+            for (int i = 0; i < sStaticCacheCount; i++) {
+                if (((hasEntryId && sStaticCache[i].entryId == entryId) ||
+                     (outMetrics->bsdName[0] != '\0' && strcmp(sStaticCache[i].bsdName, outMetrics->bsdName) == 0)) &&
+                    sStaticCache[i].hasValidSmartCache) {
+                    outMetrics->smartValid = true;
+                    outMetrics->smartSourceType = sStaticCache[i].smartSourceType;
+                    outMetrics->criticalWarning = sStaticCache[i].criticalWarning;
+                    outMetrics->temperatureCelsius = sStaticCache[i].temperatureCelsius;
+                    outMetrics->temperatureKelvin = sStaticCache[i].temperatureKelvin;
+                    outMetrics->availableSpare = sStaticCache[i].availableSpare;
+                    outMetrics->availableSpareThreshold = sStaticCache[i].availableSpareThreshold;
+                    outMetrics->percentageUsed = sStaticCache[i].percentageUsed;
+                    outMetrics->dataUnitsRead = sStaticCache[i].dataUnitsRead;
+                    outMetrics->dataUnitsWritten = sStaticCache[i].dataUnitsWritten;
+                    outMetrics->hostReadCommands = sStaticCache[i].hostReadCommands;
+                    outMetrics->hostWriteCommands = sStaticCache[i].hostWriteCommands;
+                    outMetrics->controllerBusyTime = sStaticCache[i].controllerBusyTime;
+                    outMetrics->powerCycles = sStaticCache[i].powerCycles;
+                    outMetrics->powerOnHours = sStaticCache[i].powerOnHours;
+                    outMetrics->unsafeShutdowns = sStaticCache[i].unsafeShutdowns;
+                    outMetrics->mediaErrors = sStaticCache[i].mediaErrors;
+                    outMetrics->errorInfoLogEntries = sStaticCache[i].errorInfoLogEntries;
+                    strlcpy(outMetrics->protocolType, "NVMe", sizeof(outMetrics->protocolType));
+                    restoredFromCache = true;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&sStaticCacheMutex);
+
+            if (!restoredFromCache) {
+                if (outMetrics->protocolType[0] == '\0') {
+                    strlcpy(outMetrics->protocolType, "SCSI/Block", sizeof(outMetrics->protocolType));
+                }
+                // Fallback: If external USB or SATA drive without native NVMeSMARTUserClient, tag SAT / USB source
+                if (!outMetrics->isInternal) {
+                    if (strcasecmp(outMetrics->interconnectType, "SATA") == 0) {
+                        outMetrics->smartSourceType = 1; // SAT ATA (0x85)
+                    } else if (strcasecmp(outMetrics->interconnectType, "USB") == 0) {
+                        outMetrics->smartSourceType = 2; // USB Vendor NVMe / UASP
+                    }
+                }
             }
         }
     }
@@ -913,14 +1064,14 @@ void DiskReadHardwareMetrics(const char *targetIdentifier, DiskHardwareMetrics *
 
         if (metrics.found) {
             bool isVirtual = isVirtualDiskDevice(&metrics);
-            if (!foundFirst && !isVirtual) {
+            if (!foundFirst && !isVirtual && metrics.bsdName[0] != '\0') {
                 firstDevice = metrics;
                 foundFirst = true;
             }
 
             if (isAuto) {
                 // In auto mode, prefer physical external device (skip virtual DMGs)
-                if (!metrics.isInternal && !isVirtual) {
+                if (!metrics.isInternal && !isVirtual && metrics.bsdName[0] != '\0') {
                     *outMetrics = metrics;
                     IOObjectRelease(service);
                     break;

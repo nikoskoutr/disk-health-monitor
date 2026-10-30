@@ -8,7 +8,7 @@ This directory implements the native macOS user interface using AppKit (`NSStatu
 
 ### 1. [`AppDelegate.swift`](AppDelegate.swift)
 Coordinates the application lifecycle, menu bar status item, and system observers:
-- **Status Item**: Updates the menu bar SF Symbol dynamically based on health state (`externaldrive.fill.badge.checkmark` for healthy, `externaldrive.trianglebadge.exclamationmark` for warning, `externaldrive.fill.badge.xmark` for critical).
+- **Status Item**: Updates the menu bar SF Symbol dynamically based on health state (`externaldrive.fill.badge.checkmark` for healthy, `externaldrive.trianglebadge.exclamationmark` for warning, `externaldrive.fill.badge.xmark` for critical) and formats title via `AppDelegate.formatStatusBarTitle(for:)`. Unifies disk cache refresh and health evaluation sequentially in `menuWillOpen` to eliminate concurrent IOKit SMART contention.
 - **Embedded Dashboard**: Embeds `DashboardMenuView` (385 pt) at the top of the menu bar dropdown alongside quick actions:
   - **Hardware S.M.A.R.T. Inspector** (`⌘I`)
   - **Run Deep Health & Canary Check Now** (`⌘R`)

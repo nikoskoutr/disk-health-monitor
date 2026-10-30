@@ -8,6 +8,7 @@
 // ============================================================================
 
 import Foundation
+import Darwin
 
 public struct ApfsSnapshotInfo: Identifiable, Sendable, Codable {
     public var id: String { snapshotName }
@@ -38,9 +39,34 @@ public final class ApfsSnapshotService {
 
     private init() {}
 
+    /// Validates and normalizes target path ensuring it is an absolute path, has no traversal,
+    /// and resolves to a valid mounted APFS filesystem.
+    public func validatedApfsMountPoint(_ path: String) -> String? {
+        let candidate = path.isEmpty ? "/" : path
+        guard candidate.hasPrefix("/"), !candidate.contains("\0"), !candidate.contains("..") else { return nil }
+
+        var fs = statfs()
+        guard statfs(candidate, &fs) == 0 else { return nil }
+
+        let fstype = withUnsafePointer(to: &fs.f_fstypename) {
+            $0.withMemoryRebound(to: CChar.self, capacity: Int(MFSTYPENAMELEN)) {
+                String(cString: $0)
+            }
+        }
+        let mountOn = withUnsafePointer(to: &fs.f_mntonname) {
+            $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) {
+                String(cString: $0)
+            }
+        }
+
+        // Must resolve to an APFS filesystem
+        guard fstype == "apfs" else { return nil }
+        return mountOn
+    }
+
     /// Lists all APFS local Time Machine snapshots on the target mount.
     public func listSnapshots(mountPath: String = "/") -> [ApfsSnapshotInfo] {
-        let target = mountPath.isEmpty ? "/" : mountPath
+        guard let target = validatedApfsMountPoint(mountPath) else { return [] }
         let result = SubprocessRunner.run(
             executable: "/usr/bin/tmutil",
             arguments: ["listlocalsnapshots", target],
@@ -97,15 +123,23 @@ public final class ApfsSnapshotService {
         targetPurgeBytes: UInt64 = 20_000_000_000,
         urgency: Int = 4
     ) -> SubprocessResult {
-        let target = mountPath.isEmpty ? "/" : mountPath
+        guard let target = validatedApfsMountPoint(mountPath) else {
+            return SubprocessResult(
+                exitCode: 1,
+                stdout: "",
+                stderr: "Error: '\(mountPath)' is not a valid mounted APFS filesystem.",
+                timedOut: false
+            )
+        }
         let clampedUrgency = min(max(1, urgency), 4)
+        let clampedPurgeBytes = min(max(100_000_000, targetPurgeBytes), 500_000_000_000)
 
         return SubprocessRunner.run(
             executable: "/usr/bin/tmutil",
             arguments: [
                 "thinlocalsnapshots",
                 target,
-                String(targetPurgeBytes),
+                String(clampedPurgeBytes),
                 String(clampedUrgency)
             ],
             timeoutSeconds: 45.0

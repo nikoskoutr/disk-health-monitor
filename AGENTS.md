@@ -2,7 +2,7 @@
 > # CRITICAL AGENT DIRECTIVE: ALWAYS KEEP THIS DOCUMENT UP TO DATE
 > Every AI agent or developer modifying this repository MUST synchronize and update this document (`AGENTS.md`) immediately upon completing any code, architecture, configuration, or documentation changes. Never leave this file stale.
 
-# AGENTS.md — Universal Disk Health Monitor (`v3.0.0` Build `13`)
+# AGENTS.md — Universal Disk Health Monitor (`v3.1.0` Build `14`)
 
 Definitive LLM/Agent reference for `disk-health-monitor`. Token-optimized. Zero fluff.
 
@@ -11,7 +11,7 @@ Definitive LLM/Agent reference for `disk-health-monitor`. Token-optimized. Zero 
 ## 1. PROJECT IDENTITY & CORE CONSTRAINTS
 
 - **Name**: Universal Disk Health Monitor (`DiskHealthMonitor.app` / `./disk-health` CLI symlink)
-- **Version**: `v3.0.0` (Build `13`), Bundle ID: `io.github.disk-health-monitor`
+- **Version**: `v3.1.0` (Build `14`), Bundle ID: `io.github.disk-health-monitor`
 - **Platform**: macOS 13.0+ (Ventura through macOS 15+ Sequoia). Universal Mach-O Binary (`arm64` Apple Silicon + `x86_64` Intel).
 - **Zero External Dependencies**: Compiled directly via `build_and_install.sh` using `clang` (`-O2 -Wall -Wextra`) and `swiftc` (`-O -whole-module-optimization -Xlinker -dead_strip`). Links only native Apple frameworks (`Cocoa`, `SwiftUI`, `IOKit`, `CoreFoundation`, `DiskArbitration`, `Network`, `UserNotifications`, `Security`, `UniformTypeIdentifiers`) and Darwin/POSIX libc. No SwiftPM, no CocoaPods, no Swift 5.9+ macro plugins (`@Observable` and `@State` prohibited in standalone `swiftc` builds; use `ObservableObject` / `@Published`).
 - **Dual-Mode Single Binary**:
@@ -41,13 +41,14 @@ Definitive LLM/Agent reference for `disk-health-monitor`. Token-optimized. Zero 
     - `DiskIsDarkWakeActive(void)` (checks `kCGSSessionOnConsoleKey` / `kCGSessionOnConsoleKey` dynamically via `dlsym(RTLD_DEFAULT, "CGSessionCopyCurrentDictionary")`)
   - **Bridge Invariants**:
     - **APFS Subtree Pruning (`C11-01`)**: `inspectChildrenForDriverStatsRecursive` (max depth 12) prunes `AppleAPFSContainerScheme`, `AppleAPFSContainer`, `AppleAPFSMedia`, and `AppleAPFSVolume` before checking `Whole == true` on `IOMedia`. Prevents virtual APFS containers from clobbering physical whole-disk `bsdName`.
-    - **Static Cache & Live BSD Name (`OPT-01`, `UAT2-03`, `BRIDGE-04`)**: 64-entry ring buffer `sStaticCache` protected by `sStaticCacheMutex` (`pthread_mutex_t`), keyed by `IORegistryEntryGetRegistryEntryID`. Caches invariant strings (`productName`, `vendorName`, `serialNumber`, `interconnectType`, `linkSpeedBps`, `usbCurrentAvailableMa`, `usbCurrentRequiredMa`, `linkWidthLanes`), skips virtual disk images (`isVirtualDiskDevice`), and **deliberately omits restoring `bsdName` on cache hit** so `inspectChildrenForDriverStats` always queries live `IOMedia` child (preventing stale BSD names after USB hot-replug).
+    - **Static Cache & Live BSD Name (`OPT-01`, `UAT2-03`, `BRIDGE-04`, `BRIDGE-09`)**: 64-entry ring buffer `sStaticCache` protected by `sStaticCacheMutex` (`pthread_mutex_t`), keyed by `IORegistryEntryGetRegistryEntryID`. Caches invariant strings (`productName`, `vendorName`, `serialNumber`, `interconnectType`, `linkSpeedBps`, `usbCurrentAvailableMa`, `usbCurrentRequiredMa`, `linkWidthLanes`) and last-known-good NVMe SMART telemetry (`hasValidSmartCache`), skips virtual disk images (`isVirtualDiskDevice`), and **deliberately omits restoring `bsdName` on cache hit** so `inspectChildrenForDriverStats` always queries live `IOMedia` child (preventing stale BSD names after USB hot-replug).
+    - **NVMe SMART UserClient Serialization & 2.0s Rate Throttle (`BRIDGE-09`)**: `sSmartClientMutex` (`pthread_mutex_t`) serializes `IOCreatePlugInInterfaceForService(..., kIONVMeSMARTUserClientTypeID, ...)` and `SMARTReadData` across concurrent threads. Implements 2.0s TTL cache bypass (`kSmartCacheTtlNs = 2000000000ULL` via `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)`), 6-attempt bounded retry with 25ms backoff while holding mutex across both client creation and data reads, and fallback to `sStaticCache` on failure so rapid menu bar clicks never drop `smartValid` to `false` or toggle between `"OK"` and disk temperature. In `AppDelegate.swift`, `refreshHealth` coalesces concurrent invocations using `pendingForceCanary` and `pendingRefreshDiskCache` flags in a serialized execution loop. In `DiskHealthMonitor.swift`, `evaluateSingleTargetLocked` preserves recent valid SMART telemetry (<15s) from `latestMultiSnapshotInternal` on transient hardware contention.
     - **Bus Precedence, USB Power & Lane Width (`SYS-06`, `BRIDGE-02`, `v2.8.0`)**: `inspectParentsForBusProperties` (max depth 16) evaluates parent class (`USB`, `Thunderbolt`, `DiskImage`/`HDIX`, `AHCI`/`SATA`, `PCI`/`NVMe`) before normalizing link speed. Extracts USB bus power budgets (`kUSBHostPortPropertyCurrentAllocation`, `bMaxPower`, `Current Available`, `Sleep Current`) and PCIe/Thunderbolt link width (`LINK-WIDTH`, `Current Link Width`). USB enum codes `1..5` are only mapped via `DiskNormalizeLinkSpeedToBps` when in a confirmed USB context (`UsbLinkSpeed`, `Device Speed`, or `IOUSB*` parent), preventing PCIe link gen numbers (`1..5`) from misclassifying as USB speeds.
     - **Mount Resolution Fast-Path (`OPT2-02`, `MISSED-04`)**: `DiskFindMountForBlockDevice` uses stack-allocated `struct statfs stackFs[64]` (falling back to `calloc` only if mounts $> 64$) and candidate score pruning (`10` = exact slice match, `6` = `/`, `5` = writable `/Volumes/*`, `4` = RO `/Volumes/*`, `3` = `/System/Volumes/Data`, `1` = EFI/Recovery/Preboot, `0` = `/System/Volumes/*`) to skip redundant IOKit parent walks.
 
 ### Layer 2: Domain Models, Config & Security (`src/models/`, `src/config/`, `src/security/`)
 - **`src/models/HealthModels.swift`**:
-  - Defines `kAppVersion = "3.0.0"`, `kAppBuildNumber = "13"`, `HealthSeverity` (`.healthy` rank 0, `.warning` rank 1, `.critical` rank 2), `HealthIssue` (`id` = `"\(code):\(detail)"`), `DriveBaselineState`, `DiskPersistentState`, `DiskHealthSnapshot`, `MultiDiskHealthSnapshot`.
+  - Defines `kAppVersion = "3.1.0"`, `kAppBuildNumber = "14"`, `HealthSeverity` (`.healthy` rank 0, `.warning` rank 1, `.critical` rank 2), `HealthIssue` (`id` = `"\(code):\(detail)"`), `DriveBaselineState`, `DiskPersistentState`, `DiskHealthSnapshot`, `MultiDiskHealthSnapshot`.
   - **SMART Source, Signal & Bad Extent Models (`v3.0.0`)**: Tracks `smartSourceType` (0 = none, 1 = native NVMe, 2 = SAT ATA, 3 = USB vendor), `busErrorCount`, `busResetCount`, `damagedExtents: [DamagedPhysicalExtent]`, and `apfsContainer: ApfsContainerFleetMetrics?`.
   - **Declarative Rule Engine Models (`v3.0.0`)**: Defines `ActionTriggerMetric` (14 metrics including `.systemWillSleep`), `ActionConditionOperator` (`>=`, `<=`, `>`, `<`, `==`), `ActionDriveScope` (6 scopes), `ActionExecutionType` (14 actions including `.throttleTopIoProcess` and `.preSleepShield`), `ActionRule` (with 5 built-in presets `ActionRule.builtInPresets`), `ActionExecutionStatus`, and `ActionExecutionRecord`.
   - **Composite `driveKey` (`STATE-03`, `RULE-05`)**: `DiskHealthSnapshot.isPlaceholderSerial(_:)` rejects empty/dummy serials (`00000000`, `0123456789abcdef`, `none`, `n/a`, `unknown`, `generic`, `default`, repeating chars). If serial is placeholder or duplicated across connected drives, `driveKey` falls back to `"\(serialNumber)#\(bsdName)"` or `bsdName`.
@@ -57,7 +58,7 @@ Definitive LLM/Agent reference for `disk-health-monitor`. Token-optimized. Zero 
 - **`src/models/DiskHealthError.swift`**:
   - `DiskHealthError: LocalizedError, Sendable, Equatable` covering all hardware, mount, canary, surface scan, verification, config, Keychain (`keychainAccessDenied`, `keychainOperationFailed`), file write, and alert script failure modes.
 - **`src/security/SubprocessRunner.swift` (`PROC-02`, `PROC-04`)**:
-  - Native `posix_spawn` process runner configuring `POSIX_SPAWN_SETPGROUP` to spawn grandchildren into isolated process groups. Drains stdout/stderr pipes asynchronously before `waitpid()`. Enforces watchdog timeout with `kill(-pid, SIGTERM)` / `SIGKILL` process-group termination guarded by `stateLock` and `processReaped` flag to prevent PID recycling races. Unified across `ActionRuleEngine` and `VolumeVerifierService` (`PROC-04`).
+  - Native `posix_spawn` process runner configuring `POSIX_SPAWN_SETPGROUP` to spawn grandchildren into isolated process groups. Drains stdout/stderr pipes asynchronously before `waitpid()`. Enforces a 1 MiB memory cap per stream (`maxOutputBytes = 1_048_576`) while continuing to drain pipes to EOF to avoid buffer deadlocks. Monitors child exit via `DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit)`; on timeout, holds the leader process unreaped as a zombie to strictly prevent macOS PID/PGID recycling, dispatches `kill(-pid, SIGTERM)` with a 200ms grace window, executes an unconditional `kill(-pid, SIGKILL)` across the entire process group, and then reaps `pid` via `waitpid()`. Unified across `ActionRuleEngine`, `ApfsSnapshotService`, and `VolumeVerifierService` (`PROC-04`).
 - **`src/security/SecretStore.swift`**:
   - **`AtomicFileWriter.writeRestricted(data:toPath:permissions:)`**: Writes sibling temp file with `open(..., O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0o600)`, `fchmod(0600)`, `fsync`, `close`, and atomic `rename()`. Zero `umask` TOCTOU window.
   - **`SecretStore` & `KeychainIntegrationState`**: Zero-prompt default (`useKeychainOptIn = false`, `.localOnlyDefault`). Never calls `SecItem*` unless `allowInteractiveKeychain == true` (explicit user click on "Onboard to macOS Keychain" in Settings). If user clicks "Deny" (`errSecAuthFailed = -25293`, `errSecUserCanceled = -128`, `errSecInteractionNotAllowed = -25308`), transitions to `.accessDenied`, auto-disables `useKeychainOptIn`, and retains secrets in `~/.config/disk-health-monitor/.secrets.json` (`0600`).
@@ -83,14 +84,14 @@ Definitive LLM/Agent reference for `disk-health-monitor`. Token-optimized. Zero 
   - Implements `withPreventIdleSleepAssertion(name:work:)` utilizing `IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep)` during deep surface scans and volume verification.
 - **`src/engine/ApfsSnapshotService.swift` (`APFS-02`)**:
   - Manages APFS local snapshots (`tmutil listlocalsnapshots` and `tmutil thinlocalsnapshots`).
-  - Guards system volume roots (`/`, `/System/*`) against unintended snapshot purging.
+  - Implements `validatedApfsMountPoint` to normalize paths, reject traversal (`..`) and NUL bytes, verify `statfs` `fstype == "apfs"`, clamp `targetPurgeBytes` (100MB to 500GB) and urgency (1 to 4).
 - **`src/diagnostics/OpenFileBlockerInspector.swift` (`DA-01`)**:
   - Bridges `DiskListOpenFileBlockers` to locate all active processes and file paths keeping an external volume locked.
   - Exposes `inspectBlockers(mountPath:)` and `unmountVolume(mountPath:force:)` to safely resolve macOS "Disk Not Ejected Properly" and busy unmount errors.
 - **`src/network/OpenMetricsServer.swift` (`METRICS-01`)**:
   - Native Swift loopback HTTP server utilizing `Network.framework` (`NWListener`) binding `127.0.0.1:<port>` (configurable, default 9102).
-  - Exposes standard Prometheus / OpenMetrics `/metrics` endpoint (`disk_health_score`, `disk_temperature_celsius`, `disk_percentage_used`, `disk_available_spare_percent`, etc.), `/status.json` live multi-disk snapshot, and `/healthz`.
-  - Includes explicit `Content-Length` headers, non-UTF8/empty data cancellation guards, and complete connection lifecycle management.
+  - Exposes standard Prometheus / OpenMetrics `/metrics` endpoint (`disk_health_score`, `disk_temperature_celsius`, `disk_percentage_used`, `disk_available_spare_percent`, etc.), `/status.json` live multi-disk snapshot, `/healthz`, and `/` HTML landing page.
+  - Implements exact path routing with query parameter separation, HEAD method support, `405 Method Not Allowed` for non-GET/HEAD methods, `404 Not Found` for unrecognized routes, explicit `Content-Length` headers, non-UTF8/empty data cancellation guards, and complete connection lifecycle management.
 - **`src/engine/TelemetryProvider.swift`**:
   - `DiskTelemetryProvider` protocol + live `IOKitTelemetryProvider` + testable `MockTelemetryProvider`.
   - `inspectFilesystem(mountPath:)` uses `statfs(2)` and queries `URLResourceKey.volumeAvailableCapacityForImportantUsageKey` **only when `fsType == "apfs"`** (`PERF-01`) to compute `purgeableBytes` and effective `freeBytes`.
@@ -174,7 +175,8 @@ Main Thread (@MainActor: reads publishedSnapshot / publishedMultiSnapshot / publ
         ├─> CanaryProbeService.lock (NSLock)
         │     └─> CanaryProbeService.mountExecutionLocks (NSLock per mount)
         ├─> ConfigManager.logLock (NSLock)
-        └─> DiskHealthBridge.sStaticCacheMutex (pthread_mutex_t)
+        ├─> DiskHealthBridge.sSmartClientMutex (pthread_mutex_t, leaf lock for IONVMeSMARTUserClient)
+        └─> DiskHealthBridge.sStaticCacheMutex (pthread_mutex_t, leaf lock for static & SMART cache)
 ```
 1. **Never acquire `engineLock` on the main UI thread**: UI views and `AppDelegate` read `monitor.publishedMultiSnapshot` and `monitor.publishedSnapshot` lock-free or read snapshot copies via leaf `snapshotLock`. `selectDashboardDrive(key:)` updates `@Published` properties immediately on the main thread and syncs internal keys via leaf `snapshotLock`.
 2. **Never call `DiskHealthMonitor` while holding `ConfigManager.configLock`**: `ConfigManager` always unlocks `configLock` *before* calling `notifyObjectWillChangeOnMain()`.
@@ -183,7 +185,7 @@ Main Thread (@MainActor: reads publishedSnapshot / publishedMultiSnapshot / publ
 
 ---
 
-## 4. EVOLUTION & AUDIT CHRONOLOGY (`v1.0.0` $\rightarrow$ `v2.8.0`)
+## 4. EVOLUTION & AUDIT CHRONOLOGY (`v1.0.0` $\rightarrow$ `v3.0.0`)
 
 - **v1.0.0 – v2.1.0 (Rounds 1–8)**: Initial C11 IOKit/NVMe SMART bridge, 12-point health engine, Menu Bar UI, LaunchAgent installer, `SingleInstanceLock` (`O_NOFOLLOW`), Universal Binary (`arm64` + `x86_64`) packager, and GitHub Actions CI.
 - **v2.2.0 – v2.3.0 (Rounds 9–12)**: Added multi-tier `F_NOCACHE` surface scanner (`quick`, `standard`, `full`), hardware S.M.A.R.T. inspector (`⌘I`), SSD endurance forecasting, APFS purgeable space accounting, universal webhooks, standalone HTML RMA reports (`⌘H`), `POSIX_SPAWN_SETSID` terminal detachment, 4-layer modular decomposition (25 files), opt-in Keychain state machine (`SecretStore`), `AtomicFileWriter`, and Round 12 pipe-drain/watchdog hardening (15 C tests + 37 Swift tests).
@@ -192,15 +194,21 @@ Main Thread (@MainActor: reads publishedSnapshot / publishedMultiSnapshot / publ
 - **v2.6.0 (Build 9 — Full-Timeline Production Hardening)**: Guarded non-USB link speeds against PCIe Gen `1..5` enum collisions (`BRIDGE-02`), filtered virtual `.dmg` disk images and expanded `sStaticCache` to 64 entries (`BRIDGE-04`), unified `DiskHealthSnapshot.isPlaceholderSerial` and composite `snap.driveKey` across `resetBaselines()` and `runVolumeVerification()` (`STATE-03`), added automatic token/webhook regex redaction + 2s burst deduplication in `ConfigManager.log` (`LOG-01`), upgraded canary probe to 4096B page-aligned buffers with `F_FULLFSYNC` (`CANARY-02`), gated APFS purgeable space lookup (`PERF-01`), scoped `HOST_THERMAL_CRITICAL` to internal drives (`RULE-06`) and internal Apple SSD error log delta $\ge 5$ (`RULE-07`), exposed multi-disk checklist in `GeneralSettingsTab` (`UI-03`), and added `NSLocalNetworkUsageDescription` to `Info.plist` (`BUILD-01`). Certified with 16 C tests + 48 Swift tests.
 - **v2.7.0 (Build 10 — Argon Architecture & Concurrency Hardening)**: Guarded CoreFoundation in `DiskHealthBridge.h` for pure C11 cross-platform portability (`C11-PORT`), added fast registry ID / partition prefix mount resolution and raw disk caching in `sStaticCache` (`BRIDGE-05`), prioritized physical devices over virtual `.dmg` images in `DiskListAllDevices` (`BRIDGE-06`), added leaf `snapshotLock` decoupling `currentSnapshot`/`currentMultiSnapshot` from `engineLock` (`CONC-01`), disambiguated cloned bridge serials via `customDriveKey` (`STATE-04`), added per-mount canary serialization in `CanaryProbeService` (`CANARY-04`), de-inverted `debounceLock` in `SettingsViewModel` and offloaded diagnostic export I/O (`UI-04`), applied `AtomicFileWriter.writeRestricted` (`0600`) to LaunchAgent generator (`SEC-03`), pre-compiled log redaction regexes and added `EINTR`-safe log write loop (`LOG-02`), and added side-effect-free diagnostic exports (`persistState: false`). Certified with 16 C tests + 49 Swift tests + 5 CLI integration stages passing.
 - **v2.8.0 (Build 11 — Declarative Rule-Based Automation Engine, Process I/O Culprit Detector & Historical Sparklines)**: Added `ActionRuleEngine` (`When [Trigger] on [Drive Scope] for [Consecutive Polls] -> Do [Action]`) supporting 13 trigger metrics, 6 drive scopes, poll hysteresis, per-rule cooldowns, boot/system volume safety guards (`isSystemProtectedMount`), dry-run mode, 5 curated presets, and 12 built-in actions (`safeUnmountDrive`, `safeEjectDrive`, `remountReadOnly`, `startTimeMachineBackup`, `thinApfsSnapshots`, `captureTopIoProcesses`, `runMacShortcut`, etc.); added Darwin `<libproc.h>` `DiskSampleProcessIoMetrics` and `ProcessIoInspector` (`--top-io`); added `TelemetryHistoryStore` (`history.json`, 180-point ring buffer, rate-of-change triggers, and SwiftUI trend sparklines in `StatisticsAndInsightsTab`); added USB bus power (`usbCurrentAvailableMa`, `usbCurrentRequiredMa`) and PCIe/TB lane width (`linkWidthLanes`) in `DiskHealthBridge.c` and `SmartInspectorTab`; added 7th Settings tab `AutomationRulesTab` (`⌘A`) and CLI flags `--list-rules`, `--simulate-rule`, and `--top-io`. Certified with 17 C tests + 52 Swift tests + 5 CLI integration stages passing.
-- **v2.9.0 (Build 12 — Parallel Circuit Breakers, SAT SMART, Process-Group Isolation, Dark Wake, OpenMetrics & Blocker Inspector)**:
+- **v2.9.0 – v3.0.0 (Build 12–13 — Parallel Circuit Breakers, SAT SMART, Pre-Sleep Shield, Bad Extent LBA Pinpointer, APFS Container Roles, 90d Wear Forecaster, PHY Link Telemetry & Process I/O Throttler)**:
   1. `CONC-03`: Added `ParallelDriveProber` with bounded concurrency (4 workers) and 3.0s circuit breaker per device, quarantining hung controllers (`IO_CONTROLLER_UNRESPONSIVE`, -55 penalty) without stalling fleet polling.
-  2. `BRIDGE-07`: Added USB UASP / SAT ATA pass-through fallback (`smartSourceType`: native NVMe, SAT ATA, USB vendor) in `DiskHealthBridge.c`.
-  3. `DA-01`: Added `DiskListOpenFileBlockers` Darwin `<libproc.h>` inspector and `OpenFileBlockerInspector` to locate processes locking volume unmounts (`--who-blocks`, UI card in popover).
-  4. `APFS-02`: Added `ApfsSnapshotService` for local APFS snapshot discovery and thinning (`--snapshots`, `--thin-snapshots`, UI card in `StatisticsAndInsightsTab`).
-  5. `PWR-01`: Added `PowerManagementService` with Dark Wake awareness (`DiskIsDarkWakeActive`) and `withPreventIdleSleepAssertion` sleep prevention assertion during deep scans and verification.
-  6. `METRICS-01`: Added native Swift loopback OpenMetrics / Prometheus HTTP server (`127.0.0.1:<port>`) exposing `/metrics`, `/status.json`, and `/healthz` with UI toggle, port selection, and CLI flags (`--metrics-server`, `--metrics-port`).
-  7. `PROC-02`: Added `SubprocessRunner` implementing `posix_spawn` with `POSIX_SPAWN_SETPGROUP`, async pipe draining before `waitpid`, `processReaped` state lock, and process group timeout termination (`kill(-pid, SIGTERM)` / `SIGKILL`).
-  8. Certified with **20 C tests + 58 Swift tests + 5 CLI integration stages passing**.
+  2. `BRIDGE-07` & `BRIDGE-08`: Added USB UASP / SAT ATA source tagging (`smartSourceType`) and USB/Thunderbolt PHY error & bus reset counters (`BusSignalIntegrityRule`).
+  3. `BRIDGE-09`: Serialized `IONVMeSMARTUserClient` access via `sSmartClientMutex` with contention retry (`kIOReturnNotPermitted` `0xe00002be`), cached last-valid NVMe SMART telemetry in `sStaticCache`, and unified `AppDelegate.menuWillOpen` cache + health refresh to prevent menu bar clicks from alternating between `"OK"` and disk temperature.
+  4. `DA-01` & `DA-02`: Added `DiskListOpenFileBlockers` (`--who-blocks`) and `PowerManagementService` pre-sleep external drive shield (`--pre-sleep-shield`).
+  5. `APFS-02` & `APFS-03`: Added `ApfsSnapshotService` (`--snapshots`, `--thin-snapshots`) and `DiskListApfsContainerVolumes` (`--container-info`, `ApfsSwapPressureRule`).
+  6. `SCAN-02`, `HIST-01`, `PROC-03`: Added `DiskResolvePhysicalExtent` bad-sector LBA pinpointer, 90-day JSONL archive with OLS wear regression, and `DiskSetProcessBackgroundIoPriority` (`PRIO_DARWIN_BG`) throttler.
+  7. `METRICS-01` & `PROC-02`: Added native Swift loopback OpenMetrics HTTP server (`127.0.0.1:<port>`) with exact route matching and 404/405 guards; upgraded `SubprocessRunner` (`POSIX_SPAWN_SETPGROUP`) with 1 MiB stream memory capping, EOF pipe drain to prevent deadlocks, and zombie-state process group termination eliminating PGID recycling races; added `validatedApfsMountPoint` to `ApfsSnapshotService` with traversal and byte clamping guards; and added `--sync-apps` / interactive prompts to `build_and_install.sh` to protect installed applications.
+  8. Certified with **24 C tests + 66 Swift tests + 5 CLI integration stages passing**.
+- **v3.1.0 (Build 14 — Menu Bar SMART Contention Serialization & Concurrency Coalescing)**:
+  1. `BRIDGE-09`: Serialized `IONVMeSMARTUserClient` creation and `SMARTReadData` execution inside `sSmartClientMutex` with a 2.0s TTL rate-limit (`kSmartCacheTtlNs = 2000000000ULL` via `CLOCK_UPTIME_RAW`), 6-attempt bounded retry with 25ms backoff, and automatic fallback to `sStaticCache` on driver contention drops.
+  2. `UI-05`: Implemented request coalescing in `AppDelegate.refreshHealth` via `pendingForceCanary` and `pendingRefreshDiskCache` flags in a serialized background execution loop, strictly eliminating concurrent menu open races and title flapping between `OK` and disk temperature.
+  3. `RULE-06`: Added transient driver contention fallback in `DiskHealthMonitor.evaluateSingleTargetLocked` preserving recent valid SMART telemetry (<15s) from `latestMultiSnapshotInternal`.
+  4. `CLI-04`: Auto-detection in `DiskReadHardwareMetrics` strictly guards against dangling devices without BSD names (`metrics.bsdName[0] != '\0'`).
+  5. Certified with **24 C tests + 66 Swift tests + 5 CLI integration stages passing**.
 
 ---
 
@@ -211,10 +219,10 @@ Main Thread (@MainActor: reads publishedSnapshot / publishedMultiSnapshot / publ
 # 1. Compile DiskHealthMonitor.app and ./disk-health CLI symlink
 ./build_and_install.sh
 
-# 2. Run full 5-stage verification suite (20 C tests + 58 Swift tests + CLI + Exporters + Bundle)
+# 2. Run full 5-stage verification suite (24 C tests + 66 Swift tests + CLI + Exporters + Bundle)
 ./build_and_install.sh --test
 
-# 3. Run C11 / IOKit Bridge unit tests standalone (20 tests)
+# 3. Run C11 / IOKit Bridge unit tests standalone (24 tests)
 mkdir -p .build-cache
 clang -O2 -Wall -Wextra -c src/bridge/DiskHealthBridge.c -o .build-cache/DiskHealthBridge_test.o
 clang -O2 -Wall -Wextra -Isrc/bridge -I. tests/test_disk_health_bridge.c .build-cache/DiskHealthBridge_test.o -framework IOKit -framework CoreFoundation -o .build-cache/test_disk_health_bridge

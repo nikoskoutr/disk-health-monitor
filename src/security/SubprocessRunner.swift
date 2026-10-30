@@ -96,63 +96,66 @@ public enum SubprocessRunner {
 
         // Drain stdout/stderr concurrently BEFORE waitpid to prevent 64KB pipe buffer deadlock
         var outData = Data()
+        var outTruncated = false
         var errData = Data()
+        var errTruncated = false
         let drainGroup = DispatchGroup()
 
         drainGroup.enter()
         DispatchQueue.global(qos: .utility).async {
-            outData = Self.drainFd(outPipe[0])
+            (outData, outTruncated) = Self.drainFd(outPipe[0])
             close(outPipe[0])
             drainGroup.leave()
         }
 
         drainGroup.enter()
         DispatchQueue.global(qos: .utility).async {
-            errData = Self.drainFd(errPipe[0])
+            (errData, errTruncated) = Self.drainFd(errPipe[0])
             close(errPipe[0])
             drainGroup.leave()
         }
 
-        let stateLock = NSLock()
+        let exitSemaphore = DispatchSemaphore(value: 0)
         var timedOut = false
-        var processReaped = false
 
-        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-        timer.schedule(deadline: .now() + timeoutSeconds)
-        timer.setEventHandler {
-            stateLock.lock()
-            guard !processReaped else {
-                stateLock.unlock()
-                return
-            }
-            timedOut = true
-            stateLock.unlock()
-
-            // Signal entire process group (-pid)
-            kill(-pid, SIGTERM)
-            usleep(200_000)
-
-            stateLock.lock()
-            if !processReaped {
-                kill(-pid, SIGKILL)
-            }
-            stateLock.unlock()
+        // Monitor child exit without reaping it yet (keeps zombie so PID/PGID cannot be recycled)
+        let procSource = DispatchSource.makeProcessSource(
+            identifier: pid,
+            eventMask: .exit,
+            queue: DispatchQueue.global(qos: .utility)
+        )
+        procSource.setEventHandler {
+            exitSemaphore.signal()
         }
-        timer.resume()
+        procSource.resume()
 
+        let waitResult = exitSemaphore.wait(timeout: .now() + timeoutSeconds)
+        procSource.cancel()
+
+        if waitResult == .timedOut {
+            timedOut = true
+            // Leader `pid` is still unreaped; PGID `-pid` is guaranteed valid and unrecycled
+            kill(-pid, SIGTERM)
+
+            // Give process group 200ms to exit cleanly
+            _ = exitSemaphore.wait(timeout: .now() + 0.2)
+
+            // Unconditionally SIGKILL entire process group to terminate stubborn grandchildren
+            kill(-pid, SIGKILL)
+        }
+
+        // Now safe to reap group leader
         var status: Int32 = 0
         while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
 
-        stateLock.lock()
-        processReaped = true
-        let didTimeout = timedOut
-        stateLock.unlock()
-
-        timer.cancel()
+        // Ensure lingering grandchildren in group are dead before waiting on pipe drains
+        if timedOut {
+            kill(-pid, SIGKILL)
+        }
         drainGroup.wait()
 
         let exitCode: Int32
-        if didTimeout {
+        if timedOut {
             exitCode = -9
         } else if (status & 0x7f) == 0 {
             exitCode = (status >> 8) & 0xff
@@ -160,27 +163,48 @@ public enum SubprocessRunner {
             exitCode = -1
         }
 
+        var outString = String(data: outData, encoding: .utf8) ?? ""
+        if outTruncated {
+            outString += "\n... [output truncated at 1 MiB]"
+        }
+        var errString = String(data: errData, encoding: .utf8) ?? ""
+        if errTruncated {
+            errString += "\n... [output truncated at 1 MiB]"
+        }
+
         return SubprocessResult(
             exitCode: exitCode,
-            stdout: String(data: outData, encoding: .utf8) ?? "",
-            stderr: String(data: errData, encoding: .utf8) ?? "",
+            stdout: outString,
+            stderr: errString,
             timedOut: timedOut
         )
     }
 
-    private static func drainFd(_ fd: Int32) -> Data {
+    public static let maxOutputBytes: Int = 1_048_576 // 1 MiB cap per stream
+
+    private static func drainFd(_ fd: Int32, maxBytes: Int = maxOutputBytes) -> (data: Data, truncated: Bool) {
         var data = Data()
+        var truncated = false
         var buffer = [UInt8](repeating: 0, count: 8192)
         while true {
             let n = read(fd, &buffer, buffer.count)
             if n > 0 {
-                data.append(buffer, count: n)
+                let remaining = maxBytes - data.count
+                if remaining > 0 {
+                    let toCopy = min(n, remaining)
+                    data.append(buffer, count: toCopy)
+                    if toCopy < n {
+                        truncated = true
+                    }
+                } else {
+                    truncated = true // Discard surplus bytes so child doesn't hang on pipe buffer
+                }
             } else if n < 0 && errno == EINTR {
                 continue
             } else {
                 break
             }
         }
-        return data
+        return (data, truncated)
     }
 }

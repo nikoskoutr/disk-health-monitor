@@ -21,8 +21,8 @@ public let kAppArchitecture = "unknown"
 public let kAppArchShort = "unknown"
 #endif
 
-public let kAppVersion = "3.0.0"
-public let kAppBuildNumber = "13"
+public let kAppVersion = "3.1.0"
+public let kAppBuildNumber = "14"
 
 // MARK: - Data Models
 

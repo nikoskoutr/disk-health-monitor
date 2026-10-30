@@ -29,6 +29,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var wakeWorkItem: DispatchWorkItem?
     private var configRefreshWorkItem: DispatchWorkItem?
     private var isRefreshingHealth: Bool = false
+    private var pendingForceCanary: Bool = false
+    private var pendingRefreshDiskCache: Bool = false
     private var lastStatusSymbolSeverity: HealthSeverity?
     private var lastStatusTitle: String = ""
     private var statusSymbolCache: [HealthSeverity: NSImage] = [:]
@@ -82,7 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         wsCenter.addObserver(self, selector: #selector(systemDidWake(_:)), name: NSWorkspace.didWakeNotification, object: nil)
 
         // Initial check
-        refreshHealth(forceCanary: true)
+        refreshHealth(forceCanary: true, refreshDiskCache: true)
 
         // Dynamic timer polling
         schedulePollingTimer(interval: ConfigManager.shared.currentConfig.pollIntervalSeconds)
@@ -238,10 +240,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
     }
 
-    func populateSelectDiskMenu() {
+    func populateSelectDiskMenu(triggerBackgroundUpdateIfEmpty: Bool = true) {
         guard Thread.isMainThread else {
             DispatchQueue.main.async { [weak self] in
-                self?.populateSelectDiskMenu()
+                self?.populateSelectDiskMenu(triggerBackgroundUpdateIfEmpty: triggerBackgroundUpdateIfEmpty)
             }
             return
         }
@@ -254,13 +256,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var mounts = cachedMounts
         cacheLock.unlock()
 
-        if devices.isEmpty && mounts.isEmpty {
+        if devices.isEmpty && mounts.isEmpty && triggerBackgroundUpdateIfEmpty {
             if Thread.isMainThread {
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     guard let self = self else { return }
                     self.updateDiskCache()
                     DispatchQueue.main.async {
-                        self.populateSelectDiskMenu()
+                        self.populateSelectDiskMenu(triggerBackgroundUpdateIfEmpty: false)
                     }
                 }
             } else {
@@ -295,7 +297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         selectDiskMenu.addItem(autoItem)
         selectDiskMenu.addItem(NSMenuItem.separator())
 
-        let multi = DiskHealthMonitor.shared.publishedMultiSnapshot
+        let multi = DiskHealthMonitor.shared.publishedMultiSnapshot ?? DiskHealthMonitor.shared.currentMultiSnapshot
 
         // Physical Disks
         for d in devices {
@@ -307,7 +309,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             var label = "\(vendor.isEmpty ? "" : vendor + " ")\(prod) (\(bsd), \(bus))"
 
             if let dSnap = multi?.disks.first(where: { $0.bsdName == bsd || (!serial.isEmpty && $0.serialNumber == serial) }) {
-                label += " [\(dSnap.overallSeverity.emoji) \(dSnap.temperatureCelsius)°C]"
+                let statusText = (dSnap.smartValid && dSnap.temperatureCelsius > 0)
+                    ? "\(dSnap.temperatureCelsius)°C"
+                    : ((d.smartValid && d.temperatureCelsius > 0) ? "\(d.temperatureCelsius)°C" : "OK")
+                label += " [\(dSnap.overallSeverity.emoji) \(statusText)]"
+            } else if d.smartValid && d.temperatureCelsius > 0 {
+                label += " [🟢 \(d.temperatureCelsius)°C]"
             }
 
             let item = NSMenuItem(title: label, action: #selector(selectDiskTarget(_:)), keyEquivalent: "")
@@ -396,14 +403,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         dailyDigestItem.state = DiskHealthMonitor.shared.dailySummaryEnabled ? .on : .off
-        populateSelectDiskMenu()
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.updateDiskCache()
-            DispatchQueue.main.async {
-                self?.populateSelectDiskMenu()
-            }
-        }
-        refreshHealth(forceCanary: false)
+        populateSelectDiskMenu(triggerBackgroundUpdateIfEmpty: false)
+        refreshHealth(forceCanary: false, refreshDiskCache: true)
         if let hostingView = menu.items.first?.view {
             hostingView.invalidateIntrinsicContentSize()
             let fitting = hostingView.fittingSize
@@ -475,26 +476,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cacheLock.unlock()
     }
 
-    private func refreshHealth(forceCanary: Bool) {
+    private func refreshHealth(forceCanary: Bool, refreshDiskCache: Bool = false) {
         cacheLock.lock()
-        if isRefreshingHealth && !forceCanary {
+        if isRefreshingHealth {
+            if forceCanary { pendingForceCanary = true }
+            if refreshDiskCache { pendingRefreshDiskCache = true }
             cacheLock.unlock()
             return
         }
         isRefreshingHealth = true
+        var runForceCanary = forceCanary || pendingForceCanary
+        var runRefreshDiskCache = refreshDiskCache || pendingRefreshDiskCache
+        pendingForceCanary = false
+        pendingRefreshDiskCache = false
         cacheLock.unlock()
 
         DispatchQueue.global(qos: .utility).async {
-            defer {
+            while true {
+                if runRefreshDiskCache {
+                    self.updateDiskCache()
+                }
+                let multi = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: runForceCanary, allowNotifications: true)
+                DispatchQueue.main.async {
+                    if runRefreshDiskCache {
+                        self.populateSelectDiskMenu(triggerBackgroundUpdateIfEmpty: false)
+                    }
+                    self.updateStatusBarButton(with: multi)
+                }
+
                 self.cacheLock.lock()
+                if self.pendingForceCanary || self.pendingRefreshDiskCache {
+                    runForceCanary = self.pendingForceCanary
+                    runRefreshDiskCache = self.pendingRefreshDiskCache
+                    self.pendingForceCanary = false
+                    self.pendingRefreshDiskCache = false
+                    self.cacheLock.unlock()
+                    continue
+                }
                 self.isRefreshingHealth = false
                 self.cacheLock.unlock()
-            }
-            let multi = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: forceCanary, allowNotifications: true)
-            DispatchQueue.main.async {
-                self.updateStatusBarButton(with: multi)
+                break
             }
         }
+    }
+
+    static func formatStatusBarTitle(for multi: MultiDiskHealthSnapshot) -> String {
+        if multi.disks.count > 1 {
+            var maxTemp = 0
+            for d in multi.disks where d.smartValid && d.temperatureCelsius > maxTemp {
+                maxTemp = d.temperatureCelsius
+            }
+            let tempStr = maxTemp > 0 ? " \(maxTemp)°C" : ""
+            if multi.overallSeverity == .critical {
+                return " \(multi.disks.count) Disks 🚨\(tempStr)"
+            } else if multi.overallSeverity == .warning {
+                return " \(multi.disks.count) Disks ⚠️\(tempStr)"
+            } else {
+                return " \(multi.disks.count) Disks\(tempStr)"
+            }
+        } else if let snap = multi.primarySnapshot ?? multi.disks.first {
+            let rawName = snap.mountPoint.isEmpty ? (snap.bsdName.isEmpty ? "Disk" : snap.bsdName) : (snap.mountPoint as NSString).lastPathComponent
+            let shortName = rawName.count > 18 ? String(rawName.prefix(16)) + "…" : rawName
+            let hasValidTemp = snap.smartValid && snap.temperatureCelsius > 0
+            if !snap.isMounted || !snap.hardwareFound {
+                return " \(shortName) ❌"
+            } else if snap.overallSeverity == .critical {
+                return hasValidTemp ? " \(shortName) 🚨 \(snap.temperatureCelsius)°C" : " \(shortName) 🚨"
+            } else if snap.overallSeverity == .warning {
+                return hasValidTemp ? " \(shortName) ⚠️ \(snap.temperatureCelsius)°C" : " \(shortName) ⚠️"
+            } else if hasValidTemp {
+                return " \(shortName) \(snap.temperatureCelsius)°C"
+            } else {
+                return " \(shortName) OK"
+            }
+        }
+        return ""
     }
 
     private func updateStatusBarButton(with multi: MultiDiskHealthSnapshot) {
@@ -507,35 +563,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             lastStatusSymbolSeverity = multi.overallSeverity
         }
 
-        var newTitle: String = ""
-        if multi.disks.count > 1 {
-            var maxTemp = 0
-            for d in multi.disks where d.smartValid && d.temperatureCelsius > maxTemp {
-                maxTemp = d.temperatureCelsius
-            }
-            let tempStr = maxTemp > 0 ? " \(maxTemp)°C" : ""
-            if multi.overallSeverity == .critical {
-                newTitle = " \(multi.disks.count) Disks 🚨\(tempStr)"
-            } else if multi.overallSeverity == .warning {
-                newTitle = " \(multi.disks.count) Disks ⚠️\(tempStr)"
-            } else {
-                newTitle = " \(multi.disks.count) Disks\(tempStr)"
-            }
-        } else if let snap = multi.primarySnapshot ?? multi.disks.first {
-            let rawName = snap.mountPoint.isEmpty ? (snap.bsdName.isEmpty ? "Disk" : snap.bsdName) : (snap.mountPoint as NSString).lastPathComponent
-            let shortName = rawName.count > 18 ? String(rawName.prefix(16)) + "…" : rawName
-            if !snap.isMounted || !snap.hardwareFound {
-                newTitle = " \(shortName) ❌"
-            } else if snap.overallSeverity == .critical {
-                newTitle = " \(shortName) 🚨 \(snap.temperatureCelsius)°C"
-            } else if snap.overallSeverity == .warning {
-                newTitle = " \(shortName) ⚠️ \(snap.temperatureCelsius)°C"
-            } else if snap.smartValid {
-                newTitle = " \(shortName) \(snap.temperatureCelsius)°C"
-            } else {
-                newTitle = " \(shortName) OK"
-            }
-        }
+        let newTitle = AppDelegate.formatStatusBarTitle(for: multi)
         if !newTitle.isEmpty && button.title != newTitle {
             button.title = newTitle
             lastStatusTitle = newTitle

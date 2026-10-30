@@ -401,7 +401,7 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         provider: any DiskTelemetryProvider
     ) -> DiskHealthSnapshot {
         // 1. Hardware Telemetry Query
-        let hw: DiskHardwareMetrics
+        var hw: DiskHardwareMetrics
         if let preloaded = preloadedHardware, preloaded.found {
             hw = preloaded
         } else {
@@ -417,6 +417,33 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         let interconnect = hw.found ? cStringToSwift(hw.interconnectType) : "Storage"
         let protocolType = hw.found ? cStringToSwift(hw.protocolType) : ""
         let linkSpeedFormatted = formatLinkSpeed(hw.linkSpeedBps, interconnect: interconnect)
+
+        // Transient SMART Glitch Recovery: If drive is physically present but SMART read was dropped due to driver contention,
+        // preserve recent valid SMART telemetry from previous snapshot (< 15s) to prevent menu bar title flapping.
+        if hw.found && (!hw.smartValid || hw.temperatureCelsius <= 0) {
+            let prevSnap = latestMultiSnapshotInternal?.disks.first(where: {
+                (!bsdName.isEmpty && $0.bsdName == bsdName) ||
+                (!serialNumber.isEmpty && $0.serialNumber == serialNumber)
+            }) ?? latestSnapshotInternal
+            if let prev = prevSnap, prev.smartValid && prev.temperatureCelsius > 0 {
+                if (nowTs - prev.timestamp) < 15.0 {
+                    hw.smartValid = true
+                    hw.temperatureCelsius = Int32(prev.temperatureCelsius)
+                    hw.temperatureKelvin = Int32(prev.temperatureKelvin)
+                    hw.criticalWarning = prev.criticalWarning
+                    hw.availableSpare = prev.availableSpare
+                    hw.availableSpareThreshold = prev.availableSpareThreshold
+                    hw.percentageUsed = prev.percentageUsed
+                    if hw.dataUnitsRead == 0 { hw.dataUnitsRead = prev.dataUnitsRead }
+                    if hw.dataUnitsWritten == 0 { hw.dataUnitsWritten = prev.dataUnitsWritten }
+                    if hw.powerCycles == 0 { hw.powerCycles = prev.powerCycles }
+                    if hw.powerOnHours == 0 { hw.powerOnHours = prev.powerOnHours }
+                    if hw.unsafeShutdowns == 0 { hw.unsafeShutdowns = prev.unsafeShutdowns }
+                    if hw.mediaErrors == 0 { hw.mediaErrors = prev.mediaErrors }
+                    if hw.errorInfoLogEntries == 0 { hw.errorInfoLogEntries = prev.errorInfoLogEntries }
+                }
+            }
+        }
 
         // 2. Resolve Mount Point for this Hardware Device if targetMount is not explicitly set
         var resolvedMount = targetMount

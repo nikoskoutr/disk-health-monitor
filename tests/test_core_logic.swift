@@ -758,8 +758,8 @@ struct CoreLogicTestRunner {
         assertTrue(!kAppArchitecture.isEmpty, "kAppArchitecture must not be empty")
         assertTrue(!kAppArchShort.isEmpty, "kAppArchShort must not be empty")
         assertTrue(kAppArchShort == "arm64" || kAppArchShort == "x86_64", "kAppArchShort must be either arm64 or x86_64")
-        assertTrue(kAppVersion == "3.0.0", "kAppVersion must match 3.0.0")
-        assertTrue(kAppBuildNumber == "13", "kAppBuildNumber must match 13")
+        assertTrue(kAppVersion == "3.1.0", "kAppVersion must match 3.1.0")
+        assertTrue(kAppBuildNumber == "14", "kAppBuildNumber must match 14")
 
         let diag = DiagnosticExporter.shared.generateDiagnosticReport()
         guard let sys = diag["system"] as? [String: Any] else {
@@ -3656,7 +3656,17 @@ struct CoreLogicTestRunner {
             assertTrue(resTimeout.timedOut, "/bin/sleep 5 with 0.15s timeout must report timedOut")
             assertTrue(resTimeout.exitCode == -9, "Timed out command must yield exit code -9")
 
-            print("  [OK] SubprocessRunner execution, output capture, and process group timeout termination verified")
+            // High-volume output is capped at 1 MiB to prevent memory exhaustion
+            let resFlood = SubprocessRunner.run(
+                executable: "/bin/sh",
+                arguments: ["-c", "yes '01234567890123456789' | head -n 100000"],
+                timeoutSeconds: 5.0
+            )
+            assertTrue(resFlood.isSuccess, "High-volume command must succeed")
+            assertTrue(resFlood.stdout.contains("[output truncated at 1 MiB]"), "Output exceeding 1 MiB must include truncation notice")
+            assertTrue(resFlood.stdout.utf8.count <= 1_048_576 + 256, "Captured output must be bounded to ~1 MiB")
+
+            print("  [OK] SubprocessRunner execution, output capture, 1 MiB cap, and process group timeout termination verified")
         }
 
         // ====================================================================
@@ -3709,7 +3719,16 @@ struct CoreLogicTestRunner {
                 assertTrue(!snap.formattedAge.isEmpty, "Formatted age must not be empty")
             }
 
-            print("  [OK] ApfsSnapshotService inventory listing and timestamp parsing verified (\(snaps.count) local snapshots found)")
+            // Path validation and safety clamping
+            assertTrue(svc.validatedApfsMountPoint("/") != nil, "Root must validate as APFS mount point")
+            assertTrue(svc.validatedApfsMountPoint("../traversal") == nil, "Traversal path must be rejected")
+            assertTrue(svc.validatedApfsMountPoint("/nonexistent/mount/path/404") == nil, "Nonexistent path must be rejected")
+
+            let badThin = svc.thinSnapshots(mountPath: "/nonexistent/mount/path/404")
+            assertTrue(!badThin.isSuccess, "thinSnapshots on invalid mount must fail safely")
+            assertTrue(badThin.stderr.contains("not a valid mounted APFS filesystem"), "Must report invalid APFS filesystem")
+
+            print("  [OK] ApfsSnapshotService inventory listing, mount validation, and safety guards verified")
         }
 
         // ====================================================================
@@ -3752,7 +3771,35 @@ struct CoreLogicTestRunner {
             server.stop()
             assertTrue(!server.running, "Server must stop running after stop()")
 
-            print("  [OK] OpenMetricsServer Prometheus metrics exposition, lifecycle, and port clamping verified")
+            // HTTP Route safety, exact matching, method validation, and query parameter handling
+            let resMetrics = server.routeRequest("GET /metrics HTTP/1.1\r\n\r\n")
+            assertTrue(resMetrics.contains("200 OK") && resMetrics.contains("disk_health_score"), "GET /metrics must return 200 OK")
+
+            let resMetricsQuery = server.routeRequest("GET /metrics?format=prometheus HTTP/1.1\r\n\r\n")
+            assertTrue(resMetricsQuery.contains("200 OK"), "GET /metrics?query must strip query and return 200 OK")
+
+            let resMetricsPrefix = server.routeRequest("GET /metrics-extra HTTP/1.1\r\n\r\n")
+            assertTrue(resMetricsPrefix.contains("404 Not Found"), "GET /metrics-extra must return 404 Not Found")
+
+            let resStatus = server.routeRequest("GET /status.json HTTP/1.1\r\n\r\n")
+            assertTrue(resStatus.contains("200 OK"), "GET /status.json must return 200 OK")
+
+            let resHealthz = server.routeRequest("GET /healthz HTTP/1.1\r\n\r\n")
+            assertTrue(resHealthz.contains("200 OK") && resHealthz.contains("\"status\":\"ok\""), "GET /healthz must return 200 OK")
+
+            let resRoot = server.routeRequest("GET / HTTP/1.1\r\n\r\n")
+            assertTrue(resRoot.contains("200 OK") && resRoot.contains("<!DOCTYPE html>"), "GET / must return 200 OK HTML")
+
+            let resHead = server.routeRequest("HEAD /metrics HTTP/1.1\r\n\r\n")
+            assertTrue(resHead.contains("200 OK"), "HEAD /metrics must return 200 OK without body")
+
+            let resMethodNotAllowed = server.routeRequest("POST /metrics HTTP/1.1\r\n\r\n")
+            assertTrue(resMethodNotAllowed.contains("405 Method Not Allowed"), "POST /metrics must return 405 Method Not Allowed")
+
+            let res404 = server.routeRequest("GET /nonexistent/endpoint HTTP/1.1\r\n\r\n")
+            assertTrue(res404.contains("404 Not Found"), "Unknown route must return 404 Not Found")
+
+            print("  [OK] OpenMetricsServer Prometheus metrics exposition, exact route matching, and port clamping verified")
         }
 
         // ====================================================================
@@ -4062,6 +4109,113 @@ struct CoreLogicTestRunner {
             assertTrue(unmountedCount >= 0, "Unmounted drive count must be non-negative")
 
             print("  [OK] Pre-Sleep External Drive Shield lifecycle, configuration persistence, and safety guards verified")
+        }
+
+        // ====================================================================
+        // Test 66: Menu Bar Status Title & Concurrent SMART Contention (BRIDGE-09)
+        // ====================================================================
+        do {
+            print("=== Swift Unit Test 66: Menu Bar Status Title & Concurrent SMART Contention (BRIDGE-09) ===")
+            let smartSnap = DiskHealthSnapshot(
+                timestamp: 1000,
+                formattedTime: "2026-10-30 12:00:00",
+                formattedShortTime: "12:00:00",
+                overallSeverity: .healthy,
+                healthScore: 100,
+                issues: [],
+                hardwareFound: true,
+                vendorName: "Samsung",
+                productName: "PSSD T7",
+                productRevision: "0",
+                bsdName: "disk4",
+                serialNumber: "S6XJNS0X904231D",
+                usbSerialNumber: "S6XJNS0X904231D",
+                interconnectType: "USB",
+                protocolType: "NVMe",
+                isInternal: false,
+                isRemovable: false,
+                linkSpeedBps: 10_000_000_000,
+                linkSpeedFormatted: "10 Gbps",
+                isMounted: true,
+                mountPoint: "/Volumes/T7",
+                filesystemType: "apfs",
+                isReadOnly: false,
+                totalBytes: 1_000_000_000,
+                freeBytes: 500_000_000,
+                usedBytes: 500_000_000,
+                usedPercent: 50.0,
+                subpathsStatus: [:],
+                canaryOk: true,
+                canaryLatencyMs: 2.0,
+                canaryError: "",
+                smartValid: true,
+                criticalWarning: 0,
+                temperatureCelsius: 27,
+                peakTemperatureCelsius: 41,
+                availableSpare: 100,
+                availableSpareThreshold: 10,
+                percentageUsed: 0,
+                lifeRemainingPercent: 100,
+                totalTerabytesRead: 1.0,
+                totalTerabytesWritten: 5.66,
+                powerCycles: 10,
+                powerOnHours: 100,
+                unsafeShutdowns: 0,
+                mediaErrors: 0,
+                errorInfoLogEntries: 0,
+                statsValid: true,
+                sessionBytesRead: 0,
+                sessionBytesWritten: 0,
+                operationsRead: 0,
+                operationsWritten: 0,
+                errorsRead: 0,
+                errorsWritten: 0,
+                retriesRead: 0,
+                retriesWritten: 0,
+                avgReadLatencyMs: 0.5,
+                avgWriteLatencyMs: 0.5,
+                readThroughputMBps: 0.0,
+                writeThroughputMBps: 0.0,
+                lastVerifyResult: "Not run yet",
+                lastVerifyOk: true
+            )
+            let singleMulti = MultiDiskHealthSnapshot(
+                timestamp: 1000,
+                formattedTime: "2026-10-30 12:00:00",
+                formattedShortTime: "12:00:00",
+                overallSeverity: .healthy,
+                worstHealthScore: 100,
+                averageHealthScore: 100,
+                totalIssuesCount: 0,
+                disks: [smartSnap]
+            )
+            let titleWithSmart = AppDelegate.formatStatusBarTitle(for: singleMulti)
+            assertTrue(titleWithSmart == " T7 27°C", "Expected ' T7 27°C' for SMART-valid single drive, got '\(titleWithSmart)'")
+
+            // Simulate concurrent menu open (listAllDevices + evaluateAllMonitoredDisks)
+            let baselineDevs = IOKitTelemetryProvider.shared.listAllDevices(maxCount: 16)
+            let hasAnySmart = baselineDevs.contains(where: { $0.smartValid })
+            if hasAnySmart {
+                let group = DispatchGroup()
+                let lock = NSLock()
+                var droppedSmart = false
+                for _ in 0..<4 {
+                    group.enter()
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        let devs = IOKitTelemetryProvider.shared.listAllDevices(maxCount: 16)
+                        if !devs.contains(where: { $0.smartValid }) {
+                            lock.lock()
+                            droppedSmart = true
+                            lock.unlock()
+                        }
+                        group.leave()
+                    }
+                }
+                group.wait()
+                assertTrue(!droppedSmart, "Concurrent listAllDevices calls must not drop smartValid due to kIOReturnNotPermitted contention")
+            }
+
+            print("  [OK] Menu bar status title formatting and concurrent SMART contention guard verified")
         }
 
         print("✅ All Swift Core Logic Unit Tests Passed!")

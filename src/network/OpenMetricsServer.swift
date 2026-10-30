@@ -121,30 +121,40 @@ public final class OpenMetricsServer {
         }
     }
 
-    private func routeRequest(_ req: String) -> String {
+    func routeRequest(_ req: String) -> String {
         let firstLine = req.components(separatedBy: "\r\n").first ?? ""
         let parts = firstLine.components(separatedBy: " ")
         guard parts.count >= 2 else {
             return makeResponse(status: "400 Bad Request", contentType: "text/plain; charset=utf-8", body: "Bad Request\n")
         }
 
-        let path = parts[1]
+        let method = parts[0]
+        guard method == "GET" || method == "HEAD" else {
+            return makeResponse(status: "405 Method Not Allowed", contentType: "text/plain; charset=utf-8", body: "Method Not Allowed\n")
+        }
 
-        if path.starts(with: "/metrics") {
-            let body = generatePrometheusMetrics()
+        let rawTarget = parts[1]
+        let path = String(rawTarget.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false).first ?? "")
+
+        switch path {
+        case "/metrics":
+            let body = method == "HEAD" ? "" : generatePrometheusMetrics()
             return makeResponse(status: "200 OK", contentType: "text/plain; version=0.0.4; charset=utf-8", body: body)
-        } else if path.starts(with: "/status.json") {
+
+        case "/status.json":
             let snap = DiskHealthMonitor.shared.currentMultiSnapshot
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             if let data = try? encoder.encode(snap), let jsonStr = String(data: data, encoding: .utf8) {
-                return makeResponse(status: "200 OK", contentType: "application/json; charset=utf-8", body: jsonStr)
+                return makeResponse(status: "200 OK", contentType: "application/json; charset=utf-8", body: method == "HEAD" ? "" : jsonStr)
             }
-            return makeResponse(status: "500 Internal Error", contentType: "application/json; charset=utf-8", body: "{\"error\":\"encode_failed\"}\n")
-        } else if path.starts(with: "/healthz") {
+            return makeResponse(status: "500 Internal Server Error", contentType: "application/json; charset=utf-8", body: "{\"error\":\"encode_failed\"}\n")
+
+        case "/healthz":
             let json = "{\"status\":\"ok\",\"version\":\"\(kAppVersion)\",\"build\":\"\(kAppBuildNumber)\"}\n"
-            return makeResponse(status: "200 OK", contentType: "application/json; charset=utf-8", body: json)
-        } else {
+            return makeResponse(status: "200 OK", contentType: "application/json; charset=utf-8", body: method == "HEAD" ? "" : json)
+
+        case "/", "/index.html":
             let body = """
             <!DOCTYPE html>
             <html>
@@ -160,7 +170,10 @@ public final class OpenMetricsServer {
             </body>
             </html>\n
             """
-            return makeResponse(status: "200 OK", contentType: "text/html; charset=utf-8", body: body)
+            return makeResponse(status: "200 OK", contentType: "text/html; charset=utf-8", body: method == "HEAD" ? "" : body)
+
+        default:
+            return makeResponse(status: "404 Not Found", contentType: "text/plain; charset=utf-8", body: "Not Found\n")
         }
     }
 
@@ -246,6 +259,7 @@ public final class OpenMetricsServer {
         return str
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\r", with: " ")
             .replacingOccurrences(of: "\n", with: " ")
     }
 }

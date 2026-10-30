@@ -147,9 +147,9 @@ cat << EOF > "${CONTENTS_DIR}/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>3.0.0</string>
+    <string>3.1.0</string>
     <key>CFBundleVersion</key>
-    <string>13</string>
+    <string>14</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>NSPrincipalClass</key>
@@ -173,15 +173,43 @@ xattr -cr "${APP_BUNDLE}" 2>/dev/null || true
 codesign --force --deep --sign - "${APP_BUNDLE}" 2>/dev/null || true
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "${APP_BUNDLE}" 2>/dev/null || true
 
-# If a copy of DiskHealthMonitor.app exists in /Applications or ~/Applications, keep it in sync so Spotlight/Launchpad never launches a stale build
+# Optional /Applications or ~/Applications sync
+DO_APP_SYNC=false
+if [[ "${1:-}" == "--sync-apps" ]] || [[ "${1:-}" == "--install-app" ]] || [[ "${1:-}" == "--install-service" ]] || [[ "${1:-}" == "--service" ]]; then
+    DO_APP_SYNC=true
+fi
+
 for DEST_APP_DIR in "/Applications" "${HOME}/Applications"; do
     if [[ -d "${DEST_APP_DIR}/${APP_NAME}.app" ]] && [[ -w "${DEST_APP_DIR}" ]]; then
-        rm -rf "${DEST_APP_DIR}/${APP_NAME}.app"
-        cp -R "${APP_BUNDLE}" "${DEST_APP_DIR}/${APP_NAME}.app"
-        xattr -cr "${DEST_APP_DIR}/${APP_NAME}.app" 2>/dev/null || true
-        codesign --force --deep --sign - "${DEST_APP_DIR}/${APP_NAME}.app" 2>/dev/null || true
-        /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "${DEST_APP_DIR}/${APP_NAME}.app" 2>/dev/null || true
-        echo "🔄 Synced updated ${APP_NAME}.app to ${DEST_APP_DIR}/${APP_NAME}.app"
+        if [[ -n "${CI:-}" ]]; then
+            echo "ℹ️  CI environment detected; skipping ${DEST_APP_DIR}/${APP_NAME}.app sync."
+            continue
+        fi
+
+        SHOULD_SYNC="${DO_APP_SYNC}"
+        if [[ "${SHOULD_SYNC}" == "false" ]]; then
+            if [ -t 0 ]; then
+                read -r -p "🔄 Existing ${APP_NAME}.app found in ${DEST_APP_DIR}. Sync updated build? [y/N] " SYNC_REPLY < /dev/tty || true
+                if [[ "${SYNC_REPLY:-}" =~ ^[Yy]$ ]]; then
+                    SHOULD_SYNC=true
+                fi
+            else
+                echo "ℹ️  Existing ${APP_NAME}.app found in ${DEST_APP_DIR}. Pass --sync-apps to update it."
+            fi
+        fi
+
+        if [[ "${SHOULD_SYNC}" == "true" ]]; then
+            STAGE_APP="${DEST_APP_DIR}/.${APP_NAME}.app.tmp.$$"
+            rm -rf "${STAGE_APP}"
+            ditto "${APP_BUNDLE}" "${STAGE_APP}"
+            xattr -cr "${STAGE_APP}" 2>/dev/null || true
+            codesign --force --deep --sign - "${STAGE_APP}" 2>/dev/null || true
+
+            rm -rf "${DEST_APP_DIR}/${APP_NAME}.app"
+            mv -f "${STAGE_APP}" "${DEST_APP_DIR}/${APP_NAME}.app"
+            /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "${DEST_APP_DIR}/${APP_NAME}.app" 2>/dev/null || true
+            echo "🔄 Synced updated ${APP_NAME}.app to ${DEST_APP_DIR}/${APP_NAME}.app"
+        fi
     fi
 done
 
