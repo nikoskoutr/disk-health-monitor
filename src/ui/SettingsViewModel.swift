@@ -60,12 +60,17 @@ final class SettingsViewModel: ObservableObject {
 
     // APFS Local Snapshots (APFS-02)
     @Published var apfsSnapshots: [ApfsSnapshotInfo] = []
+    @Published var apfsSnapshotsMount: String = "/"
     @Published var isLoadingSnapshots: Bool = false
     @Published var snapshotThinningStatus: String? = nil
 
     // Open File Blocker Inspector (DA-01)
     @Published var openFileBlockers: [OpenFileBlocker] = []
     @Published var inspectingBlockerTarget: String? = nil
+    @Published var unmountStatusMessage: String? = nil
+    @Published var unmountStatusIsError: Bool = false
+    @Published var isUnmountingVolume: Bool = false
+    @Published var isLoadingBlockers: Bool = false
 
     init() {
         self.botToken = ConfigManager.shared.resolvedTelegramBotToken
@@ -109,11 +114,11 @@ final class SettingsViewModel: ObservableObject {
             }
 
             if isCurrentlyInstalled {
-                let bootout = Process()
-                bootout.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-                bootout.arguments = ["bootout", "gui/\(getuid())/\(bundleId)"]
-                try? bootout.run()
-                bootout.waitUntilExit()
+                _ = SubprocessRunner.run(
+                    executable: "/bin/launchctl",
+                    arguments: ["bootout", "gui/\(getuid())/\(bundleId)"],
+                    timeoutSeconds: 10.0
+                )
                 try? FileManager.default.removeItem(atPath: plistPath)
             } else {
                 try? FileManager.default.createDirectory(atPath: agentsDir, withIntermediateDirectories: true)
@@ -123,17 +128,16 @@ final class SettingsViewModel: ObservableObject {
                     _ = AtomicFileWriter.writeRestricted(data: plistData, toPath: plistPath, permissions: 0o600)
                 }
                 // Ensure any stale registration is unloaded before bootstrapping
-                let bootout = Process()
-                bootout.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-                bootout.arguments = ["bootout", "gui/\(getuid())/\(bundleId)"]
-                try? bootout.run()
-                bootout.waitUntilExit()
-
-                let bootstrap = Process()
-                bootstrap.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-                bootstrap.arguments = ["bootstrap", "gui/\(getuid())", plistPath]
-                try? bootstrap.run()
-                bootstrap.waitUntilExit()
+                _ = SubprocessRunner.run(
+                    executable: "/bin/launchctl",
+                    arguments: ["bootout", "gui/\(getuid())/\(bundleId)"],
+                    timeoutSeconds: 10.0
+                )
+                _ = SubprocessRunner.run(
+                    executable: "/bin/launchctl",
+                    arguments: ["bootstrap", "gui/\(getuid())", plistPath],
+                    timeoutSeconds: 10.0
+                )
             }
             DispatchQueue.main.async {
                 self.checkLaunchAgent()
@@ -317,6 +321,9 @@ final class SettingsViewModel: ObservableObject {
                 self.surfaceScanCancelToken = nil
                 self.lastSurfaceScanOk = res.ok
                 self.lastSurfaceScanSummary = res.summary
+                DispatchQueue.global(qos: .utility).async {
+                    _ = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: false, allowNotifications: false)
+                }
             }
         }
     }
@@ -479,7 +486,7 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func updateMetricsServer(enabled: Bool, portString: String) {
-        let portVal = Int(portString.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 9108
+        let portVal = Int(portString.trimmingCharacters(in: .whitespacesAndNewlines)) ?? OpenMetricsServer.defaultPort
         let safePort = max(1024, min(portVal, 65535))
         ConfigManager.shared.setMetricsServer(enabled: enabled, port: safePort)
         metricsServerEnabled = enabled
@@ -492,9 +499,11 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func loadApfsSnapshots(mountPath: String = "/") {
+        let target = mountPath.isEmpty ? "/" : mountPath
+        apfsSnapshotsMount = target
         isLoadingSnapshots = true
         DispatchQueue.global(qos: .userInitiated).async {
-            let list = ApfsSnapshotService.shared.listSnapshots(mountPath: mountPath)
+            let list = ApfsSnapshotService.shared.listSnapshots(mountPath: target)
             DispatchQueue.main.async {
                 self.apfsSnapshots = list
                 self.isLoadingSnapshots = false
@@ -503,14 +512,16 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func thinApfsSnapshots(mountPath: String = "/", targetGB: UInt64 = 20) {
-        snapshotThinningStatus = "Thinning snapshots..."
+        let target = mountPath.isEmpty ? "/" : mountPath
+        apfsSnapshotsMount = target
+        snapshotThinningStatus = "Thinning snapshots on '\(target)'..."
         DispatchQueue.global(qos: .userInitiated).async {
             let bytes = targetGB * 1_000_000_000
-            let res = ApfsSnapshotService.shared.thinSnapshots(mountPath: mountPath, targetPurgeBytes: bytes, urgency: 4)
-            let updated = ApfsSnapshotService.shared.listSnapshots(mountPath: mountPath)
+            let res = ApfsSnapshotService.shared.thinSnapshots(mountPath: target, targetPurgeBytes: bytes, urgency: 4)
+            let updated = ApfsSnapshotService.shared.listSnapshots(mountPath: target)
             DispatchQueue.main.async {
                 self.apfsSnapshots = updated
-                self.snapshotThinningStatus = res.isSuccess ? "Thinned successfully" : "Thinning completed"
+                self.snapshotThinningStatus = res.isSuccess ? "Thinned successfully on '\(target)'" : "Thinning completed on '\(target)'"
                 DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
                     self.snapshotThinningStatus = nil
                 }
@@ -519,11 +530,55 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func inspectOpenFileBlockers(mountPath: String) {
-        inspectingBlockerTarget = mountPath
+        let trimmed = mountPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let target = trimmed.isEmpty ? "/" : trimmed
+        inspectingBlockerTarget = target
+        isLoadingBlockers = true
         DispatchQueue.global(qos: .userInitiated).async {
-            let list = OpenFileBlockerInspector.shared.inspectBlockers(mountPath: mountPath)
+            let list = OpenFileBlockerInspector.shared.inspectBlockers(mountPath: target)
             DispatchQueue.main.async {
                 self.openFileBlockers = list
+                self.isLoadingBlockers = false
+            }
+        }
+    }
+
+    func unmountVolumeAction(mountPath: String, force: Bool) {
+        let trimmed = mountPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let target = trimmed.isEmpty ? "/" : trimmed
+        isUnmountingVolume = true
+        unmountStatusMessage = force ? "Force unmounting '\(target)'..." : "Unmounting '\(target)'..."
+        DispatchQueue.global(qos: .userInitiated).async {
+            let res = OpenFileBlockerInspector.shared.unmountVolume(mountPath: target, force: force)
+            if res.isSuccess {
+                _ = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: true)
+            }
+            DispatchQueue.main.async {
+                self.isUnmountingVolume = false
+                let out = res.combinedOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.unmountStatusMessage = res.isSuccess
+                    ? "Volume '\(target)' unmounted successfully."
+                    : (out.isEmpty ? "Failed to unmount '\(target)' (code \(res.exitCode))." : out)
+                self.unmountStatusIsError = !res.isSuccess
+                if res.isSuccess {
+                    self.openFileBlockers = []
+                } else {
+                    self.inspectOpenFileBlockers(mountPath: target)
+                }
+            }
+        }
+    }
+
+    func terminateBlockerAction(_ blocker: OpenFileBlocker, mountPath: String) {
+        isLoadingBlockers = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let (ok, msg) = OpenFileBlockerInspector.shared.terminateBlocker(blocker, mountPath: mountPath)
+            let updatedList = OpenFileBlockerInspector.shared.inspectBlockers(mountPath: mountPath.isEmpty ? "/" : mountPath)
+            DispatchQueue.main.async {
+                self.unmountStatusMessage = msg
+                self.unmountStatusIsError = !ok
+                self.openFileBlockers = updatedList
+                self.isLoadingBlockers = false
             }
         }
     }
@@ -533,7 +588,8 @@ final class SettingsViewModel: ObservableObject {
 
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     static let shared = SettingsWindowController()
-    private static let sharedVM = SettingsViewModel()
+    static let sharedVM = SettingsViewModel()
+    var viewModel: SettingsViewModel { Self.sharedVM }
 
     convenience init() {
         self.init(window: nil)

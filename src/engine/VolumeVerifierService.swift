@@ -72,24 +72,6 @@ final class VolumeVerifierService: @unchecked Sendable {
 
     /// Terminates a parent process and all child processes spawned by it (e.g. diskutil -> fsck_apfs).
     ///
-    /// Invariant (SYS2-05): diskutil verifyVolume forks fsck_apfs, which inherits pipe handles.
-    /// If only diskutil is killed with SIGKILL, the pipe remains open in fsck_apfs and
-    /// pipe.fileHandleForReading.readToEnd() hangs indefinitely. We invoke /usr/bin/pkill -P
-    /// to eliminate the entire process group before signaling the parent.
-    ///
-    /// - Parameters:
-    ///   - pid: Parent process identifier.
-    ///   - signal: POSIX signal to deliver (e.g. SIGTERM, SIGKILL).
-    static func terminateProcessAndChildren(pid: pid_t, signal: Int32) {
-        guard pid > 0 else { return }
-        let pkill = Process()
-        pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        pkill.arguments = ["-\(signal)", "-P", "\(pid)"]
-        try? pkill.run()
-        pkill.waitUntilExit()
-        kill(pid, signal)
-    }
-
     /// Runs filesystem verification asynchronously on a background queue.
     ///
     /// - Parameters:

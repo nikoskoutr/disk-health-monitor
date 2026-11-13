@@ -28,3 +28,11 @@ Guarantees single-instance execution for the menu bar daemon without restricting
   - Writes the current process ID (`getpid()`) to the lock file followed by `fsync(2)` for diagnostic tracking in `launchctl` and Activity Monitor.
 - **Headless Invocations Unrestricted**:
   - Standalone CLI commands (`--status`, `--json`, `--check`, `--surface-scan`, `--export-*`) execute without acquiring this lock, enabling parallel automation.
+
+---
+
+### 3. [`SubprocessRunner.swift`](SubprocessRunner.swift)
+Provides process-group-isolated subprocess execution (`posix_spawn` with `POSIX_SPAWN_SETPGROUP`):
+- Explicitly validates `posix_spawn_file_actions_init` and `posix_spawnattr_init` allocation return codes with full pipe cleanup on error.
+- Caps captured stdout/stderr streams at 1 MiB (`maxOutputBytes`) while continuing to drain pipes to EOF to prevent buffer deadlocks.
+- Monitors child exits via `DispatchSource.makeProcessSource` and reaps zombie leaders safely after `SIGTERM` (200ms grace) + `kill(-pid, SIGKILL)` so macOS never recycles PGIDs prematurely.

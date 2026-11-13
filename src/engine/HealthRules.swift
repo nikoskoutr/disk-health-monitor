@@ -30,6 +30,49 @@ struct HealthEvaluationContext: Sendable {
     var driveState: DriveBaselineState
     var recentTemperatureSamples: [(timestamp: TimeInterval, tempC: Int)]
     var apfsContainer: ApfsContainerFleetMetrics? = nil
+    var isControllerUnresponsive: Bool = false
+
+    init(
+        nowTs: TimeInterval,
+        config: DiskHealthConfig,
+        hardware: DiskHardwareMetrics,
+        linkSpeedFormatted: String,
+        interconnect: String,
+        mountToInspect: String,
+        filesystem: FilesystemMountMetrics,
+        subpathsStatus: [String: Bool],
+        canaryOk: Bool,
+        canaryLatencyMs: Double,
+        canaryError: String,
+        avgReadLatMs: Double,
+        avgWriteLatMs: Double,
+        inWakeGrace: Bool,
+        hostThermalState: ProcessInfo.ThermalState,
+        driveState: DriveBaselineState,
+        recentTemperatureSamples: [(timestamp: TimeInterval, tempC: Int)],
+        apfsContainer: ApfsContainerFleetMetrics? = nil,
+        isControllerUnresponsive: Bool = false
+    ) {
+        self.nowTs = nowTs
+        self.config = config
+        self.hardware = hardware
+        self.linkSpeedFormatted = linkSpeedFormatted
+        self.interconnect = interconnect
+        self.mountToInspect = mountToInspect
+        self.filesystem = filesystem
+        self.subpathsStatus = subpathsStatus
+        self.canaryOk = canaryOk
+        self.canaryLatencyMs = canaryLatencyMs
+        self.canaryError = canaryError
+        self.avgReadLatMs = avgReadLatMs
+        self.avgWriteLatMs = avgWriteLatMs
+        self.inWakeGrace = inWakeGrace
+        self.hostThermalState = hostThermalState
+        self.driveState = driveState
+        self.recentTemperatureSamples = recentTemperatureSamples
+        self.apfsContainer = apfsContainer
+        self.isControllerUnresponsive = isControllerUnresponsive
+    }
 }
 
 struct HealthRuleOutcome: Sendable {
@@ -129,7 +172,9 @@ struct RequiredSubpathsRule: HealthRule {
 
     func evaluate(context: HealthEvaluationContext) -> HealthRuleOutcome {
         var outcome = HealthRuleOutcome()
-        guard context.filesystem.isMounted else { return outcome }
+        guard context.filesystem.isMounted,
+              context.filesystem.totalBytes > 0,
+              !context.isControllerUnresponsive else { return outcome }
 
         for (subpath, exists) in context.subpathsStatus {
             if !exists {
@@ -153,19 +198,16 @@ struct CanaryProbeRule: HealthRule {
 
     func evaluate(context: HealthEvaluationContext) -> HealthRuleOutcome {
         var outcome = HealthRuleOutcome()
+        if context.isControllerUnresponsive {
+            return outcome // Suppressed: ControllerQuarantineRule (-55) already accounts for hung controller circuit-open state.
+        }
         guard context.filesystem.isMounted && context.config.enableActiveCanary else { return outcome }
 
         if context.inWakeGrace {
             outcome.logMessages.append("Canary probe issue suppressed during wake grace period (8s).")
         } else if !context.canaryOk {
-            if context.canaryError.contains("CIRCUIT_OPEN") || context.canaryError.contains("TIMEOUT") {
-                outcome.issues.append(HealthIssue(
-                    code: "IO_CONTROLLER_UNRESPONSIVE",
-                    severity: .critical,
-                    title: "I/O Controller Unresponsive",
-                    detail: "Storage controller on \(context.filesystem.mountPoint) timed out after 3000ms. Quarantined."
-                ))
-                outcome.scorePenalty += 55
+            if context.canaryError.contains("CIRCUIT_OPEN") || context.canaryError.contains("TIMEOUT") || context.isControllerUnresponsive {
+                // Handled specifically by ControllerQuarantineRule (CONC-03)
             } else {
                 outcome.issues.append(HealthIssue(
                     code: "CANARY_IO_FAILED",
@@ -195,7 +237,9 @@ struct DiskSpaceRule: HealthRule {
 
     func evaluate(context: HealthEvaluationContext) -> HealthRuleOutcome {
         var outcome = HealthRuleOutcome()
-        guard context.filesystem.isMounted else { return outcome }
+        guard context.filesystem.isMounted,
+              context.filesystem.totalBytes > 0,
+              !context.isControllerUnresponsive else { return outcome }
 
         let freeGB = Double(context.filesystem.freeBytes) / 1_000_000_000.0
         let totalGB = Double(context.filesystem.totalBytes) / 1_000_000_000.0
@@ -304,7 +348,7 @@ struct ThermalAndSpikeRule: HealthRule {
 
     func evaluate(context: HealthEvaluationContext) -> HealthRuleOutcome {
         var outcome = HealthRuleOutcome()
-        guard context.hardware.smartValid else { return outcome }
+        guard context.hardware.smartValid || context.hardware.temperatureCelsius > 0 else { return outcome }
 
         let tempC = Int(context.hardware.temperatureCelsius)
         let cfg = context.config
@@ -583,8 +627,10 @@ struct BusSignalIntegrityRule: HealthRule {
         let hw = context.hardware
         let driveState = context.driveState
 
-        let baseErrors = driveState.baselineBusErrors
-        let baseResets = driveState.baselineBusResets
+        guard let baseErrors = driveState.baselineBusErrors,
+              let baseResets = driveState.baselineBusResets else {
+            return outcome
+        }
 
         let deltaErrors = (hw.busErrorCount >= baseErrors) ? (hw.busErrorCount - baseErrors) : hw.busErrorCount
         let deltaResets = (hw.busResetCount >= baseResets) ? (hw.busResetCount - baseResets) : hw.busResetCount
@@ -646,6 +692,28 @@ struct ApfsSwapPressureRule: HealthRule {
     }
 }
 
+// MARK: - Rule 15: Controller Quarantine & Unresponsiveness (CONC-03)
+
+struct ControllerQuarantineRule: HealthRule {
+    let ruleId = "ControllerQuarantine"
+
+    func evaluate(context: HealthEvaluationContext) -> HealthRuleOutcome {
+        var outcome = HealthRuleOutcome()
+
+        if context.isControllerUnresponsive || context.canaryError.contains("CIRCUIT_OPEN") || context.canaryError.contains("TIMEOUT") || context.canaryError.contains("CONTROLLER_") {
+            outcome.issues.append(HealthIssue(
+                code: "IO_CONTROLLER_UNRESPONSIVE",
+                severity: .critical,
+                title: "I/O Controller Unresponsive",
+                detail: "Storage controller on \(context.filesystem.mountPoint) timed out after 3000ms. Quarantined."
+            ))
+            outcome.scorePenalty += 55
+        }
+
+        return outcome
+    }
+}
+
 // MARK: - Standard Health Rule Pipeline
 
 struct StandardHealthRulePipeline: Sendable {
@@ -663,6 +731,7 @@ struct StandardHealthRulePipeline: Sendable {
         DriverStatsAndLatencyRule(),
         HostThermalAndVerifyRule(),
         BusSignalIntegrityRule(),
-        ApfsSwapPressureRule()
+        ApfsSwapPressureRule(),
+        ControllerQuarantineRule()
     ]
 }

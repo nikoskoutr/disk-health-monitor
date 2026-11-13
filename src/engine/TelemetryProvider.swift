@@ -57,6 +57,12 @@ protocol DiskTelemetryProvider: Sendable {
 
     /// Retrieves host thermal pressure state from `ProcessInfo`.
     func currentHostThermalState() -> ProcessInfo.ThermalState
+
+    /// Returns true if the system is currently running in macOS Dark Wake (Power Nap / background wake).
+    func isDarkWakeActive() -> Bool
+
+    /// Enumerates APFS container capacity and role metrics for the volume at `mountPath`.
+    func inspectApfsContainer(mountPath: String) -> ApfsContainerFleetMetrics?
 }
 
 extension DiskTelemetryProvider {
@@ -66,6 +72,14 @@ extension DiskTelemetryProvider {
 
     func runCanaryProbe(targetMount: String, force: Bool, nowTs: TimeInterval) -> CanaryProbeResult {
         return CanaryProbeService.shared.runCanaryCheck(targetMount: targetMount, force: force, nowTs: nowTs)
+    }
+
+    func isDarkWakeActive() -> Bool {
+        return IOKitTelemetryProvider.shared.isDarkWakeActive()
+    }
+
+    func inspectApfsContainer(mountPath: String) -> ApfsContainerFleetMetrics? {
+        return IOKitTelemetryProvider.shared.inspectApfsContainer(mountPath: mountPath)
     }
 }
 
@@ -190,6 +204,40 @@ struct IOKitTelemetryProvider: DiskTelemetryProvider {
     func currentHostThermalState() -> ProcessInfo.ThermalState {
         return ProcessInfo.processInfo.thermalState
     }
+
+    func isDarkWakeActive() -> Bool {
+        return PowerManagementService.shared.isDarkWakeActive()
+    }
+
+    func inspectApfsContainer(mountPath: String) -> ApfsContainerFleetMetrics? {
+        guard !mountPath.isEmpty else { return nil }
+        var cMetrics = DiskApfsContainerMetrics()
+        var vMetrics = [DiskApfsVolumeMetrics](repeating: DiskApfsVolumeMetrics(), count: 32)
+        let vCount = mountPath.withCString { cMount in
+            DiskListApfsContainerVolumes(cMount, &cMetrics, &vMetrics, 32)
+        }
+        guard vCount > 0 else { return nil }
+        var vols: [ApfsVolumeRoleMetrics] = []
+        vols.reserveCapacity(Int(vCount))
+        for i in 0..<Int(vCount) {
+            let item = vMetrics[i]
+            vols.append(ApfsVolumeRoleMetrics(
+                bsdName: cStringToSwift(item.bsdName),
+                name: cStringToSwift(item.name),
+                role: cStringToSwift(item.role),
+                totalBytes: item.totalBytes,
+                usedBytes: item.usedBytes,
+                freeBytes: item.freeBytes,
+                isEncrypted: item.isEncrypted
+            ))
+        }
+        return ApfsContainerFleetMetrics(
+            containerBsd: cStringToSwift(cMetrics.containerBsd),
+            totalCapacityBytes: cMetrics.totalCapacityBytes,
+            freeSpaceBytes: cMetrics.freeSpaceBytes,
+            volumes: vols
+        )
+    }
 }
 
 final class MockTelemetryProvider: DiskTelemetryProvider, @unchecked Sendable {
@@ -204,6 +252,8 @@ final class MockTelemetryProvider: DiskTelemetryProvider, @unchecked Sendable {
     var hostThermalState: ProcessInfo.ThermalState = .nominal
     var mountedVolumes: [MountedVolumeInfo] = []
     var canaryResultOverride: CanaryProbeResult? = nil
+    var darkWakeActive: Bool = false
+    var apfsContainerByMount: [String: ApfsContainerFleetMetrics] = [:]
 
     init() {}
 
@@ -286,5 +336,17 @@ final class MockTelemetryProvider: DiskTelemetryProvider, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return hostThermalState
+    }
+
+    func isDarkWakeActive() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return darkWakeActive
+    }
+
+    func inspectApfsContainer(mountPath: String) -> ApfsContainerFleetMetrics? {
+        lock.lock()
+        defer { lock.unlock() }
+        return apfsContainerByMount[mountPath]
     }
 }

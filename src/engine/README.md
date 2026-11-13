@@ -1,6 +1,6 @@
 # Health Evaluation Engine (`src/engine/`)
 
-This directory contains the central monitoring engine (`DiskHealthMonitor`) that orchestrates hardware telemetry collection, active canary write probes, multi-tier surface read scans, deep filesystem verification, the 12-rule health evaluation pipeline, and stateful alert cooldowns.
+This directory contains the central monitoring engine (`DiskHealthMonitor`), lock-split parallel prober (`ParallelDriveProber`), persistent state store (`PersistentStateStore`), 15-rule evaluation pipeline (`HealthRules`), declarative automation (`ActionRuleEngine`), 90-day telemetry archive (`TelemetryHistoryStore`), power management (`PowerManagementService`), APFS snapshot service (`ApfsSnapshotService`), active canary probe (`CanaryProbeService`), physical surface scanner (`SurfaceScannerService`), and volume verifier (`VolumeVerifierService`).
 
 ---
 
@@ -8,9 +8,24 @@ This directory contains the central monitoring engine (`DiskHealthMonitor`) that
 
 ### [`DiskHealthMonitor.swift`](DiskHealthMonitor.swift)
 
-#### 1. Concurrency & Sleep/Wake Lifecycle
-- All state reads, telemetry evaluations, baseline updates, and file updates are synchronized via an internal `engineLock` (`NSRecursiveLock`).
-- Observes `NSWorkspace.willSleepNotification` and `didWakeNotification`: pauses background evaluation during sleep and applies an 8-second dark-wake settle grace period on wake before querying external storage buses.
+#### 1. Lock-Split Concurrency & Sleep/Wake Lifecycle
+- Splits `evaluateAllMonitoredDisks` into unlocked Phase A (`collectPhaseATelemetry`: hardware discovery + `ParallelDriveProber`) and locked Phase B (`evaluatePreparedTargetLocked` under `engineLock`), eliminating VFS stall contention across concurrent readers.
+- Observes `NSWorkspace.willSleepNotification` and `didWakeNotification`: pauses background evaluation during sleep and applies an 8-second wake settle grace period before querying external storage buses.
+
+### [`PersistentStateStore.swift`](PersistentStateStore.swift)
+- Encapsulates `state.json` load/migration, `flock(LOCK_EX)` dirty-gated `0600` saves (`state.lock`), `latest_status.json` snapshots, per-drive baseline synchronization, and `resetBaselines()`.
+
+### [`ParallelDriveProber.swift`](ParallelDriveProber.swift)
+- Runs a bounded 4-worker `OperationQueue` with a 3.0s circuit breaker per mount, `inFlightMounts` de-duplication, Dark Wake deferral, APFS container enumeration, required subpath checks, internal/`/` quarantine exemption, and 120s auto-recovery quarantine TTL.
+
+### [`HealthRules.swift`](HealthRules.swift)
+- 15 pure functional `HealthRule` structs (`StandardHealthRulePipeline.defaultRules`): rules 1–12 plus `BusSignalIntegrityRule` (`BUS_PHY_ERRORS`, deferring nil baseline capture), `ApfsSwapPressureRule` (`APFS_SWAP_PRESSURE`), and `ControllerQuarantineRule` (`IO_CONTROLLER_UNRESPONSIVE`, -55). Evaluates HID die temperature via `smartValid || temperatureCelsius > 0` in `ThermalAndSpikeRule`.
+
+### [`ActionRuleEngine.swift`](ActionRuleEngine.swift), [`TelemetryHistoryStore.swift`](TelemetryHistoryStore.swift), [`PowerManagementService.swift`](PowerManagementService.swift) & [`ApfsSnapshotService.swift`](ApfsSnapshotService.swift)
+- **`ActionRuleEngine`**: Evaluates declarative `When -> Do` rules (including event-driven `.systemWillSleep`) with boot-volume protections, dry-run mode, and `SubprocessRunner`-isolated action execution.
+- **`TelemetryHistoryStore`**: 180-point ring buffer (`history.json`), isolated `<customFilePath>.archive` or `configDir/history/<driveKey>.jsonl` 90-day archives with OLS wear regression (`computeRollingForecasts`) and 512KB/24h gated pruning.
+- **`PowerManagementService`**: Monitors `kIOMessageSystemWillSleep` for external pre-sleep unmounts and wraps long operations in `IOPMAssertion`.
+- **`ApfsSnapshotService`**: Lists and thins APFS local snapshots via `tmutil` with path traversal and byte clamping guards.
 
 #### 2. Active Canary I/O Probe (`CanaryProbeService.swift`)
 - On mounted writable volumes, writes a 4096-byte page-aligned payload to `<mountPath>/.disk_health_canary_<uid>` in-place with POSIX flags `O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC`, permissions `0600`, and `fcntl(fd, F_NOCACHE, 1)`.

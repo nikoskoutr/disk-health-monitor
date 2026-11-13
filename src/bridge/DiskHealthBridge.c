@@ -15,13 +15,12 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <time.h>
+#include <errno.h>
 #include <sys/time.h>
 #include <pthread.h>
-#include <dlfcn.h>
 #include <sys/param.h>
 #include <sys/mount.h>
-#include <sys/resource.h>
-#include <libproc.h>
+#include <sys/attr.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <IOKit/IOCFPlugIn.h>
@@ -228,6 +227,75 @@ uint64_t DiskNormalizeLinkSpeedToBps(uint64_t rawSpeed) {
 // MARK: - Registry Inspection: Parent & Child Traversal
 // ============================================================================
 
+static void accumulateBusErrorCountersFromParent(io_registry_entry_t parent, DiskHardwareMetrics *outMetrics) {
+    // PHY Link Errors and Bus Resets (USB / Thunderbolt - BRIDGE-08)
+    CFTypeRef portStatsRef = IORegistryEntryCreateCFProperty(parent, CFSTR("port-statistics"), kCFAllocatorDefault, 0);
+    if (portStatsRef) {
+        if (CFGetTypeID(portStatsRef) == CFDictionaryGetTypeID()) {
+            CFDictionaryRef dict = (CFDictionaryRef)portStatsRef;
+            outMetrics->busErrorCount += (uint32_t)DiskExtractCFNumberU64(dict, CFSTR("kPortStatEnumerationFailureCount"));
+            outMetrics->busErrorCount += (uint32_t)DiskExtractCFNumberU64(dict, CFSTR("kPortStatOverCurrentCount"));
+            outMetrics->busErrorCount += (uint32_t)DiskExtractCFNumberU64(dict, CFSTR("kPortStatAddressFailureCount"));
+            outMetrics->busErrorCount += (uint32_t)DiskExtractCFNumberU64(dict, CFSTR("kPortStatEOF2ViolationCount"));
+            outMetrics->busResetCount += (uint32_t)DiskExtractCFNumberU64(dict, CFSTR("kPortStatEOF2ViolationDuringResetCount"));
+        }
+        CFRelease(portStatsRef);
+    }
+
+    CFTypeRef errCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("PortErrorCount"), kCFAllocatorDefault, 0);
+    if (!errCountRef) errCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("USB Port Error Count"), kCFAllocatorDefault, 0);
+    if (!errCountRef) errCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("LinkErrorCount"), kCFAllocatorDefault, 0);
+    if (!errCountRef) errCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("Link Error Count"), kCFAllocatorDefault, 0);
+    if (!errCountRef) errCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("PHY Error Count"), kCFAllocatorDefault, 0);
+    if (!errCountRef) errCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("CRC Error Count"), kCFAllocatorDefault, 0);
+    if (!errCountRef) errCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("RxErrorCount"), kCFAllocatorDefault, 0);
+    if (errCountRef) {
+        if (CFGetTypeID(errCountRef) == CFNumberGetTypeID()) {
+            int64_t val = 0;
+            if (CFNumberGetValue((CFNumberRef)errCountRef, kCFNumberSInt64Type, &val) && val > 0) {
+                outMetrics->busErrorCount += (uint32_t)val;
+            }
+        }
+        CFRelease(errCountRef);
+    }
+
+    CFTypeRef resetCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("USBPortResetCount"), kCFAllocatorDefault, 0);
+    if (!resetCountRef) resetCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("USB Bus Reset Count"), kCFAllocatorDefault, 0);
+    if (!resetCountRef) resetCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("Bus Reset Count"), kCFAllocatorDefault, 0);
+    if (!resetCountRef) resetCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("Device Reset Count"), kCFAllocatorDefault, 0);
+    if (!resetCountRef) resetCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("Link Reset Count"), kCFAllocatorDefault, 0);
+    if (!resetCountRef) resetCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("ResetCount"), kCFAllocatorDefault, 0);
+    if (resetCountRef) {
+        if (CFGetTypeID(resetCountRef) == CFNumberGetTypeID()) {
+            int64_t val = 0;
+            if (CFNumberGetValue((CFNumberRef)resetCountRef, kCFNumberSInt64Type, &val) && val > 0) {
+                outMetrics->busResetCount += (uint32_t)val;
+            }
+        }
+        CFRelease(resetCountRef);
+    }
+}
+
+static void refreshDynamicBusErrorCounters(io_registry_entry_t entry, DiskHardwareMetrics *outMetrics) {
+    io_registry_entry_t current = entry;
+    IOObjectRetain(current);
+    outMetrics->busErrorCount = 0;
+    outMetrics->busResetCount = 0;
+
+    for (int depth = 0; depth < 8; depth++) {
+        io_registry_entry_t parent = 0;
+        kern_return_t kr = IORegistryEntryGetParentEntry(current, kIOServicePlane, &parent);
+        if (kr != KERN_SUCCESS || parent == 0) {
+            if (parent != 0) IOObjectRelease(parent);
+            break;
+        }
+        accumulateBusErrorCountersFromParent(parent, outMetrics);
+        IOObjectRelease(current);
+        current = parent;
+    }
+    IOObjectRelease(current);
+}
+
 /**
  * @brief Inspects parent chain in kIOServicePlane for USB / Thunderbolt / bus properties.
  * 
@@ -387,44 +455,7 @@ static void inspectParentsForBusProperties(io_registry_entry_t entry, DiskHardwa
             }
         }
 
-        // PHY Link Errors and Bus Resets (USB / Thunderbolt - BRIDGE-08)
-        CFTypeRef portStatsRef = IORegistryEntryCreateCFProperty(parent, CFSTR("port-statistics"), kCFAllocatorDefault, 0);
-        if (portStatsRef) {
-            if (CFGetTypeID(portStatsRef) == CFDictionaryGetTypeID()) {
-                CFDictionaryRef dict = (CFDictionaryRef)portStatsRef;
-                outMetrics->busErrorCount += (uint32_t)DiskExtractCFNumberU64(dict, CFSTR("kPortStatEnumerationFailureCount"));
-                outMetrics->busErrorCount += (uint32_t)DiskExtractCFNumberU64(dict, CFSTR("kPortStatOverCurrentCount"));
-                outMetrics->busErrorCount += (uint32_t)DiskExtractCFNumberU64(dict, CFSTR("kPortStatAddressFailureCount"));
-                outMetrics->busErrorCount += (uint32_t)DiskExtractCFNumberU64(dict, CFSTR("kPortStatEOF2ViolationCount"));
-                outMetrics->busResetCount += (uint32_t)DiskExtractCFNumberU64(dict, CFSTR("kPortStatEOF2ViolationDuringResetCount"));
-            }
-            CFRelease(portStatsRef);
-        }
-
-        CFTypeRef errCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("PortErrorCount"), kCFAllocatorDefault, 0);
-        if (!errCountRef) errCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("LinkErrorCount"), kCFAllocatorDefault, 0);
-        if (!errCountRef) errCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("RxErrorCount"), kCFAllocatorDefault, 0);
-        if (errCountRef) {
-            if (CFGetTypeID(errCountRef) == CFNumberGetTypeID()) {
-                int64_t val = 0;
-                if (CFNumberGetValue((CFNumberRef)errCountRef, kCFNumberSInt64Type, &val) && val > 0) {
-                    outMetrics->busErrorCount += (uint32_t)val;
-                }
-            }
-            CFRelease(errCountRef);
-        }
-
-        CFTypeRef resetCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("USBPortResetCount"), kCFAllocatorDefault, 0);
-        if (!resetCountRef) resetCountRef = IORegistryEntryCreateCFProperty(parent, CFSTR("ResetCount"), kCFAllocatorDefault, 0);
-        if (resetCountRef) {
-            if (CFGetTypeID(resetCountRef) == CFNumberGetTypeID()) {
-                int64_t val = 0;
-                if (CFNumberGetValue((CFNumberRef)resetCountRef, kCFNumberSInt64Type, &val) && val > 0) {
-                    outMetrics->busResetCount += (uint32_t)val;
-                }
-            }
-            CFRelease(resetCountRef);
-        }
+        accumulateBusErrorCountersFromParent(parent, outMetrics);
 
         IOObjectRelease(current);
         current = parent;
@@ -658,6 +689,9 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
 
         // 3. Inspect parents for bus speed, serial number, and interconnect fallback
         inspectParentsForBusProperties(service, outMetrics);
+    } else {
+        // Always refresh dynamic PHY / bus error & reset counters on cache hits (BRIDGE-08)
+        refreshDynamicBusErrorCounters(service, outMetrics);
     }
 
     // 4. Always inspect children for driver statistics and live BSD Name (UAT2-03)
@@ -767,7 +801,7 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
         if (readSuccess && smart) {
             strlcpy(outMetrics->protocolType, "NVMe", sizeof(outMetrics->protocolType));
             outMetrics->smartValid = true;
-            outMetrics->smartSourceType = 0; // Native NVMe
+            outMetrics->smartSourceType = 1; // Native NVMe
             outMetrics->criticalWarning = data.CRITICAL_WARNING;
 
             uint16_t tempRaw = CFSwapInt16LittleToHost(data.TEMPERATURE);
@@ -800,6 +834,16 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
         }
         pthread_mutex_unlock(&sSmartClientMutex);
 
+        // Apple Silicon Die Thermal Fallback: populate before caching so 0°C SMART readings don't flap
+        if (outMetrics->isInternal && outMetrics->temperatureCelsius <= 0) {
+            int32_t dieTemp = DiskReadAppleSiliconStorageDieTemperature();
+            if (dieTemp > 0) {
+                outMetrics->temperatureCelsius = dieTemp;
+                outMetrics->temperatureKelvin = dieTemp + 273;
+                // Do NOT set outMetrics->smartValid = true here; thermal die fallback does not validate SMART wear/spare registers.
+            }
+        }
+
         if (outMetrics->smartValid) {
             if (hasEntryId && !isVirtualDiskDevice(outMetrics)) {
                 pthread_mutex_lock(&sStaticCacheMutex);
@@ -831,35 +875,35 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
             }
         } else {
             bool restoredFromCache = false;
-            pthread_mutex_lock(&sStaticCacheMutex);
-            for (int i = 0; i < sStaticCacheCount; i++) {
-                if (((hasEntryId && sStaticCache[i].entryId == entryId) ||
-                     (outMetrics->bsdName[0] != '\0' && strcmp(sStaticCache[i].bsdName, outMetrics->bsdName) == 0)) &&
-                    sStaticCache[i].hasValidSmartCache) {
-                    outMetrics->smartValid = true;
-                    outMetrics->smartSourceType = sStaticCache[i].smartSourceType;
-                    outMetrics->criticalWarning = sStaticCache[i].criticalWarning;
-                    outMetrics->temperatureCelsius = sStaticCache[i].temperatureCelsius;
-                    outMetrics->temperatureKelvin = sStaticCache[i].temperatureKelvin;
-                    outMetrics->availableSpare = sStaticCache[i].availableSpare;
-                    outMetrics->availableSpareThreshold = sStaticCache[i].availableSpareThreshold;
-                    outMetrics->percentageUsed = sStaticCache[i].percentageUsed;
-                    outMetrics->dataUnitsRead = sStaticCache[i].dataUnitsRead;
-                    outMetrics->dataUnitsWritten = sStaticCache[i].dataUnitsWritten;
-                    outMetrics->hostReadCommands = sStaticCache[i].hostReadCommands;
-                    outMetrics->hostWriteCommands = sStaticCache[i].hostWriteCommands;
-                    outMetrics->controllerBusyTime = sStaticCache[i].controllerBusyTime;
-                    outMetrics->powerCycles = sStaticCache[i].powerCycles;
-                    outMetrics->powerOnHours = sStaticCache[i].powerOnHours;
-                    outMetrics->unsafeShutdowns = sStaticCache[i].unsafeShutdowns;
-                    outMetrics->mediaErrors = sStaticCache[i].mediaErrors;
-                    outMetrics->errorInfoLogEntries = sStaticCache[i].errorInfoLogEntries;
-                    strlcpy(outMetrics->protocolType, "NVMe", sizeof(outMetrics->protocolType));
-                    restoredFromCache = true;
-                    break;
+            if (hasEntryId) {
+                pthread_mutex_lock(&sStaticCacheMutex);
+                for (int i = 0; i < sStaticCacheCount; i++) {
+                    if (sStaticCache[i].entryId == entryId && sStaticCache[i].hasValidSmartCache) {
+                        outMetrics->smartValid = true;
+                        outMetrics->smartSourceType = sStaticCache[i].smartSourceType;
+                        outMetrics->criticalWarning = sStaticCache[i].criticalWarning;
+                        outMetrics->temperatureCelsius = sStaticCache[i].temperatureCelsius;
+                        outMetrics->temperatureKelvin = sStaticCache[i].temperatureKelvin;
+                        outMetrics->availableSpare = sStaticCache[i].availableSpare;
+                        outMetrics->availableSpareThreshold = sStaticCache[i].availableSpareThreshold;
+                        outMetrics->percentageUsed = sStaticCache[i].percentageUsed;
+                        outMetrics->dataUnitsRead = sStaticCache[i].dataUnitsRead;
+                        outMetrics->dataUnitsWritten = sStaticCache[i].dataUnitsWritten;
+                        outMetrics->hostReadCommands = sStaticCache[i].hostReadCommands;
+                        outMetrics->hostWriteCommands = sStaticCache[i].hostWriteCommands;
+                        outMetrics->controllerBusyTime = sStaticCache[i].controllerBusyTime;
+                        outMetrics->powerCycles = sStaticCache[i].powerCycles;
+                        outMetrics->powerOnHours = sStaticCache[i].powerOnHours;
+                        outMetrics->unsafeShutdowns = sStaticCache[i].unsafeShutdowns;
+                        outMetrics->mediaErrors = sStaticCache[i].mediaErrors;
+                        outMetrics->errorInfoLogEntries = sStaticCache[i].errorInfoLogEntries;
+                        strlcpy(outMetrics->protocolType, "NVMe", sizeof(outMetrics->protocolType));
+                        restoredFromCache = true;
+                        break;
+                    }
                 }
+                pthread_mutex_unlock(&sStaticCacheMutex);
             }
-            pthread_mutex_unlock(&sStaticCacheMutex);
 
             if (!restoredFromCache) {
                 if (outMetrics->protocolType[0] == '\0') {
@@ -868,9 +912,9 @@ static void populateMetricsFromBlockStorageDevice(io_service_t service, DiskHard
                 // Fallback: If external USB or SATA drive without native NVMeSMARTUserClient, tag SAT / USB source
                 if (!outMetrics->isInternal) {
                     if (strcasecmp(outMetrics->interconnectType, "SATA") == 0) {
-                        outMetrics->smartSourceType = 1; // SAT ATA (0x85)
+                        outMetrics->smartSourceType = 2; // SAT ATA (0x85)
                     } else if (strcasecmp(outMetrics->interconnectType, "USB") == 0) {
-                        outMetrics->smartSourceType = 2; // USB Vendor NVMe / UASP
+                        outMetrics->smartSourceType = 3; // USB Vendor NVMe / UASP
                     }
                 }
             }
@@ -1233,193 +1277,8 @@ bool DiskFindMountForBlockDevice(const char *deviceBsdName, char *outMountPoint,
 }
 
 // ============================================================================
-// MARK: - Process Disk I/O Telemetry via Darwin libproc (proc_pid_rusage)
+// MARK: - Physical Extent LBA Pinpointer (SCAN-02) & APFS Container Pool (APFS-03)
 // ============================================================================
-
-int DiskSampleProcessIoMetrics(DiskProcessIoMetric *outArray, int maxCount) {
-    if (!outArray || maxCount <= 0) return 0;
-
-    int numBytes = proc_listallpids(NULL, 0);
-    if (numBytes <= 0) return 0;
-
-    size_t pidCapacity = (size_t)(numBytes / (int)sizeof(pid_t)) + 64;
-    pid_t stackPids[512];
-    pid_t *pids = stackPids;
-    if (pidCapacity > 512) {
-        pids = (pid_t *)calloc(pidCapacity, sizeof(pid_t));
-        if (!pids) return 0;
-    }
-
-    int actualBytes = proc_listallpids(pids, (int)(pidCapacity * sizeof(pid_t)));
-    if (actualBytes <= 0) {
-        if (pids != stackPids) free(pids);
-        return 0;
-    }
-
-    int pidCount = actualBytes / (int)sizeof(pid_t);
-    int populated = 0;
-
-    for (int i = 0; i < pidCount && populated < maxCount; i++) {
-        pid_t pid = pids[i];
-        if (pid <= 0) continue;
-
-        struct rusage_info_v4 ru;
-        memset(&ru, 0, sizeof(ru));
-        if (proc_pid_rusage(pid, RUSAGE_INFO_V4, (rusage_info_t *)&ru) != 0) {
-            continue;
-        }
-
-        // Include processes with non-zero disk I/O or the current process itself
-        if (ru.ri_diskio_bytesread == 0 && ru.ri_diskio_byteswritten == 0 && pid != getpid()) {
-            continue;
-        }
-
-        DiskProcessIoMetric *entry = &outArray[populated];
-        memset(entry, 0, sizeof(DiskProcessIoMetric));
-        entry->pid = (int32_t)pid;
-        entry->diskBytesRead = ru.ri_diskio_bytesread;
-        entry->diskBytesWritten = ru.ri_diskio_byteswritten;
-
-        char nameBuf[128] = {0};
-        if (proc_name(pid, nameBuf, sizeof(nameBuf) - 1) > 0 && nameBuf[0] != '\0') {
-            strlcpy(entry->processName, nameBuf, sizeof(entry->processName));
-        } else {
-            snprintf(entry->processName, sizeof(entry->processName), "pid-%d", (int)pid);
-        }
-        populated++;
-    }
-
-    if (pids != stackPids) free(pids);
-    return populated;
-}
-
-// ============================================================================
-// MARK: - Open File Blocker Inspector (DA-01) & Dark Wake Power State (PWR-01)
-// ============================================================================
-
-int DiskListOpenFileBlockers(const char *mountPath, DiskFileBlocker *outList, int maxCount) {
-    if (!mountPath || mountPath[0] == '\0' || !outList || maxCount <= 0) return 0;
-
-    int numBytes = proc_listallpids(NULL, 0);
-    if (numBytes <= 0) return 0;
-
-    size_t pidCapacity = (size_t)(numBytes / (int)sizeof(pid_t)) + 64;
-    pid_t stackPids[512];
-    pid_t *pids = stackPids;
-    if (pidCapacity > 512) {
-        pids = (pid_t *)calloc(pidCapacity, sizeof(pid_t));
-        if (!pids) return 0;
-    }
-
-    int actualBytes = proc_listallpids(pids, (int)(pidCapacity * sizeof(pid_t)));
-    if (actualBytes <= 0) {
-        if (pids != stackPids) free(pids);
-        return 0;
-    }
-
-    int pidCount = actualBytes / (int)sizeof(pid_t);
-    int populated = 0;
-    size_t mountLen = strlen(mountPath);
-
-    for (int i = 0; i < pidCount && populated < maxCount; i++) {
-        pid_t pid = pids[i];
-        if (pid <= 0 || pid == getpid()) continue;
-
-        int numFdsBytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, NULL, 0);
-        if (numFdsBytes <= 0) continue;
-
-        int fdCount = numFdsBytes / (int)sizeof(struct proc_fdinfo);
-        if (fdCount <= 0) continue;
-
-        struct proc_fdinfo stackFdList[128];
-        struct proc_fdinfo *fdList = stackFdList;
-        if ((size_t)fdCount > 128) {
-            fdList = (struct proc_fdinfo *)calloc((size_t)fdCount, sizeof(struct proc_fdinfo));
-            if (!fdList) continue;
-        }
-
-        int readFdBytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fdList, (int)(fdCount * sizeof(struct proc_fdinfo)));
-        int actualFds = readFdBytes / (int)sizeof(struct proc_fdinfo);
-
-        char procNameBuf[128] = {0};
-        bool fetchedProcName = false;
-
-        for (int j = 0; j < actualFds && populated < maxCount; j++) {
-            if (fdList[j].proc_fdtype != PROX_FDTYPE_VNODE) continue;
-
-            struct vnode_fdinfowithpath vnodeInfo;
-            memset(&vnodeInfo, 0, sizeof(vnodeInfo));
-            int vnodeRet = proc_pidfdinfo(pid, fdList[j].proc_fd, PROC_PIDFDVNODEPATHINFO, &vnodeInfo, sizeof(vnodeInfo));
-            if (vnodeRet < (int)sizeof(vnodeInfo)) continue;
-
-            const char *filePath = vnodeInfo.pvip.vip_path;
-            if (!filePath || filePath[0] == '\0') continue;
-
-            // Check if filePath is inside mountPath
-            bool matches = false;
-            if (strcmp(mountPath, "/") == 0) {
-                matches = true;
-            } else if (strncmp(filePath, mountPath, mountLen) == 0) {
-                if (filePath[mountLen] == '/' || filePath[mountLen] == '\0') {
-                    matches = true;
-                }
-            }
-
-            if (matches) {
-                if (!fetchedProcName) {
-                    if (proc_name(pid, procNameBuf, sizeof(procNameBuf) - 1) <= 0 || procNameBuf[0] == '\0') {
-                        snprintf(procNameBuf, sizeof(procNameBuf), "pid-%d", (int)pid);
-                    }
-                    fetchedProcName = true;
-                }
-
-                DiskFileBlocker *entry = &outList[populated];
-                entry->pid = (int32_t)pid;
-                strlcpy(entry->processName, procNameBuf, sizeof(entry->processName));
-                entry->processName[sizeof(entry->processName) - 1] = '\0';
-                strlcpy(entry->filePath, filePath, sizeof(entry->filePath));
-                entry->filePath[sizeof(entry->filePath) - 1] = '\0';
-                entry->fd = fdList[j].proc_fd;
-                populated++;
-            }
-        }
-
-        if (fdList != stackFdList) free(fdList);
-    }
-
-    if (pids != stackPids) free(pids);
-    return populated;
-}
-
-int DiskIsDarkWakeActive(void) {
-    typedef CFDictionaryRef (*CGSessionCopyCurrentDictionaryFn)(void);
-    static CGSessionCopyCurrentDictionaryFn sFn = NULL;
-    static bool sResolved = false;
-
-    if (!sResolved) {
-        sFn = (CGSessionCopyCurrentDictionaryFn)dlsym(RTLD_DEFAULT, "CGSessionCopyCurrentDictionary");
-        sResolved = true;
-    }
-
-    if (!sFn) return 0;
-    CFDictionaryRef sessionDict = sFn();
-    if (!sessionDict) return 0;
-
-    int isDark = 0;
-    CFBooleanRef onConsole = (CFBooleanRef)CFDictionaryGetValue(sessionDict, CFSTR("kCGSSessionOnConsoleKey"));
-    if (!onConsole) {
-        onConsole = (CFBooleanRef)CFDictionaryGetValue(sessionDict, CFSTR("kCGSessionOnConsoleKey"));
-    }
-
-    if (onConsole && CFGetTypeID(onConsole) == CFBooleanGetTypeID()) {
-        if (!CFBooleanGetValue(onConsole)) {
-            isDark = 1;
-        }
-    }
-
-    CFRelease(sessionDict);
-    return isDark;
-}
 
 int DiskResolvePhysicalExtent(int fd, off_t logicalOffset, off_t length, uint64_t *outPhysOffset, uint64_t *outContigBytes) {
     if (fd < 0 || !outPhysOffset || !outContigBytes) {
@@ -1452,20 +1311,6 @@ int DiskResolvePhysicalExtent(int fd, off_t logicalOffset, off_t length, uint64_
     }
 
     return -errno;
-}
-
-int DiskSetProcessBackgroundIoPriority(pid_t pid, bool enable) {
-    if (pid <= 0) return -EINVAL;
-    int res = setpriority(PRIO_DARWIN_PROCESS, (id_t)pid, enable ? PRIO_DARWIN_BG : 0);
-    if (res != 0) {
-        if (pid == getpid()) {
-            if (setpriority(PRIO_DARWIN_THREAD, 0, enable ? PRIO_DARWIN_BG : 0) == 0) {
-                return 0;
-            }
-        }
-        return -errno;
-    }
-    return 0;
 }
 
 int DiskListApfsContainerVolumes(const char *targetBsdOrMount, DiskApfsContainerMetrics *outContainer, DiskApfsVolumeMetrics *outVolumes, int maxVolumes) {
@@ -1515,9 +1360,11 @@ int DiskListApfsContainerVolumes(const char *targetBsdOrMount, DiskApfsContainer
             CFRelease(bsdRef);
         }
 
-        // Filter by container if specified
+        // Filter by container with slice boundary check ("disk1" must not match "disk10s1")
         if (targetContainer[0] != '\0' && vol->bsdName[0] != '\0') {
-            if (strncmp(vol->bsdName, targetContainer, strlen(targetContainer)) != 0) {
+            size_t prefixLen = strlen(targetContainer);
+            if (strncmp(vol->bsdName, targetContainer, prefixLen) != 0 ||
+                (vol->bsdName[prefixLen] != 's' && vol->bsdName[prefixLen] != '\0')) {
                 IOObjectRelease(service);
                 continue;
             }
@@ -1551,6 +1398,15 @@ int DiskListApfsContainerVolumes(const char *targetBsdOrMount, DiskApfsContainer
             strlcpy(vol->role, "User", sizeof(vol->role));
         }
 
+        // Encryption flag (FileVault / APFS encryption)
+        CFTypeRef encRef = IORegistryEntryCreateCFProperty(service, CFSTR("Encrypted"), kCFAllocatorDefault, 0);
+        if (encRef) {
+            if (CFGetTypeID(encRef) == CFBooleanGetTypeID()) {
+                vol->isEncrypted = CFBooleanGetValue((CFBooleanRef)encRef);
+            }
+            CFRelease(encRef);
+        }
+
         // Size / Allocation
         CFTypeRef sizeRef = IORegistryEntryCreateCFProperty(service, CFSTR("Size"), kCFAllocatorDefault, 0);
         if (sizeRef) {
@@ -1563,7 +1419,22 @@ int DiskListApfsContainerVolumes(const char *targetBsdOrMount, DiskApfsContainer
             CFRelease(sizeRef);
         }
 
-        // If volume is mounted, query statfs for exact space
+        // Initial per-volume consumed bytes from IORegistry
+        CFTypeRef consumedRef = IORegistryEntryCreateCFProperty(service, CFSTR("CapacityConsumed"), kCFAllocatorDefault, 0);
+        if (!consumedRef) {
+            consumedRef = IORegistryEntryCreateCFProperty(service, CFSTR("Capacity Consumed"), kCFAllocatorDefault, 0);
+        }
+        if (consumedRef) {
+            if (CFGetTypeID(consumedRef) == CFNumberGetTypeID()) {
+                int64_t usedSz = 0;
+                if (CFNumberGetValue((CFNumberRef)consumedRef, kCFNumberSInt64Type, &usedSz) && usedSz > 0) {
+                    vol->usedBytes = (uint64_t)usedSz;
+                }
+            }
+            CFRelease(consumedRef);
+        }
+
+        // If volume is mounted, query statfs for container pool and getattrlist(ATTR_VOL_SPACEUSED) for true per-volume used bytes
         char mountPath[MAXPATHLEN] = {0};
         if (vol->bsdName[0] != '\0' && DiskFindMountForBlockDevice(vol->bsdName, mountPath, sizeof(mountPath))) {
             struct statfs st;
@@ -1572,13 +1443,23 @@ int DiskListApfsContainerVolumes(const char *targetBsdOrMount, DiskApfsContainer
                 uint64_t poolFree = (uint64_t)st.f_bfree * (uint64_t)st.f_bsize;
                 uint64_t poolAvail = (uint64_t)st.f_bavail * (uint64_t)st.f_bsize;
                 vol->freeBytes = (poolAvail > 0) ? poolAvail : poolFree;
-                if (poolTotal > vol->freeBytes) {
-                    vol->usedBytes = poolTotal - vol->freeBytes;
-                }
                 if (outContainer->totalCapacityBytes == 0) {
                     outContainer->totalCapacityBytes = poolTotal;
                     outContainer->freeSpaceBytes = vol->freeBytes;
                 }
+            }
+
+            struct {
+                uint32_t length;
+                uint64_t spaceUsed;
+            } __attribute__((aligned(4), packed)) volAttrBuf = {0, 0};
+            struct attrlist alist;
+            memset(&alist, 0, sizeof(alist));
+            alist.bitmapcount = ATTR_BIT_MAP_COUNT;
+            alist.volattr = ATTR_VOL_INFO | ATTR_VOL_SPACEUSED;
+            if (getattrlist(mountPath, &alist, &volAttrBuf, sizeof(volAttrBuf), 0) == 0 &&
+                volAttrBuf.length >= sizeof(volAttrBuf)) {
+                vol->usedBytes = volAttrBuf.spaceUsed;
             }
         }
 

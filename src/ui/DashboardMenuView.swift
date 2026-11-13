@@ -154,10 +154,12 @@ struct DashboardMenuView: View {
                     metricTile(
                         icon: "thermometer.medium",
                         title: "TEMPERATURE",
-                        value: snap.smartValid ? "\(snap.temperatureCelsius)°C" : "N/A",
-                        subtitle: snap.smartValid ? "Peak: \(snap.peakTemperatureCelsius)°C (Warn \(cfg.tempWarningCelsius)°C)" : "No SMART",
+                        value: snap.hasTemperature ? "\(snap.temperatureCelsius)°C" : "N/A",
+                        subtitle: snap.hasTemperature
+                            ? (snap.smartValid ? "Peak: \(snap.peakTemperatureCelsius)°C (Warn \(cfg.tempWarningCelsius)°C)" : "Apple Silicon Die Sensor (Warn \(cfg.tempWarningCelsius)°C)")
+                            : "No Temp Sensor",
                         tint: snap.temperatureCelsius >= cfg.tempWarningCelsius ? .orange : .green,
-                        progress: snap.smartValid ? min(1.0, max(0.0, Double(snap.temperatureCelsius) / Double(max(1, cfg.tempCriticalCelsius)))) : nil,
+                        progress: snap.hasTemperature ? min(1.0, max(0.0, Double(snap.temperatureCelsius) / Double(max(1, cfg.tempCriticalCelsius)))) : nil,
                         progressColor: snap.temperatureCelsius >= cfg.tempCriticalCelsius ? .red : (snap.temperatureCelsius >= cfg.tempWarningCelsius ? .orange : .green)
                     )
                     metricTile(
@@ -276,7 +278,9 @@ struct DashboardMenuView: View {
                         HStack {
                             Spacer()
                             Button(action: {
-                                SettingsWindowController.shared.showSettings(tab: 4)
+                                DiskHealthMonitor.shared.selectDashboardDrive(key: snap.driveKey)
+                                SettingsWindowController.shared.showSettings(tab: 5)
+                                SettingsWindowController.sharedVM.inspectOpenFileBlockers(mountPath: snap.mountPoint)
                             }) {
                                 HStack(spacing: 3) {
                                     Image(systemName: "eject.circle.fill")

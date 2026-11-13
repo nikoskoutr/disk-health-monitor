@@ -223,6 +223,10 @@ struct AutomationRulesTab: View {
                             Text("Recovers to HEALTHY").tag("RECOVERED")
                         }
                         .labelsHidden()
+                    } else if viewModel.draftAutomationRule.triggerMetric == .systemWillSleep {
+                        Text("Fires automatically when macOS sends IOPMrootDomain sleep notification.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
                     } else {
                         Picker("", selection: $viewModel.draftAutomationRule.conditionOperator) {
                             ForEach(ActionConditionOperator.allCases, id: \.self) { op in

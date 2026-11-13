@@ -20,10 +20,15 @@ echo "==========================================================================
 
 # 1. Test DiskHealthBridge C Unit Tests
 echo "--- [1/5] Building & Running test_disk_health_bridge (C/IOKit Unit Tests) ---"
-clang -O2 -Wall -Wextra -c "${ROOT_DIR}/src/bridge/DiskHealthBridge.c" -o "${BUILD_CACHE}/DiskHealthBridge_test.o"
+TEST_BRIDGE_OBJECTS=()
+while IFS= read -r -d '' c_file; do
+    obj_path="${BUILD_CACHE}/$(basename "${c_file%.c}")_test.o"
+    clang -O2 -Wall -Wextra -c "${c_file}" -o "${obj_path}"
+    TEST_BRIDGE_OBJECTS+=("${obj_path}")
+done < <(find "${ROOT_DIR}/src/bridge" -maxdepth 1 -name "*.c" -print0 | sort -z)
 clang -O2 -Wall -Wextra -I"${ROOT_DIR}/src/bridge" -I"${ROOT_DIR}" \
     "${SCRIPT_DIR}/test_disk_health_bridge.c" \
-    "${BUILD_CACHE}/DiskHealthBridge_test.o" \
+    "${TEST_BRIDGE_OBJECTS[@]}" \
     -framework IOKit -framework CoreFoundation \
     -o "${BUILD_CACHE}/test_disk_health_bridge"
 "${BUILD_CACHE}/test_disk_health_bridge"
@@ -43,7 +48,7 @@ swiftc -O -whole-module-optimization -Xlinker -dead_strip \
     -import-objc-header "${ROOT_DIR}/src/bridge/DiskHealthBridge.h" \
     "${TEST_SWIFT_SOURCES[@]}" \
     "${SCRIPT_DIR}/test_core_logic.swift" \
-    "${BUILD_CACHE}/DiskHealthBridge_test.o" \
+    "${TEST_BRIDGE_OBJECTS[@]}" \
     -framework Cocoa \
     -framework SwiftUI \
     -framework IOKit \
@@ -54,7 +59,7 @@ swiftc -O -whole-module-optimization -Xlinker -dead_strip \
     -framework Network \
     -o "${BUILD_CACHE}/test_core_logic"
 "${BUILD_CACHE}/test_core_logic"
-rm -f "${BUILD_CACHE}/DiskHealthBridge_test.o"
+rm -f "${TEST_BRIDGE_OBJECTS[@]}"
 
 # 3. Test CLI binary commands
 echo "--- [3/5] Testing CLI Binary Options ---"

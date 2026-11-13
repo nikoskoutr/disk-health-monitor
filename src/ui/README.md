@@ -36,28 +36,28 @@ Renders the visual telemetry popover card in the status bar menu:
 
 ---
 
-### 3. [`SettingsView.swift`](SettingsView.swift), [`SettingsViewModel.swift`](SettingsViewModel.swift) & [`tabs/`](tabs/)
-Implements the 6-tab native macOS Preferences window (`⌘,`, 720×660 pt):
+### 3. [`SettingsView.swift`](SettingsView.swift), [`SettingsViewModel.swift`](SettingsViewModel.swift), [`SettingsComponents.swift`](SettingsComponents.swift) & [`tabs/`](tabs/)
+Implements the 7-tab native macOS Preferences window (`⌘,`, 820×700 pt) with shared UI components (`SmartAttributeRow`, `SmartAttributesTableView`) and offloaded background actions:
 
 1. **General Tab ([`GeneralSettingsTab.swift`](tabs/GeneralSettingsTab.swift))**:
-   - Monitor All Connected Disks toggle, single-drive selector, and multi-disk target checklist.
-   - LaunchAgent background service toggle with clean `launchctl` state synchronization.
+   - Monitor All Connected Disks toggle, single-drive selector, multi-disk target checklist, and Pre-Sleep External Drive Shield toggle.
+   - LaunchAgent background service toggle synchronized via `SubprocessRunner` (`launchctl`).
    - Polling frequency slider (`10s` to `300s`), active canary toggle, and scheduled verification interval.
 2. **Thresholds Tab ([`ThresholdsSettingsTab.swift`](tabs/ThresholdsSettingsTab.swift))**:
    - Temperature warning/critical thresholds (°C).
    - Capacity usage ceiling (%) and minimum free space floors (GB).
    - Minimum expected USB bus speed selector and alert cooldown duration.
 3. **Notifications Tab ([`NotificationsSettingsTab.swift`](tabs/NotificationsSettingsTab.swift))**:
-   - Native Notification Center toggle and audible critical audio beeps.
+   - Native Notification Center toggle, audible critical beeps, and Prometheus/OpenMetrics loopback server toggle + port (`9102`).
    - Opt-in macOS Keychain storage onboarding and status indicator.
-   - Telegram Bot API configuration with `SecureField` token entry and live test message dispatcher.
-   - Universal Webhook URL (Discord, Slack, Mattermost, Home Assistant) with live test button.
-   - Custom alert shell script hook path with validation runner.
+   - Telegram Bot API configuration (`SecureField`), Universal Webhook URL, and custom alert script hook.
 4. **S.M.A.R.T. Tab ([`SmartInspectorTab.swift`](tabs/SmartInspectorTab.swift), `⌘I`)**:
-   - Dedicated hardware inspector displaying all raw NVMe registers, normalized attributes, composite temperatures, critical warning bits, daily write burn rate ($\text{TB/day}$), and projected remaining lifespan.
-5. **Statistics & Insights Tab ([`StatisticsTab.swift`](tabs/StatisticsTab.swift))**:
-   - Multi-disk fleet comparison cards, endurance projections, I/O latency & throughput metrics, and capacity breakdown across all monitored drives.
+   - Dedicated hardware inspector rendering shared `SmartAttributesTableView` / `SmartAttributeRow`, HID die thermal status, kernel I/O driver stats, PHY CRC/reset counters, and bad physical LBA extents.
+5. **Statistics & Insights Tab ([`StatisticsAndInsightsTab.swift`](tabs/StatisticsAndInsightsTab.swift), `⌘S`)**:
+   - Multi-disk fleet cards, 7d/30d OLS wear projections, SwiftUI trend sparklines, runaway I/O process throttler, and context-aware APFS snapshot inventory (`apfsSnapshotsMount`).
 6. **Diagnostics Tab ([`DiagnosticsAndExportTab.swift`](tabs/DiagnosticsAndExportTab.swift))**:
-   - **Multi-Tier Surface Scan**: Selectable modes (`quick`, `standard`, `full`) with live progress, file counts, throughput ($\text{MB/s}$), and cancel support.
-   - **Volume Verification**: Manual `diskutil verifyVolume` execution and baseline reset actions.
-   - **Profiles & Reports**: One-click actions to Export HTML Report (`⌘H`), Export Diagnostic JSON, Export Sanitized Config, and Import Config Profile.
+   - **Multi-Tier Surface Scan**: `quick`, `standard`, `full` modes with live progress and cancellation.
+   - **Open File Blockers & Volume Verification**: Interactive blocker inspection with fail-closed `isTerminatable` termination, unmount controls, and `diskutil verifyVolume`.
+   - **Profiles & Reports**: Export HTML RMA Report (`⌘H`), Diagnostic JSON, Sanitized Config, and Import Config Profile.
+7. **Automation Rules Tab ([`AutomationRulesTab.swift`](tabs/AutomationRulesTab.swift), `⌘A`)**:
+   - Declarative `When -> Do` rule builder (including non-numeric `.systemWillSleep` event triggers), preset loader, dry-run simulation, and execution audit log.

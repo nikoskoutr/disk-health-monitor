@@ -11,11 +11,12 @@ import Foundation
 import Network
 
 public final class OpenMetricsServer {
+    public static let defaultPort: Int = 9102
     public static let shared = OpenMetricsServer()
 
     private let lock = NSLock()
     private var listener: NWListener?
-    private var currentPort: Int = 9108
+    private var currentPort: Int = defaultPort
     private var isRunning: Bool = false
 
     public var running: Bool {
@@ -33,7 +34,7 @@ public final class OpenMetricsServer {
     private init() {}
 
     /// Starts the loopback HTTP server on the specified port.
-    public func start(port: Int = 9108) {
+    public func start(port: Int = 9102) {
         lock.lock()
         defer { lock.unlock() }
 
@@ -93,6 +94,7 @@ public final class OpenMetricsServer {
             l.cancel()
             listener = nil
             isRunning = false
+            currentPort = Self.defaultPort
             ConfigManager.shared.log("OpenMetrics server stopped")
         }
     }
@@ -103,7 +105,26 @@ public final class OpenMetricsServer {
     }
 
     private func receiveRequest(connection: NWConnection) {
+        let timeoutLock = NSLock()
+        var completed = false
+
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5.0) {
+            timeoutLock.lock()
+            let shouldCancel = !completed
+            completed = true
+            timeoutLock.unlock()
+            if shouldCancel {
+                connection.cancel()
+            }
+        }
+
         connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, _, _ in
+            timeoutLock.lock()
+            let alreadyTimedOut = completed
+            completed = true
+            timeoutLock.unlock()
+            if alreadyTimedOut { return }
+
             guard let self = self else {
                 connection.cancel()
                 return
@@ -221,13 +242,13 @@ public final class OpenMetricsServer {
         lines.append("# HELP disk_used_percent Volume capacity utilization percentage")
         lines.append("# TYPE disk_used_percent gauge")
         for drive in drives {
-            lines.append("disk_used_percent{\(labels(for: drive))} \(String(format: "%.2f", drive.usedPercent))")
+            lines.append("disk_used_percent{\(labels(for: drive))} \(formatPromFloat(drive.usedPercent, decimals: 2))")
         }
 
         lines.append("# HELP disk_io_latency_ms Recent read/write I/O latency in milliseconds")
         lines.append("# TYPE disk_io_latency_ms gauge")
         for drive in drives {
-            lines.append("disk_io_latency_ms{\(labels(for: drive))} \(String(format: "%.3f", max(drive.avgReadLatencyMs, drive.avgWriteLatencyMs)))")
+            lines.append("disk_io_latency_ms{\(labels(for: drive))} \(formatPromFloat(max(drive.avgReadLatencyMs, drive.avgWriteLatencyMs), decimals: 3))")
         }
 
         lines.append("# HELP disk_critical_warning_bitmask NVMe S.M.A.R.T. critical warning bitmask")
@@ -242,8 +263,91 @@ public final class OpenMetricsServer {
             lines.append("disk_media_errors{\(labels(for: drive))} \(drive.mediaErrors)")
         }
 
+        lines.append("# HELP disk_total_terabytes_written Lifetime host data written in terabytes")
+        lines.append("# TYPE disk_total_terabytes_written counter")
+        for drive in drives {
+            lines.append("disk_total_terabytes_written{\(labels(for: drive))} \(formatPromFloat(drive.totalTerabytesWritten, decimals: 3))")
+        }
+
+        lines.append("# HELP disk_total_terabytes_read Lifetime host data read in terabytes")
+        lines.append("# TYPE disk_total_terabytes_read counter")
+        for drive in drives {
+            lines.append("disk_total_terabytes_read{\(labels(for: drive))} \(formatPromFloat(drive.totalTerabytesRead, decimals: 3))")
+        }
+
+        lines.append("# HELP disk_power_on_hours Total cumulative device power on hours")
+        lines.append("# TYPE disk_power_on_hours counter")
+        for drive in drives {
+            lines.append("disk_power_on_hours{\(labels(for: drive))} \(drive.powerOnHours)")
+        }
+
+        lines.append("# HELP disk_power_cycles Total cumulative device power cycles")
+        lines.append("# TYPE disk_power_cycles counter")
+        for drive in drives {
+            lines.append("disk_power_cycles{\(labels(for: drive))} \(drive.powerCycles)")
+        }
+
+        lines.append("# HELP disk_unsafe_shutdowns Cumulative unsafe shutdowns / power loss events")
+        lines.append("# TYPE disk_unsafe_shutdowns counter")
+        for drive in drives {
+            lines.append("disk_unsafe_shutdowns{\(labels(for: drive))} \(drive.unsafeShutdowns)")
+        }
+
+        lines.append("# HELP disk_bus_phy_errors_total Hardware bus physical layer link CRC errors")
+        lines.append("# TYPE disk_bus_phy_errors_total counter")
+        for drive in drives {
+            lines.append("disk_bus_phy_errors_total{\(labels(for: drive))} \(drive.busErrorCount)")
+        }
+
+        lines.append("# HELP disk_bus_resets_total Hardware storage bus recovery resets")
+        lines.append("# TYPE disk_bus_resets_total counter")
+        for drive in drives {
+            lines.append("disk_bus_resets_total{\(labels(for: drive))} \(drive.busResetCount)")
+        }
+
+        lines.append("# HELP disk_canary_latency_ms Active filesystem canary probe round-trip latency in milliseconds")
+        lines.append("# TYPE disk_canary_latency_ms gauge")
+        for drive in drives {
+            lines.append("disk_canary_latency_ms{\(labels(for: drive))} \(formatPromFloat(drive.canaryLatencyMs, decimals: 2))")
+        }
+
+        lines.append("# HELP disk_canary_ok Active filesystem canary probe health status (1 = OK, 0 = failed)")
+        lines.append("# TYPE disk_canary_ok gauge")
+        for drive in drives {
+            lines.append("disk_canary_ok{\(labels(for: drive))} \(drive.canaryOk ? 1 : 0)")
+        }
+
+        lines.append("# HELP disk_driver_errors_total Cumulative Darwin IOKit driver read and write errors")
+        lines.append("# TYPE disk_driver_errors_total counter")
+        for drive in drives {
+            lines.append("disk_driver_errors_total{\(labels(for: drive))} \(drive.errorsRead + drive.errorsWritten)")
+        }
+
+        lines.append("# HELP disk_driver_retries_total Cumulative Darwin IOKit driver read and write retries")
+        lines.append("# TYPE disk_driver_retries_total counter")
+        for drive in drives {
+            lines.append("disk_driver_retries_total{\(labels(for: drive))} \(drive.retriesRead + drive.retriesWritten)")
+        }
+
+        lines.append("# HELP disk_rolling_30d_tbw_per_day Rolling 30-day linear regression write rate in TB/day")
+        lines.append("# TYPE disk_rolling_30d_tbw_per_day gauge")
+        for drive in drives {
+            lines.append("disk_rolling_30d_tbw_per_day{\(labels(for: drive))} \(formatPromFloat(drive.rolling30dTerabytesWrittenPerDay, decimals: 4))")
+        }
+
+        lines.append("# HELP disk_p95_write_latency_ms Bounded 95th percentile write latency in milliseconds")
+        lines.append("# TYPE disk_p95_write_latency_ms gauge")
+        for drive in drives {
+            lines.append("disk_p95_write_latency_ms{\(labels(for: drive))} \(formatPromFloat(drive.p95WriteLatencyMs, decimals: 3))")
+        }
+
         lines.append("")
         return lines.joined(separator: "\n")
+    }
+
+    private func formatPromFloat(_ value: Double, decimals: Int = 3) -> String {
+        guard value.isFinite else { return "0" }
+        return String(format: "%.\(decimals)f", value)
     }
 
     private func labels(for drive: DiskHealthSnapshot) -> String {

@@ -19,6 +19,12 @@ public struct SubprocessResult: Sendable {
     public var isSuccess: Bool {
         return exitCode == 0 && !timedOut
     }
+
+    public var combinedOutput: String {
+        if stdout.isEmpty { return stderr }
+        if stderr.isEmpty { return stdout }
+        return stdout + "\n" + stderr
+    }
 }
 
 public enum SubprocessRunner {
@@ -48,7 +54,12 @@ public enum SubprocessRunner {
         }
 
         var fileActions: posix_spawn_file_actions_t?
-        posix_spawn_file_actions_init(&fileActions)
+        let faInitRc = posix_spawn_file_actions_init(&fileActions)
+        guard faInitRc == 0 else {
+            close(outPipe[0]); close(outPipe[1])
+            close(errPipe[0]); close(errPipe[1])
+            return SubprocessResult(exitCode: -1, stdout: "", stderr: "Failed to init spawn file actions: errno \(faInitRc)", timedOut: false)
+        }
         posix_spawn_file_actions_adddup2(&fileActions, outPipe[1], STDOUT_FILENO)
         posix_spawn_file_actions_adddup2(&fileActions, errPipe[1], STDERR_FILENO)
         posix_spawn_file_actions_addclose(&fileActions, outPipe[0])
@@ -57,9 +68,15 @@ public enum SubprocessRunner {
         posix_spawn_file_actions_addclose(&fileActions, errPipe[1])
 
         var attr: posix_spawnattr_t?
-        posix_spawnattr_init(&attr)
-        // Isolate child into its own process group (pgid == childPid)
-        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETPGROUP))
+        let attrInitRc = posix_spawnattr_init(&attr)
+        guard attrInitRc == 0 else {
+            posix_spawn_file_actions_destroy(&fileActions)
+            close(outPipe[0]); close(outPipe[1])
+            close(errPipe[0]); close(errPipe[1])
+            return SubprocessResult(exitCode: -1, stdout: "", stderr: "Failed to init spawn attributes: errno \(attrInitRc)", timedOut: false)
+        }
+        // Isolate child into its own process group (pgid == childPid) and close all inherited file descriptors
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT))
         posix_spawnattr_setpgroup(&attr, 0)
 
         let argvStrings = [executable] + arguments

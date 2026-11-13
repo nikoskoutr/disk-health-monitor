@@ -20,8 +20,18 @@ Serialized via `exportDiagnosticReportJSON()` or `--export-diagnostics [path]`:
 
 #### 2. Standalone HTML Health & RMA Report
 Exported via `exportDiagnosticReportHTML()`, `--export-html [path]`, menu item (`⌘H`), or Settings UI:
-- **Zero-Dependency Styling**: Fully self-contained responsive CSS with dark/light mode compatibility.
-- **Hardware Summary & RMA Readiness**: Clear color-coded overall severity banner, drive serial number, model, bus speed, and operational counters formatted for hardware RMA submissions.
+- **Zero-Dependency Styling**: Fully self-contained 15-check responsive CSS report with dark/light mode compatibility, consuming the passed snapshot without triggering re-entrant monitor evaluation.
+- **Hardware Summary & RMA Readiness**: Color-coded severity banner, drive serial/model, HID die thermal visibility (`hasTemperature`), damaged physical LBA extents, APFS container pools, and operational counters for RMA submissions.
+
+---
+
+### [`OpenFileBlockerInspector.swift`](OpenFileBlockerInspector.swift)
+Bridges `DiskListOpenFileBlockers` (`DA-01`) with `startTimeSec` and fail-closed `isTerminatable` (`default: false`) to identify active processes holding open file descriptors on a mount, exposes `unmountVolume` via `SubprocessRunner`, and performs PID-reuse-safe termination (`DiskVerifyBlockerForTermination`) when user action explicitly terminates an external mount blocker.
+
+---
+
+### [`ProcessIoInspector.swift`](ProcessIoInspector.swift)
+Samples Darwin `<libproc.h>` `DiskSampleProcessIoMetrics` across a configurable interval (`--top-io`) and implements safe runaway process background I/O throttling (`PRIO_DARWIN_BG` via `DiskSetProcessBackgroundIoPriority`), sampling active culprits first and guarding protected system mounts and PIDs `<= 100`.
 - **Raw S.M.A.R.T. & Driver Statistics**: Visual tabular presentation of controller temperatures, wear levels, spare health, I/O errors, and canary latency.
 
 #### 3. Security & POSIX Permissions

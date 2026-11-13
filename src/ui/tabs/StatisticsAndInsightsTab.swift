@@ -291,20 +291,36 @@ struct StatisticsAndInsightsTab: View {
 
     @ViewBuilder
     private var apfsSnapshotsCard: some View {
+        let selectedDisk = activeDisks.first(where: { $0.driveKey == monitor.selectedDashboardDriveKey }) ?? activeDisks.first
+        let isMounted = selectedDisk?.isMounted == true && !(selectedDisk?.mountPoint.isEmpty ?? true)
+        let isApfs = selectedDisk?.filesystemType.lowercased() == "apfs" || (selectedDisk == nil)
+        let canManageSnapshots = isMounted && isApfs
+        let activeMount = isMounted ? selectedDisk!.mountPoint : (selectedDisk == nil ? "/" : "")
+
         SettingsCard(title: "APFS Local Snapshots & Retention (Time Machine)", icon: "camera.metering.matrix", iconColor: .teal) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Local Time Machine Snapshots")
+                        Text(canManageSnapshots ? "Local Time Machine Snapshots (\(activeMount))" : "Local Time Machine Snapshots")
                             .font(.system(size: 13, weight: .semibold))
-                        Text(viewModel.apfsSnapshots.isEmpty ? "No active local snapshots found on root volume." : "\(viewModel.apfsSnapshots.count) local snapshot\(viewModel.apfsSnapshots.count == 1 ? "" : "s") retaining historical volume state.")
-                            .font(.system(size: 11))
-                            .foregroundColor(.secondary)
+                        if !canManageSnapshots {
+                            Text("Selected volume is unmounted or not formatted with APFS.")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                        } else {
+                            let displayedMount = viewModel.apfsSnapshots.isEmpty ? activeMount : viewModel.apfsSnapshotsMount
+                            Text(viewModel.apfsSnapshots.isEmpty ? "No active local snapshots found on '\(activeMount)'." : "\(viewModel.apfsSnapshots.count) local snapshot\(viewModel.apfsSnapshots.count == 1 ? "" : "s") on '\(displayedMount)'.")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                        }
                     }
                     Spacer()
 
                     HStack(spacing: 8) {
-                        Button(action: { viewModel.loadApfsSnapshots() }) {
+                        Button(action: {
+                            guard canManageSnapshots else { return }
+                            viewModel.loadApfsSnapshots(mountPath: activeMount)
+                        }) {
                             HStack(spacing: 4) {
                                 if viewModel.isLoadingSnapshots {
                                     ProgressView().controlSize(.small)
@@ -315,16 +331,19 @@ struct StatisticsAndInsightsTab: View {
                             }
                             .font(.system(size: 11))
                         }
-                        .disabled(viewModel.isLoadingSnapshots)
+                        .disabled(!canManageSnapshots || viewModel.isLoadingSnapshots)
 
-                        Button(action: { viewModel.thinApfsSnapshots(targetGB: 20) }) {
+                        Button(action: {
+                            guard canManageSnapshots else { return }
+                            viewModel.thinApfsSnapshots(mountPath: activeMount, targetGB: 20)
+                        }) {
                             HStack(spacing: 4) {
                                 Image(systemName: "trash")
                                 Text("Thin Snapshots (20 GB)")
                             }
                             .font(.system(size: 11))
                         }
-                        .disabled(viewModel.isLoadingSnapshots || viewModel.apfsSnapshots.isEmpty)
+                        .disabled(!canManageSnapshots || viewModel.isLoadingSnapshots || viewModel.apfsSnapshots.isEmpty)
                     }
                 }
 
@@ -653,23 +672,12 @@ struct StatisticsAndInsightsTab: View {
                 }
 
                 let targetDisk = activeDisks.first(where: { $0.driveKey == monitor.selectedDashboardDriveKey }) ?? activeDisks.first
-                if let disk = targetDisk, disk.smartValid {
-                    VStack(spacing: 5) {
-                        smartRow(id: "01", name: "Critical Warning Bitmask", raw: String(format: "0x%02X", disk.criticalWarning), ok: disk.criticalWarning == 0)
-                        smartRow(id: "02", name: "Composite Temperature", raw: "\(disk.temperatureCelsius) °C (Peak: \(disk.peakTemperatureCelsius) °C)", ok: disk.temperatureCelsius < configMgr.config.tempWarningCelsius)
-                        smartRow(id: "03", name: "Available Spare Capacity", raw: "\(disk.availableSpare)% (Threshold: \(disk.availableSpareThreshold)%)", ok: disk.availableSpare > disk.availableSpareThreshold)
-                        smartRow(id: "04", name: "Percentage Used (Wear)", raw: "\(disk.percentageUsed)% Used (\(disk.lifeRemainingPercent)% Left)", ok: disk.percentageUsed < 80)
-                        smartRow(id: "05", name: "Data Units Read", raw: String(format: "%llu units (%.2f TB)", disk.dataUnitsRead, disk.totalTerabytesRead), ok: true)
-                        smartRow(id: "06", name: "Data Units Written (TBW)", raw: String(format: "%llu units (%.2f TB)", disk.dataUnitsWritten, disk.totalTerabytesWritten), ok: true)
-                        smartRow(id: "07", name: "Host Read Commands", raw: "\(disk.hostReadCommands)", ok: true)
-                        smartRow(id: "08", name: "Host Write Commands", raw: "\(disk.hostWriteCommands)", ok: true)
-                        smartRow(id: "09", name: "Controller Busy Time", raw: "\(disk.controllerBusyTime) min", ok: true)
-                        smartRow(id: "0A", name: "Power Cycles", raw: "\(disk.powerCycles) cycles", ok: true)
-                        smartRow(id: "0B", name: "Power-On Hours (POH)", raw: "\(disk.powerOnHours) hours (\(disk.powerOnHours / 24) days)", ok: true)
-                        smartRow(id: "0C", name: "Unsafe Shutdowns", raw: "\(disk.unsafeShutdowns) events", ok: true)
-                        smartRow(id: "0D", name: "Media & Data Integrity Errors", raw: "\(disk.mediaErrors) errors", ok: disk.mediaErrors == 0)
-                        smartRow(id: "0E", name: "Error Information Log Entries", raw: "\(disk.errorInfoLogEntries) entries", ok: disk.errorInfoLogEntries == 0)
-                    }
+                if let disk = targetDisk {
+                    SmartAttributesTableView(
+                        disk: disk,
+                        warningTempC: configMgr.config.tempWarningCelsius,
+                        compact: true
+                    )
                 } else {
                     Text("Hardware S.M.A.R.T. telemetry is not supported on this bus/device.")
                         .font(.system(size: 11))
@@ -681,25 +689,6 @@ struct StatisticsAndInsightsTab: View {
     }
 
     // MARK: - Component Helpers
-
-    private func smartRow(id: String, name: String, raw: String, ok: Bool) -> some View {
-        HStack(spacing: 8) {
-            Text(id)
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                .foregroundColor(.secondary)
-                .frame(width: 22, alignment: .leading)
-            Text(name)
-                .font(.system(size: 11))
-            Spacer()
-            Text(raw)
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundColor(ok ? .primary : .red)
-            Circle()
-                .fill(ok ? Color.green : Color.red)
-                .frame(width: 6, height: 6)
-        }
-        .padding(.vertical, 2)
-    }
 
     private func insightStatPill(title: String, value: String, color: Color) -> some View {
         VStack(alignment: .leading, spacing: 3) {

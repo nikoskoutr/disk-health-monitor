@@ -103,6 +103,15 @@ final class DiagnosticExporter: @unchecked Sendable {
                     "temperatureCelsius": d.temperatureCelsius,
                     "lifeRemainingPercent": d.lifeRemainingPercent,
                     "totalTerabytesWritten": d.totalTerabytesWritten,
+                    "smartSourceType": d.smartSourceTypeFormatted,
+                    "busErrorCount": d.busErrorCount,
+                    "busResetCount": d.busResetCount,
+                    "damagedExtentsCount": d.damagedExtents.count,
+                    "rolling7dTBPerDay": d.rolling7dTerabytesWrittenPerDay,
+                    "rolling30dTBPerDay": d.rolling30dTerabytesWrittenPerDay,
+                    "p95WriteLatencyMs": d.p95WriteLatencyMs,
+                    "p95TemperatureCelsius": d.p95TemperatureCelsius,
+                    "isControllerUnresponsive": d.isControllerUnresponsive,
                     "issuesCount": d.issues.count
                 ]
             },
@@ -199,6 +208,42 @@ final class DiagnosticExporter: @unchecked Sendable {
                 "webhookUrl": ConfigManager.shared.resolvedWebhookUrl.isEmpty ? "None" : "•••••••• (Protected)",
                 "alertScriptPath": ConfigManager.shared.resolvedAlertScriptPath.isEmpty ? "None" : ConfigManager.shared.resolvedAlertScriptPath
             ],
+            "damagedExtents": snap.damagedExtents.map { ext in
+                [
+                    "logicalOffset": ext.logicalOffset,
+                    "physicalOffset": ext.physicalLbaOffset,
+                    "length": ext.contiguousBytes,
+                    "filePath": ext.filePath
+                ]
+            },
+            "busIntegrity": [
+                "busErrorCount": snap.busErrorCount,
+                "busResetCount": snap.busResetCount,
+                "smartSourceType": snap.smartSourceTypeFormatted,
+                "isControllerUnresponsive": snap.isControllerUnresponsive
+            ],
+            "rollingForecasts": [
+                "rolling7dTBPerDay": snap.rolling7dTerabytesWrittenPerDay,
+                "rolling30dTBPerDay": snap.rolling30dTerabytesWrittenPerDay,
+                "p95WriteLatencyMs": snap.p95WriteLatencyMs,
+                "p95TemperatureCelsius": snap.p95TemperatureCelsius
+            ],
+            "apfsContainer": { () -> Any in
+                guard let c = snap.apfsContainer else { return NSNull() }
+                return [
+                    "containerBsd": c.containerBsd,
+                    "totalBytes": c.totalCapacityBytes,
+                    "freeBytes": c.freeSpaceBytes,
+                    "volumes": c.volumes.map { v in
+                        [
+                            "bsdName": v.bsdName,
+                            "volumeName": v.name,
+                            "role": v.role,
+                            "usedBytes": v.usedBytes
+                        ] as [String: Any]
+                    }
+                ] as [String: Any]
+            }(),
             "recentLogLines": recentLogLines
         ]
         return report
@@ -239,8 +284,10 @@ final class DiagnosticExporter: @unchecked Sendable {
     }
 
     func exportDiagnosticReportHTML(snapshot: DiskHealthSnapshot? = nil) -> String {
-        let snap = snapshot ?? DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: false, persistState: false)
-        let multi = DiskHealthMonitor.shared.currentMultiSnapshot ?? DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: true, allowNotifications: false, persistState: false)
+        let snap = snapshot ?? DiskHealthMonitor.shared.currentSnapshot ?? DiskHealthMonitor.shared.evaluateHealth(forceCanary: true, allowNotifications: false, persistState: false)
+        let multi: MultiDiskHealthSnapshot? = (snapshot != nil)
+            ? DiskHealthMonitor.shared.currentMultiSnapshot
+            : (DiskHealthMonitor.shared.currentMultiSnapshot ?? DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: true, allowNotifications: false, persistState: false))
         let esc = TelegramNotifier.shared.escapeHTML
         let badgeColor: String = {
             switch snap.overallSeverity {
@@ -251,7 +298,7 @@ final class DiagnosticExporter: @unchecked Sendable {
         }()
 
         var fleetSection = ""
-        if multi.disks.count > 1 {
+        if let multi = multi, multi.disks.count > 1 {
             var fleetRows = ""
             for d in multi.disks {
                 let statusColor = d.overallSeverity == .healthy ? "#10b981" : (d.overallSeverity == .warning ? "#f59e0b" : "#ef4444")
@@ -260,7 +307,7 @@ final class DiagnosticExporter: @unchecked Sendable {
                   <td><b>\(esc(d.vendorName)) \(esc(d.productName))</b></td>
                   <td><code>\(esc(d.bsdName))</code></td>
                   <td><code>\(esc(d.mountPoint.isEmpty ? "Unmounted" : d.mountPoint))</code></td>
-                  <td>\(d.smartValid ? "\(d.temperatureCelsius)°C" : "N/A")</td>
+                  <td>\(d.hasTemperature ? "\(d.temperatureCelsius)°C" : "N/A")</td>
                   <td>\(d.smartValid ? "\(d.lifeRemainingPercent)% Left" : "N/A")</td>
                   <td>\(d.smartValid ? String(format: "%.2f TBW", d.totalTerabytesWritten) : "N/A")</td>
                   <td><span style='color:\(statusColor);font-weight:700;'>\(esc(d.overallSeverity.rawValue)) (\(d.healthScore)%)</span></td>
@@ -286,11 +333,46 @@ final class DiagnosticExporter: @unchecked Sendable {
 
         var issuesRows = ""
         if snap.issues.isEmpty {
-            issuesRows = "<tr><td colspan='3' style='color:#10b981;font-weight:600;'>✅ All 12 hardware, thermal, and filesystem health checks passed.</td></tr>"
+            issuesRows = "<tr><td colspan='3' style='color:#10b981;font-weight:600;'>✅ All 15 hardware, thermal, and filesystem health checks passed.</td></tr>"
         } else {
             for issue in snap.issues {
                 issuesRows += "<tr><td><b>\(esc(issue.severity.rawValue))</b></td><td><code>\(esc(issue.code))</code></td><td><b>\(esc(issue.title))</b>: \(esc(issue.detail))</td></tr>"
             }
+        }
+
+        var apfsContainerSection = ""
+        if let container = snap.apfsContainer {
+            var volRows = ""
+            for v in container.volumes {
+                volRows += "<tr><td><code>\(esc(v.bsdName))</code></td><td>\(esc(v.name))</td><td><span class='badge' style='background:#3b82f6;padding:2px 8px;font-size:11px;'>\(esc(v.role))</span></td><td>\(formatBytes(v.usedBytes))</td></tr>\n"
+            }
+            apfsContainerSection = """
+            <div class="card">
+              <h2>4. APFS Container Pool (\(esc(container.containerBsd)))</h2>
+              <p>Pool Capacity: \(formatBytes(container.totalCapacityBytes)) • Free: \(formatBytes(container.freeSpaceBytes))</p>
+              <table>
+                <tr><th>BSD</th><th>Name</th><th>Role</th><th>Used</th></tr>
+                \(volRows)
+              </table>
+            </div>
+            """
+        }
+
+        var damagedExtentsSection = ""
+        if !snap.damagedExtents.isEmpty {
+            var extRows = ""
+            for ext in snap.damagedExtents {
+                extRows += "<tr><td><code>\(esc(ext.filePath))</code></td><td>\(ext.logicalOffset)</td><td><code>0x\(String(ext.physicalLbaOffset, radix: 16))</code></td><td>\(ext.contiguousBytes) B</td></tr>\n"
+            }
+            damagedExtentsSection = """
+            <div class="card">
+              <h2>5. Pinpointed Bad Extents (Physical LBA Mapping)</h2>
+              <table>
+                <tr><th>File Path</th><th>Logical Offset</th><th>Physical Byte Offset</th><th>Length</th></tr>
+                \(extRows)
+              </table>
+            </div>
+            """
         }
 
         return """
@@ -330,7 +412,7 @@ final class DiagnosticExporter: @unchecked Sendable {
           <div class="card">
             <h2>2. NVMe S.M.A.R.T. &amp; Kernel Driver Telemetry</h2>
             <table>
-              <tr><th>Temperature</th><td>\(snap.smartValid ? "\(snap.temperatureCelsius)°C (Peak: \(snap.peakTemperatureCelsius)°C)" : "N/A")</td></tr>
+              <tr><th>Temperature</th><td>\(snap.hasTemperature ? (snap.smartValid ? "\(snap.temperatureCelsius)°C (Peak: \(snap.peakTemperatureCelsius)°C)" : "\(snap.temperatureCelsius)°C (Die Sensor)") : "N/A")</td></tr>
               <tr><th>SSD Wear &amp; Available Spare</th><td>\(snap.smartValid ? "\(snap.lifeRemainingPercent)% Life Remaining (Used: \(snap.percentageUsed)%, Available Spare: \(snap.availableSpare)% / Thresh: \(snap.availableSpareThreshold)%)" : "N/A")</td></tr>
               <tr><th>Lifetime Data Read / Written</th><td>\(snap.smartValid ? String(format: "%.2f TB Written (TBW) / %.2f TB Read", snap.totalTerabytesWritten, snap.totalTerabytesRead) : "N/A")</td></tr>
               <tr><th>Power Cycles / Hours / Unsafe</th><td>\(snap.smartValid ? "Cycles: \(snap.powerCycles) • POH: \(snap.powerOnHours)h • Unsafe Shutdowns: \(snap.unsafeShutdowns)" : "N/A")</td></tr>
@@ -339,7 +421,18 @@ final class DiagnosticExporter: @unchecked Sendable {
             </table>
           </div>
           <div class="card">
-            <h2>3. Active Health Findings</h2>
+            <h2>3. Bus Signal Integrity &amp; Endurance Forecasts</h2>
+            <table>
+              <tr><th>SMART Source Type</th><td>\(esc(snap.smartSourceTypeFormatted))</td></tr>
+              <tr><th>Bus PHY Errors &amp; Resets</th><td>PHY Errors: \(snap.busErrorCount) • Resets: \(snap.busResetCount) • Controller Unresponsive: \(snap.isControllerUnresponsive ? "YES" : "NO")</td></tr>
+              <tr><th>Rolling TBW Forecasts</th><td>7-Day: \(String(format: "%.3f TB/day", snap.rolling7dTerabytesWrittenPerDay)) • 30-Day: \(String(format: "%.3f TB/day", snap.rolling30dTerabytesWrittenPerDay))</td></tr>
+              <tr><th>Bounded p95 Operating Metrics</th><td>Write Latency: \(String(format: "%.2f ms", snap.p95WriteLatencyMs)) • Temperature: \(snap.p95TemperatureCelsius)°C</td></tr>
+            </table>
+          </div>
+          \(apfsContainerSection)
+          \(damagedExtentsSection)
+          <div class="card">
+            <h2>6. Active Health Findings</h2>
             <table>
               <tr><th>Severity</th><th>Rule Code</th><th>Description</th></tr>
               \(issuesRows)

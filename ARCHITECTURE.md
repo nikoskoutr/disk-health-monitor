@@ -2,7 +2,7 @@
 
 **Standard:** arc42 Architecture Template (v8.2) & C4 Model-as-Code (Mermaid)  
 **System:** Universal macOS Disk Health Monitor & Telemetry Agent  
-**Version:** `v2.6.0` (Build 9)  
+**Version:** `v3.2.0` (Build 15)  
 **Target Architectures:** Universal Binary (`arm64` Apple Silicon & `x86_64` Intel)  
 **Target Platform:** macOS 13.0 (Ventura) through macOS 15+ (Sequoia)  
 
@@ -139,26 +139,30 @@ flowchart TD
         subgraph ContainerUI["Presentation Container (AppKit & SwiftUI)"]
             AppDelegate["AppDelegate.swift<br/>NSStatusItem & Sleep/Mount Listeners"]
             DashMenu["DashboardMenuView.swift<br/>Popover Telemetry Card & Fleet Selector"]
-            SettingsCtrl["SettingsWindowController & ViewModel<br/>Ephemeral NSWindow & 6 Config Tabs"]
+            SettingsCtrl["SettingsWindowController & ViewModel<br/>Ephemeral NSWindow & 7 Config Tabs"]
         end
 
         subgraph ContainerEngine["Telemetry & Domain Engine"]
-            EngineCoord["DiskHealthMonitor.swift<br/>Multi-Disk Coordinator, Baselines & Cooldowns"]
-            RulePipeline["HealthRules.swift<br/>12 Pure Functional Sendable Rules"]
-            ProbeSvc["CanaryProbeService.swift<br/>512B Sector-Aligned F_NOCACHE Probe"]
-            VerifySvc["VolumeVerifierService.swift<br/>diskutil Runner & Process Tree Killer"]
-            ScanSvc["SurfaceScannerService.swift<br/>Direct I/O Sector Reader with ETA"]
+            EngineCoord["DiskHealthMonitor.swift<br/>Lock-Split Coordinator & Phase A/B Pipeline"]
+            StateStore["PersistentStateStore.swift<br/>flock State Persistence & Baselines"]
+            ProberSvc["ParallelDriveProber.swift<br/>4-Worker Pool & 120s Circuit Breaker"]
+            RulePipeline["HealthRules.swift<br/>15 Pure Functional Sendable Rules"]
+            ActionSvc["ActionRuleEngine.swift<br/>Declarative When-Then Automation"]
+            ProbeSvc["CanaryProbeService.swift<br/>4096B Page-Aligned F_NOCACHE Probe"]
+            VerifySvc["VolumeVerifierService.swift<br/>diskutil Runner via SubprocessRunner"]
+            ScanSvc["SurfaceScannerService.swift<br/>Direct I/O Reader & LBA Extent Pinpointer"]
         end
 
         subgraph ContainerInfra["Security, Config & Diagnostics"]
             CfgMgr["ConfigManager.swift<br/>5-Tier Precedence & Rotating 5MB Logger"]
-            SecStore["SecretStore.swift & AtomicFileWriter<br/>Opt-in Keychain State Machine & 0600 Writer"]
-            DiagExp["DiagnosticExporter.swift<br/>Sanitized JSON & Standalone HTML RMA Generator"]
-            NotifAdapters["Notifiers<br/>macOS UserNotifications, Telegram, Webhook"]
+            SecStore["SecretStore.swift & SubprocessRunner<br/>Opt-in Keychain, 0600 Writer & PGID Isolation"]
+            DiagExp["DiagnosticExporter.swift & Inspectors<br/>JSON/HTML RMA, Blocker & Process I/O Inspectors"]
+            NetSrv["OpenMetricsServer.swift<br/>127.0.0.1:9102 Loopback HTTP Server"]
+            NotifAdapters["AlertCoordinator & Notifiers<br/>Hysteresis, UserNotifications, Telegram, Webhook"]
         end
 
         subgraph ContainerBridge["Hardware Abstraction Layer (C11)"]
-            BridgeC["DiskHealthBridge.c / .h<br/>IORegistry Traversal, APFS Pruner, 128-bit NVMe Reader, Static Cache"]
+            BridgeC["DiskHealthBridge.c, DiskProcessBridge.c, DiskPowerHidBridge.c<br/>IOKit SMART/APFS, libproc Blockers/Signals, Dark Wake & HID Die Temp"]
         end
     end
 
@@ -196,30 +200,40 @@ flowchart TD
         L4_AppDel["src/ui/AppDelegate.swift"]
         L4_Dash["src/ui/DashboardMenuView.swift"]
         L4_SetVM["src/ui/SettingsViewModel.swift"]
-        L4_Tabs["src/ui/tabs/*.swift (6 Tabs)"]
+        L4_Tabs["src/ui/tabs/*.swift (7 Tabs)"]
     end
 
     subgraph Layer3["Layer 3: Core Domain & Services Engine"]
         L3_Mon["src/engine/DiskHealthMonitor.swift"]
-        L3_Rules["src/engine/HealthRules.swift"]
+        L3_Prober["src/engine/ParallelDriveProber.swift"]
+        L3_State["src/engine/PersistentStateStore.swift"]
+        L3_Rules["src/engine/HealthRules.swift (15 Rules)"]
+        L3_Auto["src/engine/ActionRuleEngine.swift"]
+        L3_Hist["src/engine/TelemetryHistoryStore.swift"]
+        L3_Pwr["src/engine/PowerManagementService.swift"]
+        L3_Apfs["src/engine/ApfsSnapshotService.swift"]
         L3_Canary["src/engine/CanaryProbeService.swift"]
         L3_Scan["src/engine/SurfaceScannerService.swift"]
         L3_Ver["src/engine/VolumeVerifierService.swift"]
         L3_TelProv["src/engine/TelemetryProvider.swift"]
-        L3_Diag["src/diagnostics/DiagnosticExporter.swift"]
+        L3_Diag["src/diagnostics/*.swift"]
+        L3_Net["src/network/OpenMetricsServer.swift"]
         L3_Notif["src/notifications/*.swift"]
     end
 
     subgraph Layer2["Layer 2: Infrastructure, Security & Persistence"]
         L2_Cfg["src/config/ConfigManager.swift"]
+        L2_Sub["src/security/SubprocessRunner.swift"]
         L2_Sec["src/security/SecretStore.swift"]
         L2_Lock["src/security/SingleInstanceLock.swift"]
-        L2_Mod["src/models/HealthModels.swift"]
+        L2_Mod["src/models/HealthModels.swift & AutomationModels.swift"]
         L2_Err["src/models/DiskHealthError.swift"]
     end
 
     subgraph Layer1["Layer 1: Low-Level Darwin C11 Hardware Bridge"]
         L1_Bridge["src/bridge/DiskHealthBridge.c"]
+        L1_Proc["src/bridge/DiskProcessBridge.c"]
+        L1_Pwr["src/bridge/DiskPowerHidBridge.c"]
         L1_H["src/bridge/DiskHealthBridge.h"]
     end
 
@@ -232,26 +246,36 @@ flowchart TD
 
 | Component File | Subsystem | Core Responsibilities & Invariants |
 | :--- | :--- | :--- |
-| `src/bridge/DiskHealthBridge.c` | Hardware Bridge | Traverses `IOBlockStorageDevice` and `IONVMeSMARTUserClient`. Prunes virtual APFS child subtrees to prevent physical BSD name clobbering. Implements `sStaticCache` ring-buffer memoizing invariant hardware strings per `IORegistryEntryID`. |
-| `src/engine/TelemetryProvider.swift` | Domain Engine | Defines `DiskTelemetryProvider` protocol. Implements `IOKitTelemetryProvider` combining C bridge hardware metrics with Darwin `statfs` and APFS purgeable space accounting. Implements `MockTelemetryProvider` for deterministic fault injection. |
-| `src/engine/DiskHealthMonitor.swift` | Domain Engine | Central orchestrator managing single-disk and fleet-wide (`evaluateAllMonitoredDisks`) evaluations, baseline delta tracking, scoped alert cooldowns, dirty-state persistence, and `@MainActor` thread decoupling. |
-| `src/engine/HealthRules.swift` | Domain Engine | 12 pure functional, side-effect-free `HealthRule` implementations mapping `HealthEvaluationContext` to `HealthRuleOutcome` (`issues`, `scorePenalty`, `logMessages`). |
-| `src/engine/CanaryProbeService.swift` | Active Probing | Performs sector-aligned (512-byte) in-place `pwrite`/`fsync`/`pread` probes with `F_NOCACHE` and 300s mount caching. Implements `0400` orphan self-healing. |
-| `src/engine/VolumeVerifierService.swift` | Filesystem Verification | Asynchronously spawns `/usr/sbin/diskutil verifyVolume` with a 180s watchdog, terminates child process trees (`pkill -P`), and classifies exit codes (`-69863` privilege vs `-69845` corruption). |
-| `src/engine/SurfaceScannerService.swift` | Media Inspection | Reads allocated storage using 4KB sector buffers and `fcntl(fd, F_NOCACHE, 1)` across `quick` (64 MB), `standard` (2 GB), and `full` modes with ETA calculation and cancellation tokens. |
-| `src/config/ConfigManager.swift` | Configuration | Resolves 5-tier configuration precedence (`CLI > Env > .env > config.json > Defaults`), handles JSON serialization, masks credentials, and manages the 5 MB rotating log. |
-| `src/security/SecretStore.swift` | Security | Manages the opt-in Keychain state machine (`KeychainIntegrationState`) to guarantee zero unprompted modal dialogs during daemon operation. Implements `AtomicFileWriter` (`0600` POSIX write + `fsync` + `rename`). |
+| `src/bridge/DiskHealthBridge.c` | Hardware Bridge | Traverses `IOBlockStorageDevice` and `IONVMeSMARTUserClient` (`sSmartClientMutex`, 2s TTL). Prunes virtual APFS child subtrees to prevent physical BSD name clobbering. Implements 64-entry `sStaticCache` ring-buffer with dynamic bus PHY counter refresh. |
+| `src/bridge/DiskProcessBridge.c` | Process & Blocker Bridge | Darwin `<libproc.h>` `DiskSampleProcessIoMetrics`, firmlink-aware `DiskListOpenFileBlockers` / `DiskListProcessOpenFilesOnMount`, PID-reuse-safe `DiskVerifyBlockerForTermination`, and `PRIO_DARWIN_BG` throttling. |
+| `src/bridge/DiskPowerHidBridge.c` | Power & HID Bridge | Thread-safe `DiskIsDarkWakeActive` (`CGSessionCopyCurrentDictionary` via `pthread_once`) and `DiskReadAppleSiliconStorageDieTemperature` (HID sensor with 5s/60s `CLOCK_UPTIME_RAW` TTL). |
+| `src/engine/TelemetryProvider.swift` | Domain Engine | Defines `DiskTelemetryProvider` protocol (`inspectFilesystem`, `checkSubpaths`, `runCanaryProbe`, `isDarkWakeActive`, `inspectApfsContainer`), live `IOKitTelemetryProvider`, and `MockTelemetryProvider`. |
+| `src/engine/ParallelDriveProber.swift` | Parallel Probing | Bounded 4-worker `OperationQueue` executing slow VFS, canary, subpath, and APFS probes unlocked with 3.0s circuit breaker, `inFlightMounts` dedupe, and 120s auto-recovery quarantine (exempting internal/`/`). |
+| `src/engine/PersistentStateStore.swift` | State Persistence | Manages `state.json` load/migration, `flock(LOCK_EX)` dirty-gated saves, `latest_status.json`, baseline synchronization, and `resetBaselines()`. |
+| `src/engine/DiskHealthMonitor.swift` | Domain Engine | Orchestrates Phase A unlocked parallel probing and Phase B `engineLock` evaluation, delegates alerts to `AlertCoordinator`, and runs `ActionRuleEngine`. |
+| `src/engine/HealthRules.swift` | Domain Engine | 15 pure functional, side-effect-free `HealthRule` implementations mapping `HealthEvaluationContext` to `HealthRuleOutcome` (`issues`, `scorePenalty`, `logMessages`). |
+| `src/engine/CanaryProbeService.swift` | Active Probing | Performs 4096-byte page-aligned in-place `pwrite`/`F_FULLFSYNC`/`pread` probes with `F_NOCACHE` and 300s mount caching. Implements `0400` orphan self-healing. |
+| `src/engine/VolumeVerifierService.swift` | Filesystem Verification | Spawns `/usr/sbin/diskutil verifyVolume` via `SubprocessRunner` (isolated PGID, 180s watchdog) and classifies exit codes (`-69863` privilege vs `-69845` corruption). |
+| `src/engine/SurfaceScannerService.swift` | Media Inspection | Reads allocated storage using 4KB buffers and `F_NOCACHE` across `quick`, `standard`, and `full` modes, pinpointing bad LBA extents (`F_LOG2PHYS`) even on resolution failure. |
+| `src/engine/PowerManagementService.swift` | Power Lifecycle | Manages Dark Wake detection, `IOPMAssertion` anti-idle locks, and `kIOMessageSystemWillSleep` pre-sleep external unmount shield. |
+| `src/engine/ApfsSnapshotService.swift` | Snapshot Control | Validates APFS mounts and invokes `tmutil` local snapshot listing and thinning via `SubprocessRunner`. |
+| `src/engine/TelemetryHistoryStore.swift` | Historical Telemetry | Bounded 180-point `history.json` ring buffer + isolated 90-day hourly JSONL archives with OLS wear regression and 512KB/24h gated pruning. |
+| `src/notifications/AlertCoordinator.swift` | Alert Dispatch | Coordinates 2-poll transient hysteresis, 900s recovery cooldowns, `BUS_PHY_ERRORS` baseline advancement, digests, and async multi-channel delivery. |
+| `src/security/SubprocessRunner.swift` | Process Isolation | `posix_spawn` (`POSIX_SPAWN_SETPGROUP`) runner checking init allocations, capping streams at 1 MiB, and performing zombie-safe `-pgid` `SIGTERM`/`SIGKILL` teardown. |
+| `src/network/OpenMetricsServer.swift` | Metrics Server | Loopback `NWListener` (`127.0.0.1:9102`) with 5s receive timeout serving Prometheus `/metrics`, `/status.json`, and `/healthz`. |
+| `src/config/ConfigManager.swift` | Configuration | Resolves 5-tier precedence via shared `applyKeyValueMap`, handles JSON serialization, masks credentials, and manages the 5 MB rotating log. |
+| `src/security/SecretStore.swift` | Security | Manages the opt-in Keychain state machine (`KeychainIntegrationState`) and `AtomicFileWriter` (`0600` POSIX write + `fsync` + `rename`). |
 | `src/security/SingleInstanceLock.swift` | Concurrency | Enforces single-instance execution via non-blocking `flock(2)` on `menubar.lock` with `O_NOFOLLOW` symlink attack protection. |
-| `src/diagnostics/DiagnosticExporter.swift` | Diagnostics | Compiles JSON diagnostic bundles and standalone HTML health reports with embedded SVGs and reverse-seek boundary-safe log tailing (`SYS2-01`). |
-| `src/ui/AppDelegate.swift` | UI Presentation | Manages `NSStatusItem`, status bar title caching (truncated to $\le 18$ characters), workspace mount notifications, and sleep/wake power notifications. |
-| `src/ui/DashboardMenuView.swift` | UI Presentation | SwiftUI popover displaying the selected drive's health gauge, lifetime writes, temperature, SMART attributes, fleet pill switcher, and quick actions. |
-| `src/ui/SettingsViewModel.swift` | UI Presentation | Coordinates two-way SwiftUI bindings, launchd plist generation, alert script testing, and manages the ephemeral lifecycle of `SettingsWindowController`. |
+| `src/diagnostics/DiagnosticExporter.swift` | Diagnostics | Compiles JSON diagnostic bundles and 15-check standalone HTML RMA reports without re-entrant monitor evaluation, plus UTF-8 safe `readLastLogLines`. |
+| `src/ui/AppDelegate.swift` | UI Presentation | Manages `NSStatusItem`, HID die temperature + SMART title formatting, coalesced refreshes, workspace mount notifications, and sleep/wake listeners. |
+| `src/ui/DashboardMenuView.swift` | UI Presentation | SwiftUI popover displaying drive health gauge, lifetime writes, temperature (SMART/HID), fleet pill switcher, and quick actions. |
+| `src/ui/SettingsViewModel.swift` | UI Presentation | Coordinates two-way SwiftUI bindings, `SubprocessRunner`-based `launchctl` toggle, offloaded unmount/blocker actions, and ephemeral `SettingsWindowController`. |
 
 ---
 
 ## 6. Runtime View (Operational Sequences & State Machines)
 
-### 6.1 Multi-Disk Fleet Polling Sequence
+### 6.1 Multi-Disk Fleet Polling Sequence (Phase A Unlocked Probe + Phase B Locked Evaluation)
 The core evaluation cycle executed periodically by `AppDelegate` or triggered on-demand via CLI flags:
 
 ```mermaid
@@ -260,33 +284,29 @@ sequenceDiagram
     participant Timer as Polling Timer (30s)
     participant Mon as DiskHealthMonitor
     participant Prov as IOKitTelemetryProvider
-    participant Bridge as DiskHealthBridge.c
-    participant Canary as CanaryProbeService
+    participant Bridge as src/bridge/*.c
+    participant Prober as ParallelDriveProber (4 Workers)
     participant Rules as StandardHealthRulePipeline
-    participant Disk as AtomicFileWriter (0600)
+    participant Alerts as AlertCoordinator & PersistentStateStore
 
     Timer->>Mon: evaluateAllMonitoredDisks(forceCanary, allowNotifications)
     activate Mon
-    Note over Mon: Acquire engineLock
+    Note over Mon: Phase A (Unlocked): enumerate + parallel VFS/canary/APFS probes
     Mon->>Prov: listAllDevices(maxCount: 32)
     Prov->>Bridge: DiskListAllDevices(&rawDevices, 32)
-    Bridge-->>Prov: DiskHardwareMetrics[] (Static cache + live SMART/driver stats)
+    Bridge-->>Prov: DiskHardwareMetrics[] (Static cache + SMART/HID temp + driver stats)
+    Mon->>Prober: probeAll(targets, timeoutSeconds: 3.0)
+    Prober->>Prov: inspectFilesystem, checkSubpaths, inspectApfsContainer, runCanaryProbe
+    Prober-->>Mon: [driveKey: DriveProbeResult] (with quarantine circuit breaker)
+    Note over Mon: Phase B (Acquire engineLock): deterministic rule evaluation & state swap
     loop For each physical drive
-        Mon->>Prov: findMountPoint(forBsdName: dev.bsdName)
-        Prov->>Bridge: DiskFindMountForBlockDevice() (stackFs[64] + slice resolution)
-        Bridge-->>Prov: Resolved mount path (e.g. "/" or "/Volumes/T7")
-        Mon->>Prov: inspectFilesystem(mountPath) (statfs + APFS purgeable space)
-        alt Volume Mounted & Canary Enabled & !isSystemSleeping
-            Mon->>Canary: runCanaryCheck(targetMount, force, nowTs)
-            Canary-->>Mon: CanaryProbeResult (cached 300s or live 512B probe)
-        end
-        Mon->>Rules: evaluate(context: HealthEvaluationContext) across 12 Pure Rules
+        Mon->>Rules: evaluate(context: HealthEvaluationContext) across 15 Pure Rules
         Rules-->>Mon: HealthRuleOutcome (issues, scorePenalty, logMessages)
-        Mon->>Mon: Update per-drive baseline state & evaluate scoped alert cooldowns
+        Mon->>Mon: Consolidate final DiskHealthSnapshot & update baselines
+        Mon->>Alerts: processAlertTransitions & dispatchNotificationsAsync
     end
-    Mon->>Mon: Aggregate MultiDiskHealthSnapshot (worstSeverity, worstScore, avgScore)
-    Mon->>Disk: Write latest_status.json & state.json (only if dirty)
-    Note over Mon: Release engineLock & dispatch @Published updates to Main Thread
+    Mon->>Alerts: PersistentStateStore saveStateLocked & saveLatestStatus (flock 0600)
+    Note over Mon: Release engineLock & publish @Published snapshots via DispatchQueue.main
     deactivate Mon
 ```
 
@@ -388,9 +408,9 @@ flowchart TD
 
 ### 7.2 Release Artifacts Pipeline (`build_and_install.sh`)
 When executed with the `--package` flag, `build_and_install.sh` produces verified distribution artifacts in `dist/`:
-- `DiskHealthMonitor-v2.6.0-macOS-universal.dmg`: Apple Disk Image containing `DiskHealthMonitor.app` and `/Applications` symlink.
-- `DiskHealthMonitor-v2.6.0-macOS-universal.zip`: Compressed application bundle.
-- `disk-health-v2.6.0-cli-universal.tar.gz`: Standalone universal Mach-O CLI binary and installation helper.
+- `DiskHealthMonitor-v3.2.0-macOS-universal.dmg`: Apple Disk Image containing `DiskHealthMonitor.app` and `/Applications` symlink.
+- `DiskHealthMonitor-v3.2.0-macOS-universal.zip`: Compressed application bundle.
+- `disk-health-v3.2.0-cli-universal.tar.gz`: Standalone universal Mach-O CLI binary and installation helper.
 - `SHA256SUMS.txt`: Cryptographic SHA-256 checksums of all release packages.
 
 ---
@@ -491,10 +511,10 @@ The system architecture is verified across 5 distinct testing tiers certifying e
 ```mermaid
 flowchart TD
     subgraph TestSuite["Automated Verification Suite (tests/run_tests.sh)"]
-        T1["[1/5] C11 / IOKit Bridge Unit Tests<br/>(16 C Tests in test_disk_health_bridge.c)"]
-        T2["[2/5] Swift Core Engine & Domain Unit Tests<br/>(48 Swift Tests in test_core_logic.swift)"]
-        T3["[3/5] CLI Integration & Detachment Tests<br/>(14 Command-Line Flags & Session Checks)"]
-        T4["[4/5] Exporters & Surface Scanner Verification<br/>(JSON, Standalone HTML, Quick F_NOCACHE Scan)"]
+        T1["[1/5] C11 / IOKit Bridge Unit Tests<br/>(26 C Tests in test_disk_health_bridge.c)"]
+        T2["[2/5] Swift Core Engine & Domain Unit Tests<br/>(68 Swift Tests in test_core_logic.swift)"]
+        T3["[3/5] CLI Integration & Detachment Tests<br/>(Command-Line Flags & Session Checks)"]
+        T4["[4/5] Exporters & Surface Scanner Verification<br/>(JSON, Standalone HTML, F_NOCACHE Scans)"]
         T5["[5/5] Bundle Assets & Layout Integrity<br/>(AppIcon.icns, Info.plist, Logs Directory)"]
     end
 
@@ -517,8 +537,8 @@ flowchart TD
 
 | Verification Stage | Test Target | Key Assertions & Scenarios | Architectural Guarantee |
 | :---: | :--- | :--- | :--- |
-| **Stage 1** | `test_disk_health_bridge` | Tests 1–16: Registry traversal, APFS pruning, SATA/USB vs PCIe link speed parsing, NVMe 128-bit saturation, temperature clamping (-40°C to 150°C), 64-entry static cache hit/miss. | Zero memory leaks in C, balanced `CFRelease`/`IOObjectRelease`. |
-| **Stage 2** | `test_core_logic` | Tests 1–48: Pure health rules, atomic 0600 file writes, SecretStore state machine, 4096B page-aligned canary with `F_FULLFSYNC`, orphan self-healing, log secret redaction & burst deduplication, transient alert hysteresis. | Deterministic domain evaluation, acyclic lock hierarchy, thread safety. |
+| **Stage 1** | `test_disk_health_bridge` | Tests 1–26: Registry traversal, APFS pruning & container roles, SATA/USB vs PCIe link speeds, NVMe 128-bit saturation, temperature clamping & HID fallback, 64-entry static cache, libproc I/O & scoped blockers, Dark Wake. | Zero memory leaks in C, balanced `CFRelease`/`IOObjectRelease`. |
+| **Stage 2** | `test_core_logic` | Tests 1–68: 15 pure health rules, atomic 0600 writes, SecretStore state machine, 4096B page-aligned canary with `F_FULLFSYNC`, ParallelDriveProber circuit breaker, ActionRuleEngine, 90d OLS history, OpenMetrics, SubprocessRunner PGID timeout. | Deterministic domain evaluation, acyclic lock hierarchy, thread safety. |
 | **Stage 3** | CLI Integration | `--help`, `--version`, `--list-disks`, `--status`, `--all`, `--json`, `--check`, `--watch-mounts`, `--deep`, `POSIX_SPAWN_SETSID` detachment. | Dual-mode bootstrap correctness, deterministic exit status codes (`0`, `1`, `2`). |
 | **Stage 4** | Exporters & Scanners | `--export-config`, `--import-config`, `--export-diagnostics`, `--export-html`, `--surface-scan quick`. | Credential masking, valid HTML/SVG generation, non-destructive media read verification. |
 | **Stage 5** | Packaging Integrity | Directory structure, `assets/AppIcon.icns`, `Info.plist` bundle identifiers. | Clean macOS bundle structure and LaunchAgent compatibility. |

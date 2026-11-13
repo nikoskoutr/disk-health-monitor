@@ -1,0 +1,258 @@
+version: "3.2.0"
+build: "15"
+document: "PRODUCT_DESIGN_ROADMAP.yaml"
+role: "Lead Product Designer & Engineering Co-Architect"
+consultant: "Gemini 4 Argon"
+date: "2026-10-30"
+
+stakeholders:
+  - id: SH-01
+    name: "Mac Power User & Systems Developer"
+    archetype: "Existing Core User"
+    primary_needs:
+      - "Zero-overhead menu bar visibility into internal Apple Silicon SSD wear (TBW), thermal throttling, and APFS swap bloat."
+      - "Instant resolution of 'Disk Not Ejected Properly' / busy volume locks without dropping into Terminal to run lsof."
+      - "Protection of external USB-C/Thunderbolt NVMe scratch drives during macOS sleep/wake cycles."
+    current_pain_points:
+      - "Clicking 'Inspect Open Files & Eject' in DashboardMenuView opens Tab 4 (Statistics & Insights), which lacks an OpenFileBlockerInspector UI and cannot terminate blocking processes or force unmount."
+      - "SurfaceScannerService updates lastDamagedExtents in memory, but DiskHealthMonitor never copies damagedExtents into DiskHealthSnapshot, leaving SmartInspectorTab's 'Pinpointed Bad Extents' card permanently empty."
+      - "APFS Local Snapshots card in StatisticsAndInsightsTab is hardcoded to scan and thin '/' instead of the currently selected external or secondary APFS volume."
+    unlocked_by_product:
+      - "Sub-millisecond C11 IOKit hardware bridge with zero external dependencies, deterministic CLI exit codes, and native SwiftUI popover telemetry."
+
+  - id: SH-02
+    name: "Homelab, Mac mini Server & NAS Operator"
+    archetype: "Existing Headless / Automation User"
+    primary_needs:
+      - "Unattended 24/7 monitoring of multi-bay USB/Thunderbolt DAS enclosures attached to headless Mac mini / Mac Studio servers."
+      - "Scrapeable Prometheus/OpenMetrics telemetry (/metrics) and instant Telegram/Discord/Slack/Webhook alerts on bus resets, thermal spikes, or read-only journal faults."
+      - "Circuit-breaker isolation when a single cheap USB bridge hangs in kernel D-state."
+    current_pain_points:
+      - "ParallelDriveProber (CONC-03) is implemented in src/engine/ParallelDriveProber.swift, but DiskHealthMonitor never invokes it—still executing provider.inspectFilesystem and runCanaryProbe synchronously under engineLock."
+      - "OpenMetricsServer is not automatically started when the Menu Bar app launches even if metricsServerEnabled == true in config.json (only starts when toggled in SettingsViewModel or run via --metrics-server CLI)."
+      - "OpenMetricsServer exposes only 9 basic metrics and omits critical v3.0+ telemetry: total_tb_written, total_tb_read, power_on_hours, unsafe_shutdowns, bus_error_count, bus_reset_count, canary_latency_ms, and rolling_30d_tbw_rate."
+    unlocked_by_product:
+      - "Built-in Network.framework OpenMetrics server, multi-channel webhooks, and declarative 'When X, Do Y' automation rules."
+
+  - id: SH-03
+    name: "Creative Pro, DIT (Digital Imaging Technician) & Video Editor"
+    archetype: "Existing High-Bandwidth Storage User"
+    primary_needs:
+      - "Verification that shuttle drives and Thunderbolt 3/4 NVMe RAID/scratch disks negotiate at full 10G/20G/40Gbps link speed and x4 PCIe lane width before ingesting camera cards."
+      - "Detection of cable/hub PHY CRC errors and USB bus power brownouts (mA requested vs available)."
+      - "Fast, non-destructive F_NOCACHE surface read verification with live throughput and physical bad-block pinpointing."
+    current_pain_points:
+      - "Pre-Sleep External Drive Shield (PowerManagementService.startPreSleepShield) is never called in AppDelegate.applicationDidFinishLaunching when preSleepShieldEnabled is true in config.json, leaving external shuttle drives unprotected on sleep unless enabled via CLI first."
+      - "ActionTriggerMetric.systemWillSleep is defined in the rule engine enum, but evaluateRuleCondition hardcodes 'return (false, ...)' and PowerManagementService never triggers ActionRuleEngine on kIOMessageSystemWillSleep."
+    unlocked_by_product:
+      - "Real-time USB/Thunderbolt link speed degradation rules, PHY error counters, and active 4KB page-aligned F_NOCACHE canary probes."
+
+  - id: SH-04
+    name: "Enterprise Mac Fleet / MDM Administrator & CI/CD Infra Engineer"
+    archetype: "New Target Stakeholder"
+    primary_needs:
+      - "Fleet-wide deployment on GitHub Actions / Tart / Anka macOS build runners and corporate developer Macs to catch dying internal SSDs or runaway build-cache TBW burn before CI jobs fail with ENOSPC or EROFS."
+      - "Automated background process I/O throttling (PRIO_DARWIN_BG) and APFS snapshot thinning when CI runners hit disk pressure."
+    current_pain_points:
+      - "ProcessIoInspector.throttleRunawayProcess prohibits throttling on '/' even for non-system user processes (e.g., runaway node/cargo/xcodebuild processes), limiting its usefulness on single-volume macOS CI runners."
+      - "TelemetryHistoryStore appendArchiveRecord appends to ~/.config/disk-health-monitor/history/<driveKey>.jsonl indefinitely without enforcing the advertised 90-day retention pruning on disk."
+    unlocked_by_product:
+      - "Zero-dependency Universal binary, 0600 atomic state/config files, zero unprompted Keychain popups, and JSON/Prometheus telemetry."
+
+  - id: SH-05
+    name: "Hardware Refurbisher, Field Tech & RMA Certifier"
+    archetype: "New Target Stakeholder"
+    primary_needs:
+      - "One-click or single-CLI-command certification of used Macs and external SSDs producing tamper-evident, customer-ready HTML/JSON RMA reports with surface scan results, SMART register dumps, and bad-extent LBA maps."
+    current_pain_points:
+      - "DiagnosticExporter HTML and JSON reports omit v3.0+ telemetry (busErrorCount, busResetCount, damagedExtents, apfsContainer role breakdown, rolling 7d/30d TBW forecasts, p95 latency/temp, and smartSourceType)."
+    unlocked_by_product:
+      - "Standalone dark/print-styled HTML RMA exporter and F_LOG2PHYS physical extent resolver."
+
+use_cases:
+  - id: UC-01
+    title: "Interactive Unmount Blocker Resolution & Safe Eject"
+    stakeholder_id: "SH-01"
+    type: "existing"
+    flow_summary: "User clicks 'Inspect Open Files & Eject' on an external drive in the Menu Bar popover, views exact PIDs and file paths holding open vnodes on that mount via DiskListOpenFileBlockers, and clicks 'Unmount' or 'Force Unmount'."
+    current_limitations: "Broken end-to-end UX flow. Clicking the button in DashboardMenuView opens Tab 4 (StatisticsAndInsightsTab), which has no UI for OpenFileBlockerInspector."
+
+  - id: UC-02
+    title: "Fault-Isolated Parallel Multi-Disk Polling with Circuit Breaker"
+    stakeholder_id: "SH-02"
+    type: "existing"
+    flow_summary: "Daemon polls 4+ internal and external drives in parallel using ParallelDriveProber with a 3.0s timeout per mount; if an external USB enclosure enters kernel D-state, its mount is quarantined and flagged with IO_CONTROLLER_UNRESPONSIVE (-55 score) without stalling healthy drives."
+    current_limitations: "Dead code path. ParallelDriveProber is never called by DiskHealthMonitor, and ControllerQuarantineRule is documented in AGENTS.md but missing from HealthRules.swift."
+
+  - id: UC-03
+    title: "Automated Pre-Sleep External Drive Unmount Shield"
+    stakeholder_id: "SH-03"
+    type: "existing"
+    flow_summary: "User enables 'Pre-Sleep External Drive Shield' in General Settings; when macOS prepares to sleep (kIOMessageSystemWillSleep), the app unmounts external volumes and evaluates any .systemWillSleep automation rules before acknowledging IOAllowPowerChange."
+    current_limitations: "AppDelegate never calls PowerManagementService.shared.startPreSleepShield() on launch, and .systemWillSleep rules never fire."
+
+  - id: UC-04
+    title: "Physical Bad-Block LBA Mapping into SMART Inspector & RMA Reports"
+    stakeholder_id: "SH-05"
+    type: "existing"
+    flow_summary: "Technician runs a Surface Scan (Quick/Standard/Full); any EIO/ENXIO/ETIMEDOUT read error resolves its physical LBA offset via F_LOG2PHYS_EXT, populates snapshot.damagedExtents, renders in SmartInspectorTab, and exports into the HTML/JSON RMA report."
+    current_limitations: "SurfaceScannerService stores lastDamagedExtents internally, but DiskHealthMonitor never attaches them to DiskHealthSnapshot, and DiagnosticExporter omits them."
+
+  - id: UC-05
+    title: "Headless Prometheus & Grafana Fleet Monitoring"
+    stakeholder_id: "SH-02"
+    type: "new"
+    flow_summary: "Homelab operator enables the OpenMetrics HTTP server in Settings (or config.json); the Menu Bar agent automatically starts the listener on launch and serves comprehensive SMART, bus PHY, latency, and endurance metrics at 127.0.0.1:9102/metrics."
+    current_limitations: "Default port mismatch between docs (9102) and code (9108); server does not auto-start on app launch; missing TBW, POH, bus error, and p95 metrics."
+
+  - id: UC-06
+    title: "Per-Volume APFS Local Snapshot Management"
+    stakeholder_id: "SH-01"
+    type: "new"
+    flow_summary: "User selects any mounted APFS drive in the dashboard or Statistics tab, inspects local Time Machine snapshots on that specific mount point, and thins snapshots to reclaim space."
+    current_limitations: "StatisticsAndInsightsTab hardcodes '/' when calling loadApfsSnapshots() and thinApfsSnapshots()."
+
+  - id: UC-07
+    title: "CI/CD Runner Disk Pressure Shield & Safe User Process Throttling"
+    stakeholder_id: "SH-04"
+    type: "new"
+    flow_summary: "CI runner agent detects runaway compiler or cache disk write rate on single-disk runner; throttles user-space process (PRIO_DARWIN_BG) while preserving system stability."
+    current_limitations: "ProcessIoInspector hard-rejects any throttling target when mount is '/', even for user processes in /Users/."
+
+  - id: UC-08
+    title: "Unified Zombie-Safe Subprocess Alert Pipeline"
+    stakeholder_id: "SH-02"
+    type: "existing"
+    flow_summary: "Alert scripts execute in POSIX_SPAWN_SETPGROUP process groups with 15s watchdog; clean timeout escalation without PID recycling or buffer deadlocks."
+    current_limitations: "DiskHealthMonitor.testAlertScriptResult uses legacy Foundation.Process and pkill instead of unified SubprocessRunner."
+
+listOfChanges:
+  - id: CHG-01
+    title: "Wire ParallelDriveProber & ControllerQuarantineRule into DiskHealthMonitor Pipeline"
+    category: "issue"
+    target_stakeholders: ["SH-01", "SH-02", "SH-03", "SH-04"]
+    core_benefits: "Eliminates main-engine lock stalls when an external USB/Thunderbolt controller hangs in kernel D-state and activates the 15th health rule (IO_CONTROLLER_UNRESPONSIVE)."
+    description: >
+      1. In DiskHealthMonitor.evaluateAllMonitoredDisks and evaluateSingleTargetLocked, integrate ParallelDriveProber.shared.probeAll (when using live IOKitTelemetryProvider) or check ParallelDriveProber.shared.isMountQuarantined so filesystem statfs and canary probes execute with the 3.0s circuit breaker.
+      2. Populate DiskHealthSnapshot.isControllerUnresponsive and smartSourceType.
+      3. Add ControllerQuarantineRule to HealthRules.swift and StandardHealthRulePipeline.defaultRules.
+      4. Clear quarantined mount state in AppDelegate.volumeMountChanged when a volume is remounted.
+    impact: "high"
+    complexity: "medium"
+    files_affected:
+      - "src/engine/DiskHealthMonitor.swift"
+      - "src/engine/ParallelDriveProber.swift"
+      - "src/engine/HealthRules.swift"
+      - "src/models/HealthModels.swift"
+      - "src/ui/AppDelegate.swift"
+
+  - id: CHG-02
+    title: "Build Interactive 'Open File Blockers & Safe Eject' Card and Fix Dashboard Deep-Link"
+    category: "issue"
+    target_stakeholders: ["SH-01", "SH-03"]
+    core_benefits: "Completes the broken 'Inspect Open Files & Eject' workflow so users can see and resolve processes locking a volume directly from the UI."
+    description: >
+      1. Add an 'Open File Blockers & Safe Volume Unmount (DA-01)' SettingsCard in DiagnosticsAndExportTab bound to viewModel.openFileBlockers and the currently selected drive's mountPoint.
+      2. Provide action buttons in the card: 'Scan Open Files', 'Safe Unmount', and 'Force Unmount', displaying status feedback in the UI.
+      3. Update DashboardMenuView's 'Inspect Open Files & Eject' button to trigger viewModel.inspectOpenFileBlockers(mountPath: snap.mountPoint) and navigate to DiagnosticsAndExportTab (tab 6).
+    impact: "high"
+    complexity: "low"
+    files_affected:
+      - "src/ui/DashboardMenuView.swift"
+      - "src/ui/SettingsViewModel.swift"
+      - "src/ui/tabs/DiagnosticsAndExportTab.swift"
+
+  - id: CHG-03
+    title: "Propagate SurfaceScannerService Damaged Physical Extents into DiskHealthSnapshot & RMA Reports"
+    category: "issue"
+    target_stakeholders: ["SH-01", "SH-03", "SH-05"]
+    core_benefits: "Surfaces pinpointed physical LBA bad sectors in the S.M.A.R.T. Inspector UI, JSON/HTML RMA reports, and health evaluations after a surface scan."
+    description: >
+      1. Key SurfaceScannerService.lastDamagedExtents by mountPoint (e.g. damagedExtentsByMount: [String: [DamagedPhysicalExtent]]) so multi-disk scans do not overwrite each other.
+      2. In DiskHealthMonitor.evaluateSingleTargetLocked, populate finalSnapshot.damagedExtents = SurfaceScannerService.shared.damagedExtents(forMount: fsMetrics.mountPoint).
+      3. When damaged extents are recorded by a surface scan, trigger a snapshot refresh so SmartInspectorTab immediately displays the 'Pinpointed Bad Extents (Physical LBA Mapping)' card.
+      4. Include damagedExtents, busErrorCount, busResetCount, smartSourceType, apfsContainer, and rolling 7d/30d TBW forecasts in DiagnosticExporter.generateDiagnosticReport and exportDiagnosticReportHTML.
+    impact: "high"
+    complexity: "low"
+    files_affected:
+      - "src/engine/SurfaceScannerService.swift"
+      - "src/engine/DiskHealthMonitor.swift"
+      - "src/diagnostics/DiagnosticExporter.swift"
+
+  - id: CHG-04
+    title: "Auto-Start Pre-Sleep Shield & OpenMetrics Server on Launch + Wire .systemWillSleep Rules"
+    category: "issue"
+    target_stakeholders: ["SH-01", "SH-02", "SH-03"]
+    core_benefits: "Ensures configured background services (Pre-Sleep Shield and Prometheus HTTP exporter) actually start when the Menu Bar agent launches, and makes .systemWillSleep automation rules functional."
+    description: >
+      1. In AppDelegate.applicationDidFinishLaunching, call PowerManagementService.shared.startPreSleepShield(), and if ConfigManager.shared.currentConfig.metricsServerEnabled is true, start OpenMetricsServer.shared.start(port: cfg.metricsServerPort).
+      2. In ConfigManager.setPreSleepShield(enabled:), call PowerManagementService.shared.startPreSleepShield() when enabled is true.
+      3. In PowerManagementService.handlePowerMessage (on kIOMessageSystemWillSleep), evaluate enabled ActionRules where triggerMetric == .systemWillSleep across mounted drives before calling IOAllowPowerChange.
+      4. Update ActionRuleEngine.evaluateRuleCondition for .systemWillSleep so simulated/triggered pre-sleep events match deterministically.
+    impact: "high"
+    complexity: "medium"
+    files_affected:
+      - "src/ui/AppDelegate.swift"
+      - "src/config/ConfigManager.swift"
+      - "src/engine/PowerManagementService.swift"
+      - "src/engine/ActionRuleEngine.swift"
+
+  - id: CHG-05
+    title: "Expand OpenMetrics / Prometheus Exporter with Full v3.1 Telemetry"
+    category: "improvement"
+    target_stakeholders: ["SH-02", "SH-04"]
+    core_benefits: "Provides complete observability for Grafana dashboards without scraping JSON endpoints."
+    description: >
+      Extend OpenMetricsServer.generatePrometheusMetrics() to export gauges/counters for:
+      - disk_total_terabytes_written & disk_total_terabytes_read
+      - disk_rolling_30d_tbw_per_day & disk_p95_write_latency_ms
+      - disk_power_on_hours, disk_power_cycles, & disk_unsafe_shutdowns
+      - disk_bus_phy_errors_total & disk_bus_resets_total
+      - disk_canary_latency_ms & disk_canary_ok
+      - disk_driver_errors_total & disk_driver_retries_total
+      Harmonize default metricsServerPort across ConfigManager, OpenMetricsServer, main.swift, and AGENTS.md to 9102.
+    impact: "medium"
+    complexity: "low"
+    files_affected:
+      - "src/network/OpenMetricsServer.swift"
+      - "src/config/ConfigManager.swift"
+      - "src/main.swift"
+      - "AGENTS.md"
+
+  - id: CHG-06
+    title: "Scope APFS Local Snapshot Inspector & Cleaner to Selected Drive Mount Point"
+    category: "improvement"
+    target_stakeholders: ["SH-01", "SH-03"]
+    core_benefits: "Allows inspecting and thinning APFS snapshots on external APFS volumes or secondary containers rather than only '/'."
+    description: >
+      In StatisticsAndInsightsTab.apfsSnapshotsCard, resolve the selected drive's mount point (let targetMount = selectedDisk?.mountPoint.isEmpty == false ? selectedDisk!.mountPoint : "/") and pass mountPath: targetMount to viewModel.loadApfsSnapshots(mountPath:) and viewModel.thinApfsSnapshots(mountPath:targetGB:), displaying the active mount path in the card subtitle.
+    impact: "medium"
+    complexity: "low"
+    files_affected:
+      - "src/ui/tabs/StatisticsAndInsightsTab.swift"
+
+  - id: CHG-07
+    title: "Enforce 90-Day Retention Pruning & Atomic Compaction on JSONL History Archives"
+    category: "optimization"
+    target_stakeholders: ["SH-02", "SH-04"]
+    core_benefits: "Prevents unbounded disk growth in ~/.config/disk-health-monitor/history/<driveKey>.jsonl over multi-month daemon operation while keeping 0600 permissions."
+    description: >
+      In TelemetryHistoryStore.appendArchiveRecord, periodically (when file size exceeds 512 KB or once per 24h per drive) prune JSONL lines with timestamp < now - 90 * 86400 and rewrite the compacted archive via AtomicFileWriter.writeRestricted(..., permissions: 0o600).
+    impact: "medium"
+    complexity: "low"
+    files_affected:
+      - "src/engine/TelemetryHistoryStore.swift"
+
+  - id: CHG-08
+    title: "Unify Alert Script Execution onto SubprocessRunner & Allow Safe User-PID Throttling"
+    category: "optimization"
+    target_stakeholders: ["SH-01", "SH-02", "SH-04"]
+    core_benefits: "Eliminates legacy Foundation.Process + /usr/bin/pkill -P race in DiskHealthMonitor alert hooks (completing PROC-04) and allows throttling non-system user processes on single-volume Macs."
+    description: >
+      1. Refactor DiskHealthMonitor.testAlertScriptResult and executeAlertScriptAsync to use SubprocessRunner.run(executable:arguments:environment:timeoutSeconds: 15.0) instead of Process() + VolumeVerifierService.terminateProcessAndChildren, ensuring POSIX_SPAWN_SETPGROUP zombie-safe process group termination everywhere.
+      2. In ProcessIoInspector.throttleRunawayProcess(forMount:), allow throttling user-owned processes (pid > 100 and not in exemptNames) even when mountPath == "/" if the process's open file path is inside /Users/ or /Volumes/ (while keeping /System and /private strictly exempt).
+    impact: "medium"
+    complexity: "low"
+    files_affected:
+      - "src/engine/DiskHealthMonitor.swift"
+      - "src/diagnostics/ProcessIoInspector.swift"

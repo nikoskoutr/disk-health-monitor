@@ -444,8 +444,8 @@ int main(void) {
 
     printf("\n=== Test 18: SAT ATA & NVMe SMART Source Types (v2.9.0) ===\n");
     for (int i = 0; i < count; i++) {
-        // smartSourceType must be one of 0 (Native NVMe), 1 (SAT ATA), 2 (USB Vendor NVMe)
-        assert(devices[i].smartSourceType <= 2);
+        // smartSourceType: 0 (None), 1 (Native NVMe), 2 (SAT ATA), 3 (USB Vendor NVMe)
+        assert(devices[i].smartSourceType <= 3);
     }
     printf("  SMART source types verified across all block devices\n");
 
@@ -552,6 +552,35 @@ int main(void) {
     assert(smartCtx.mismatchCount == 0);
     printf("  Concurrent 3-thread NVMe SMART queries verified (0 kIOReturnNotPermitted drops)\n");
 
-    printf("\n=== All 24 Bridge Tests Passed Successfully! ===\n");
+    printf("\n=== Test 25: Apple Silicon Storage Die Temperature Fallback (DiskReadAppleSiliconStorageDieTemperature) ===\n");
+    int32_t dieTemp = DiskReadAppleSiliconStorageDieTemperature();
+#if defined(__arm64__) || defined(__aarch64__)
+    printf("  Apple Silicon NAND die sensor query: %d C\n", dieTemp);
+    assert(dieTemp >= 0 && dieTemp < 120);
+#else
+    printf("  Non-ARM platform: die sensor query returned: %d C (fallback safe)\n", dieTemp);
+    assert(dieTemp >= 0);
+#endif
+    printf("  DiskReadAppleSiliconStorageDieTemperature verified\n");
+
+    printf("\n=== Test 26: Signal & Process Safety Helpers (DiskVerifyProcessForSignal & DiskIsSafeUserSpaceProcess) ===\n");
+    bool isZombie = false;
+    assert(!DiskVerifyProcessForSignal(1, "launchd", true, &isZombie)); // PID 1 rejected for safety
+    assert(!DiskVerifyProcessForSignal(getpid(), NULL, true, &isZombie)); // self PID rejected
+    assert(!DiskVerifyProcessForSignal(999999, NULL, false, &isZombie)); // non-existent PID rejected
+    assert(!DiskIsSafeUserSpaceProcess(1)); // launchd is not a user process
+
+    DiskFileBlocker scopedBlockers[4];
+    memset(scopedBlockers, 0, sizeof(scopedBlockers));
+    assert(DiskListProcessOpenFilesOnMount(0, "/", scopedBlockers, 4) == 0);
+    assert(DiskListProcessOpenFilesOnMount(getpid(), NULL, scopedBlockers, 4) == 0);
+    assert(DiskListProcessOpenFilesOnMount(getpid(), "/Nonexistent/Mount/999", scopedBlockers, 4) == 0);
+
+    assert(!DiskVerifyBlockerForTermination(1, 0, "launchd", NULL, &isZombie));
+    assert(!DiskVerifyBlockerForTermination(getpid(), 1, "wrong_proc_name", NULL, &isZombie));
+    assert(!DiskVerifyBlockerForTermination(getpid(), 0, NULL, "/Nonexistent/Mount/999", &isZombie));
+    printf("  Process safety verification and scoped blocker helpers verified\n");
+
+    printf("\n=== All 26 Bridge Tests Passed Successfully! ===\n");
     return 0;
 }

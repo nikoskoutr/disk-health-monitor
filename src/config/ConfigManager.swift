@@ -41,7 +41,7 @@ struct DiskHealthConfig: Codable, Equatable {
     var enableActionRulesEngine: Bool = true
     var actionRules: [ActionRule] = ActionRule.defaultStarterRules
     var metricsServerEnabled: Bool = false
-    var metricsServerPort: Int = 9108
+    var metricsServerPort: Int = 9102
     var preSleepShieldEnabled: Bool = false
 
     init() {}
@@ -335,6 +335,7 @@ final class ConfigManager: ObservableObject, @unchecked Sendable {
             searchPaths.append("\(currentDir)/.env")
         }
 
+        var dotEnvMap: [String: String] = [:]
         for path in searchPaths {
             guard FileManager.default.fileExists(atPath: path),
                   ConfigManager.isSecureUserOwnedFile(atPath: path),
@@ -347,110 +348,69 @@ final class ConfigManager: ObservableObject, @unchecked Sendable {
                 if parts.count == 2 {
                     let key = parts[0].trimmingCharacters(in: .whitespaces)
                     let val = parts[1].trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-                    if val.isEmpty { continue }
-
-                    switch key {
-                    case "DISK_HEALTH_VOLUME":
-                        result.targetVolumePath = val
-                    case "DISK_HEALTH_DEVICE":
-                        result.targetDeviceQuery = val
-                    case "MONITOR_ALL_DISKS":
-                        result.monitorAllDisks = (val.lowercased() == "true" || val == "1" || val.lowercased() == "yes")
-                    case "DISK_HEALTH_TARGETS":
-                        result.monitoredTargets = val.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-                    case "DISK_HEALTH_REQUIRED_SUBPATHS":
-                        result.requiredSubpaths = val.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-                    case "ENABLE_ACTIVE_CANARY":
-                        result.enableActiveCanary = (val.lowercased() == "true" || val == "1" || val.lowercased() == "yes")
-                    case "ENABLE_NATIVE_NOTIFICATIONS":
-                        result.enableNativeNotifications = (val.lowercased() == "true" || val == "1" || val.lowercased() == "yes")
-                    case "ENABLE_CRITICAL_SOUND_ALERT":
-                        result.enableCriticalSoundAlert = (val.lowercased() == "true" || val == "1" || val.lowercased() == "yes")
-                    case "SCHEDULED_VERIFY_INTERVAL_HOURS":
-                        if let v = Int(val), v >= 0 { result.scheduledVerifyIntervalHours = v }
-                    case "POLL_INTERVAL_SECONDS":
-                        if let v = TimeInterval(val), v >= 5.0 { result.pollIntervalSeconds = v }
-                    case "ALERT_COOLDOWN_SECONDS":
-                        if let v = TimeInterval(val), v >= 0.0 { result.alertCooldownSeconds = v }
-                    case "MIN_EXPECTED_USB_SPEED_BPS":
-                        if let v = UInt64(val) { result.minExpectedUsbSpeedBps = v }
-                    case "TELEGRAM_BOT_TOKEN":
-                        foundToken = val
-                    case "TELEGRAM_CHAT_ID":
-                        foundChatId = val
-                        result.telegramChatId = val
-                    case "WEBHOOK_URL":
-                        foundWebhook = val
-                        result.webhookUrl = val
-                    case "ALERT_SCRIPT_PATH":
-                        result.alertScriptPath = val
-                    case "TEMP_WARNING_CELSIUS":
-                        if let v = Int(val) { result.tempWarningCelsius = v }
-                    case "TEMP_CRITICAL_CELSIUS":
-                        if let v = Int(val) { result.tempCriticalCelsius = v }
-                    case "DISK_USED_WARNING_PERCENT":
-                        if let v = Double(val) { result.diskUsedWarningPercent = v }
-                    case "DISK_USED_CRITICAL_PERCENT":
-                        if let v = Double(val) { result.diskUsedCriticalPercent = v }
-                    case "MIN_FREE_SPACE_CRITICAL_GB":
-                        if let v = Double(val) { result.minFreeSpaceCriticalGB = v }
-                    case "MIN_FREE_SPACE_WARNING_GB":
-                        if let v = Double(val) { result.minFreeSpaceWarningGB = v }
-                    default:
-                        break
+                    if !val.isEmpty {
+                        dotEnvMap[key] = val
                     }
                 }
             }
             break // Stop after first valid .env file is loaded
         }
+        result = applyKeyValueMap(dotEnvMap, into: result)
+        foundToken = dotEnvMap["TELEGRAM_BOT_TOKEN"]
+        foundChatId = dotEnvMap["TELEGRAM_CHAT_ID"]
+        foundWebhook = dotEnvMap["WEBHOOK_URL"]
         return (result, foundToken, foundChatId, foundWebhook)
     }
 
     static func applyEnvironmentVariables(into cfg: DiskHealthConfig, env: [String: String] = ProcessInfo.processInfo.environment) -> DiskHealthConfig {
+        return applyKeyValueMap(env, into: cfg)
+    }
+
+    private static func parseBoolFlag(_ val: String) -> Bool {
+        let lower = val.lowercased()
+        return lower == "true" || val == "1" || lower == "yes" || lower == "on"
+    }
+
+    private static func applyKeyValueMap(_ map: [String: String], into cfg: DiskHealthConfig) -> DiskHealthConfig {
         var result = cfg
-        if let v = env["DISK_HEALTH_VOLUME"], !v.isEmpty { result.targetVolumePath = v }
-        if let v = env["DISK_HEALTH_DEVICE"], !v.isEmpty { result.targetDeviceQuery = v }
-        if let v = env["MONITOR_ALL_DISKS"], !v.isEmpty {
-            result.monitorAllDisks = (v.lowercased() == "true" || v == "1" || v.lowercased() == "yes")
-        }
-        if let v = env["DISK_HEALTH_TARGETS"], !v.isEmpty {
+        if let v = map["DISK_HEALTH_VOLUME"], !v.isEmpty { result.targetVolumePath = v }
+        if let v = map["DISK_HEALTH_DEVICE"], !v.isEmpty { result.targetDeviceQuery = v }
+        if let v = map["MONITOR_ALL_DISKS"], !v.isEmpty { result.monitorAllDisks = parseBoolFlag(v) }
+        if let v = map["DISK_HEALTH_TARGETS"], !v.isEmpty {
             result.monitoredTargets = v.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         }
-        if let v = env["DISK_HEALTH_REQUIRED_SUBPATHS"], !v.isEmpty {
+        if let v = map["DISK_HEALTH_REQUIRED_SUBPATHS"], !v.isEmpty {
             result.requiredSubpaths = v.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         }
-        if let v = env["ENABLE_ACTIVE_CANARY"], !v.isEmpty {
-            result.enableActiveCanary = (v.lowercased() == "true" || v == "1" || v.lowercased() == "yes")
-        }
-        if let v = env["ENABLE_NATIVE_NOTIFICATIONS"], !v.isEmpty {
-            result.enableNativeNotifications = (v.lowercased() == "true" || v == "1" || v.lowercased() == "yes")
-        }
-        if let v = env["ENABLE_CRITICAL_SOUND_ALERT"], !v.isEmpty {
-            result.enableCriticalSoundAlert = (v.lowercased() == "true" || v == "1" || v.lowercased() == "yes")
-        }
-        if let v = env["SCHEDULED_VERIFY_INTERVAL_HOURS"], let val = Int(v), val >= 0 {
+        if let v = map["ENABLE_ACTIVE_CANARY"], !v.isEmpty { result.enableActiveCanary = parseBoolFlag(v) }
+        if let v = map["ENABLE_NATIVE_NOTIFICATIONS"], !v.isEmpty { result.enableNativeNotifications = parseBoolFlag(v) }
+        if let v = map["ENABLE_CRITICAL_SOUND_ALERT"], !v.isEmpty { result.enableCriticalSoundAlert = parseBoolFlag(v) }
+        if let v = map["SCHEDULED_VERIFY_INTERVAL_HOURS"], let val = Int(v), val >= 0 {
             result.scheduledVerifyIntervalHours = val
         }
-        if let v = env["POLL_INTERVAL_SECONDS"], let val = TimeInterval(v), val >= 5.0 { result.pollIntervalSeconds = val }
-        if let v = env["ALERT_COOLDOWN_SECONDS"], let val = TimeInterval(v), val >= 0.0 { result.alertCooldownSeconds = val }
-        if let v = env["MIN_EXPECTED_USB_SPEED_BPS"], let val = UInt64(v) { result.minExpectedUsbSpeedBps = val }
-        if let v = env["TELEGRAM_CHAT_ID"], !v.isEmpty { result.telegramChatId = v }
-        if let v = env["WEBHOOK_URL"], !v.isEmpty { result.webhookUrl = v }
-        if let v = env["ALERT_SCRIPT_PATH"], !v.isEmpty { result.alertScriptPath = v }
-        if let v = env["TEMP_WARNING_CELSIUS"], let val = Int(v) { result.tempWarningCelsius = val }
-        if let v = env["TEMP_CRITICAL_CELSIUS"], let val = Int(v) { result.tempCriticalCelsius = val }
-        if let v = env["DISK_USED_WARNING_PERCENT"], let val = Double(v) { result.diskUsedWarningPercent = val }
-        if let v = env["DISK_USED_CRITICAL_PERCENT"], let val = Double(v) { result.diskUsedCriticalPercent = val }
-        if let v = env["MIN_FREE_SPACE_CRITICAL_GB"], let val = Double(v) { result.minFreeSpaceCriticalGB = val }
-        if let v = env["MIN_FREE_SPACE_WARNING_GB"], let val = Double(v) { result.minFreeSpaceWarningGB = val }
-        if let v = env["DISK_HEALTH_METRICS_ENABLED"], !v.isEmpty {
-            result.metricsServerEnabled = (v.lowercased() == "true" || v == "1" || v.lowercased() == "yes")
+        if let v = map["POLL_INTERVAL_SECONDS"], let val = TimeInterval(v), val >= 5.0 { result.pollIntervalSeconds = val }
+        if let v = map["ALERT_COOLDOWN_SECONDS"], let val = TimeInterval(v), val >= 0.0 { result.alertCooldownSeconds = val }
+        if let v = map["MIN_EXPECTED_USB_SPEED_BPS"], let val = UInt64(v) { result.minExpectedUsbSpeedBps = val }
+        if let v = map["TELEGRAM_CHAT_ID"], !v.isEmpty { result.telegramChatId = v }
+        if let v = map["WEBHOOK_URL"], !v.isEmpty { result.webhookUrl = v }
+        if let v = map["ALERT_SCRIPT_PATH"], !v.isEmpty { result.alertScriptPath = v }
+        if let v = map["TEMP_WARNING_CELSIUS"], let val = Int(v) { result.tempWarningCelsius = val }
+        if let v = map["TEMP_CRITICAL_CELSIUS"], let val = Int(v) { result.tempCriticalCelsius = val }
+        if let v = map["DISK_USED_WARNING_PERCENT"], let val = Double(v) { result.diskUsedWarningPercent = val }
+        if let v = map["DISK_USED_CRITICAL_PERCENT"], let val = Double(v) { result.diskUsedCriticalPercent = val }
+        if let v = map["MIN_FREE_SPACE_CRITICAL_GB"], let val = Double(v) { result.minFreeSpaceCriticalGB = val }
+        if let v = map["MIN_FREE_SPACE_WARNING_GB"], let val = Double(v) { result.minFreeSpaceWarningGB = val }
+        if let v = map["DISK_HEALTH_METRICS_SERVER"], !v.isEmpty {
+            result.metricsServerEnabled = parseBoolFlag(v)
         }
-        if let v = env["DISK_HEALTH_METRICS_PORT"], let val = Int(v), val >= 1024 && val <= 65535 {
+        if let v = map["DISK_HEALTH_METRICS_ENABLED"], !v.isEmpty {
+            result.metricsServerEnabled = parseBoolFlag(v)
+        }
+        if let v = map["DISK_HEALTH_METRICS_PORT"], let val = Int(v), val >= 1024 && val <= 65535 {
             result.metricsServerPort = val
         }
-        if let v = env["DISK_HEALTH_PRE_SLEEP_SHIELD"], !v.isEmpty {
-            result.preSleepShieldEnabled = (v.lowercased() == "true" || v == "1" || v.lowercased() == "yes")
+        if let v = map["DISK_HEALTH_PRE_SLEEP_SHIELD"], !v.isEmpty {
+            result.preSleepShieldEnabled = parseBoolFlag(v)
         }
         return result
     }
@@ -491,6 +451,11 @@ final class ConfigManager: ObservableObject, @unchecked Sendable {
     func setPreSleepShield(enabled: Bool) {
         updateConfig { cfg in
             cfg.preSleepShieldEnabled = enabled
+        }
+        if enabled {
+            PowerManagementService.shared.startPreSleepShield()
+        } else {
+            PowerManagementService.shared.stopPreSleepShield()
         }
     }
 

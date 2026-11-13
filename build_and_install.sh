@@ -49,7 +49,12 @@ if [[ "${1:-}" == "--package" ]] || [[ "${1:-}" == "--universal" ]]; then
     echo "🌐 Building Universal Binary (arm64 + x86_64)..."
     ARCH_FLAGS+=(-arch arm64 -arch x86_64)
 fi
-clang -O2 -ffunction-sections -fdata-sections -Wall -Wextra "${ARCH_FLAGS[@]}" -c "${SCRIPT_DIR}/src/bridge/DiskHealthBridge.c" -o "${BUILD_CACHE_DIR}/DiskHealthBridge.o"
+BRIDGE_OBJECTS=()
+while IFS= read -r -d '' c_file; do
+    obj_path="${BUILD_CACHE_DIR}/$(basename "${c_file%.c}").o"
+    clang -O2 -ffunction-sections -fdata-sections -Wall -Wextra "${ARCH_FLAGS[@]}" -c "${c_file}" -o "${obj_path}"
+    BRIDGE_OBJECTS+=("${obj_path}")
+done < <(find "${SCRIPT_DIR}/src/bridge" -maxdepth 1 -name "*.c" -print0 | sort -z)
 
 # 2. Compile App Icon if needed
 if [[ ! -f "${SCRIPT_DIR}/assets/AppIcon.icns" ]] || [[ "${1:-}" == "--regenerate-icon" ]]; then
@@ -94,7 +99,7 @@ if [[ "${1:-}" == "--package" ]] || [[ "${1:-}" == "--universal" ]]; then
         -module-cache-path "${BUILD_CACHE_DIR}/ModuleCache-arm64" \
         -import-objc-header "${SCRIPT_DIR}/src/bridge/DiskHealthBridge.h" \
         "${SWIFT_SOURCES[@]}" \
-        "${BUILD_CACHE_DIR}/DiskHealthBridge.o" \
+        "${BRIDGE_OBJECTS[@]}" \
         -framework Cocoa -framework SwiftUI -framework IOKit -framework CoreFoundation -framework UserNotifications -framework Security -framework DiskArbitration -framework Network \
         -o "${BUILD_CACHE_DIR}/${APP_NAME}-arm64"
 
@@ -102,7 +107,7 @@ if [[ "${1:-}" == "--package" ]] || [[ "${1:-}" == "--universal" ]]; then
         -module-cache-path "${BUILD_CACHE_DIR}/ModuleCache-x86_64" \
         -import-objc-header "${SCRIPT_DIR}/src/bridge/DiskHealthBridge.h" \
         "${SWIFT_SOURCES[@]}" \
-        "${BUILD_CACHE_DIR}/DiskHealthBridge.o" \
+        "${BRIDGE_OBJECTS[@]}" \
         -framework Cocoa -framework SwiftUI -framework IOKit -framework CoreFoundation -framework UserNotifications -framework Security -framework DiskArbitration -framework Network \
         -o "${BUILD_CACHE_DIR}/${APP_NAME}-x86_64"
 
@@ -115,7 +120,7 @@ else
         -module-cache-path "${BUILD_CACHE_DIR}/ModuleCache" \
         -import-objc-header "${SCRIPT_DIR}/src/bridge/DiskHealthBridge.h" \
         "${SWIFT_SOURCES[@]}" \
-        "${BUILD_CACHE_DIR}/DiskHealthBridge.o" \
+        "${BRIDGE_OBJECTS[@]}" \
         -framework Cocoa \
         -framework SwiftUI \
         -framework IOKit \
@@ -127,7 +132,7 @@ else
         -o "${BINARY_PATH}"
 fi
 
-rm -f "${BUILD_CACHE_DIR}/DiskHealthBridge.o"
+rm -f "${BRIDGE_OBJECTS[@]}"
 chmod +x "${BINARY_PATH}"
 
 # 4. Create Info.plist for Menu Bar Agent (LSUIElement = true)
@@ -147,9 +152,9 @@ cat << EOF > "${CONTENTS_DIR}/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>3.1.0</string>
+    <string>3.2.0</string>
     <key>CFBundleVersion</key>
-    <string>14</string>
+    <string>15</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>NSPrincipalClass</key>
@@ -274,6 +279,7 @@ if [[ "${1:-}" == "--install-service" ]] || [[ "${1:-}" == "--service" ]]; then
 </dict>
 </plist>
 EOF
+chmod 600 "${SERVICE_PLIST}"
 
     # Reload service and ensure any standalone GUI instance hands off cleanly to launchd
     launchctl bootout "gui/$(id -u)/${BUNDLE_ID}" 2>/dev/null || true

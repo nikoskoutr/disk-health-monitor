@@ -26,6 +26,12 @@ Delivers alerts to multi-platform webhook endpoints:
 - **Sanitized Logging**: Automatically masks webhook URLs and credentials in runtime logs.
 - **Non-Blocking**: Asynchronous dispatch with 15-second request timeouts and connectivity testing from the Settings UI.
 
-### 4. Audio Beeps & Script Hooks
+### 4. [`AlertCoordinator.swift`](AlertCoordinator.swift)
+Extracts stateful alert transition tracking and notification delivery from `DiskHealthMonitor`:
+- **Transient Poll Hysteresis & Recovery Cooldowns (`ALERT-01`)**: Requires 2 consecutive unhealthy polls for transient latency/thermal-spike warnings, 2 healthy polls for recovery alerts, and preserves 900s cooldowns across brief blips.
+- **Baseline Advancement (`RULE-02`)**: Advances error, retry, and `BUS_PHY_ERRORS` baselines atomically upon alert dispatch.
+- **Digests & Clean Script Hooks**: Handles scheduled daily digests and executes user alert scripts via `SubprocessRunner` with scrubbed environment variables (`makeCleanAlertScriptEnvironment`).
+
+### 5. Audio Beeps & Script Hooks
 - **Audible Alerts**: When `enableCriticalSoundAlert` is enabled, triggers an immediate system audio beep (`NSSound.beep()`) upon entering a critical health state.
 - **Custom Shell Hook**: When `alertScriptPath` is configured, executes an external shell script or binary asynchronously with a 15-second watchdog timer, passing issue parameters via environment variables.

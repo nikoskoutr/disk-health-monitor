@@ -74,7 +74,7 @@ struct NotificationsSettingsTab: View {
                             .frame(width: 175, alignment: .leading)
 
                             HStack(spacing: 8) {
-                                TextField("9108", text: $viewModel.metricsServerPortString)
+                                TextField("9102", text: $viewModel.metricsServerPortString)
                                     .textFieldStyle(.roundedBorder)
                                     .frame(width: 80)
                                     .font(.system(size: 12, design: .monospaced))

@@ -16,8 +16,8 @@ This directory defines the strongly typed, `Codable` Swift data structures repre
 Point-in-time telemetry snapshot serialized to `logs/latest_status.json` and returned via `--json`:
 - **System**: `timestamp`, `formattedTime`, `formattedShortTime`, `overallSeverity`, `healthScore`, `issues`.
 - **Filesystem & Capacity**: `mountPoint`, `filesystemType`, `totalBytes`, `freeBytes`, `purgeableBytes` (opportunistic APFS capacity), `usedBytes`, `usedPercent`, `isReadOnly`, `subpathsStatus`.
-- **Hardware & Bus**: `vendorName`, `productName`, `bsdName`, `serialNumber`, `interconnectType`, `protocolType`, `isInternal`, `linkSpeedBps`, `linkSpeedFormatted`.
-- **NVMe S.M.A.R.T.**: `smartValid`, `criticalWarning`, `temperatureCelsius`, `temperatureKelvin`, `peakTemperatureCelsius`, `availableSpare`, `availableSpareThreshold`, `percentageUsed`, `lifeRemainingPercent`, `dataUnitsRead`, `dataUnitsWritten`, `totalTerabytesRead`, `totalTerabytesWritten`, `powerCycles`, `powerOnHours`, `unsafeShutdowns`, `mediaErrors`, `errorInfoLogEntries`.
+- **Hardware & Bus**: `vendorName`, `productName`, `bsdName`, `serialNumber`, `interconnectType`, `protocolType`, `isInternal`, `linkSpeedBps`, `linkSpeedFormatted`, `linkWidthLanes`, `usbCurrentAvailableMa`, `usbCurrentRequiredMa`.
+- **NVMe S.M.A.R.T. & Die Sensor**: `smartValid`, `hasTemperature` (decouples HID thermal visibility from full SMART validity), `smartSourceType`, `criticalWarning`, `temperatureCelsius`, `temperatureKelvin`, `peakTemperatureCelsius`, `availableSpare`, `availableSpareThreshold`, `percentageUsed`, `lifeRemainingPercent`, `dataUnitsRead`, `dataUnitsWritten`, `totalTerabytesRead`, `totalTerabytesWritten`, `powerCycles`, `powerOnHours`, `unsafeShutdowns`, `mediaErrors`, `errorInfoLogEntries`, `busErrorCount`, `busResetCount`, `damagedExtents`, `apfsContainer`.
 - **Storage Driver Stats**: `statsValid`, `sessionBytesRead`, `sessionBytesWritten`, `operationsRead`, `operationsWritten`, `errorsRead`, `errorsWritten`, `avgReadLatencyMs`, `avgWriteLatencyMs`, `readThroughputMBps`, `writeThroughputMBps`.
 - **Active Canary & Verification**: `canaryOk`, `canaryLatencyMs`, `lastVerifyResult`, `lastVerifyOk`.
 
@@ -39,6 +39,13 @@ Wraps `DateFormatter` with an internal `NSLock` and `en_US_POSIX` locale to prev
 
 #### 6. Fleet Aggregation (`MultiDiskHealthSnapshot`)
 Aggregates simultaneous per-drive `DiskHealthSnapshot` evaluations with fleet-wide `overallSeverity`, `worstHealthScore`, `averageHealthScore`, `totalIssuesCount`, and deterministic `primarySnapshot` selection (highest severity, tie-broken by lowest health score).
+
+---
+
+### [`AutomationModels.swift`](AutomationModels.swift)
+Extracted automation domain schemas:
+- **`ActionTriggerMetric`** (14 metrics including event-driven `.systemWillSleep` with `usesNumericThreshold == false`), **`ActionConditionOperator`**, **`ActionDriveScope`**, and **`ActionExecutionType`** (14 actions including `.preSleepShield` and `.throttleTopIoProcess`).
+- **`ActionRule`** (`builtInPresets`), **`ActionExecutionStatus`**, and **`ActionExecutionRecord`**.
 
 ---
 

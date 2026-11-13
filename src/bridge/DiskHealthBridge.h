@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <sys/types.h>
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
 #endif
@@ -48,7 +49,7 @@ typedef struct {
     // NVMe Base Specification 1.4+ S.M.A.R.T. / Health Information Log
     // ========================================================================
     bool smartValid;                    ///< True if IONVMeSMARTUserClient successfully returned SMART logs.
-    uint8_t smartSourceType;            ///< Source: 0 = Native NVMe, 1 = SAT ATA (0x85), 2 = USB Vendor NVMe.
+    uint8_t smartSourceType;            ///< Source: 0 = None / Unavailable, 1 = Native NVMe, 2 = SAT ATA (0x85), 3 = USB Vendor NVMe.
     uint8_t criticalWarning;            ///< Bitmask of critical warnings (0x01: spare below threshold, 0x02: temp, etc.).
     int32_t temperatureCelsius;         ///< Composite controller temperature in degrees Celsius (validated & clamped).
     int32_t temperatureKelvin;          ///< Raw composite temperature in Kelvin as reported by NVMe controller.
@@ -207,6 +208,7 @@ typedef struct {
     char processName[128];              ///< Executable process name (from proc_name).
     char filePath[512];                 ///< Resolved absolute file path on the targeted mount.
     int32_t fd;                         ///< Open file descriptor index.
+    uint64_t startTimeSec;              ///< Process start timestamp (pbi_start_tvsec) for PID-reuse verification.
 } DiskFileBlocker;
 
 /**
@@ -221,6 +223,29 @@ typedef struct {
  * @return Number of open file blockers populated (or 0 if none/error).
  */
 int DiskListOpenFileBlockers(const char *mountPath, DiskFileBlocker *outList, int maxCount);
+
+/**
+ * @brief Lists open file descriptors held by a specific PID on a target mount path.
+ *
+ * @param pid Process ID to inspect.
+ * @param mountPath Target mount directory (e.g. "/Volumes/T7" or "/").
+ * @param outList Pre-allocated array of DiskFileBlocker structs.
+ * @param maxCount Maximum number of entries to populate.
+ * @return Number of matching open file blockers populated for that PID.
+ */
+int DiskListProcessOpenFilesOnMount(pid_t pid, const char *mountPath, DiskFileBlocker *outList, int maxCount);
+
+/**
+ * @brief Verifies blocker PID identity, start time, user ownership, and optional open mount handle before signaling.
+ *
+ * @param pid Process ID to verify.
+ * @param expectedStartTimeSec Captured pbi_start_tvsec (or 0 to skip start-time check).
+ * @param expectedName Expected process name, or NULL to skip name check.
+ * @param mountPath Optional mount path to require an active open file descriptor on (or NULL).
+ * @param outIsZombie Output bool set to true if process is in SZOMB state.
+ * @return True if safe to signal.
+ */
+bool DiskVerifyBlockerForTermination(pid_t pid, uint64_t expectedStartTimeSec, const char *expectedName, const char *mountPath, bool *outIsZombie);
 
 /**
  * @brief Checks whether the macOS system is currently in Dark Wake (Power Nap) state.
@@ -267,6 +292,35 @@ int DiskListApfsContainerVolumes(const char *targetBsdOrMount, DiskApfsContainer
  * @return 0 on success, negative errno on failure.
  */
 int DiskSetProcessBackgroundIoPriority(pid_t pid, bool enable);
+
+/**
+ * @brief Reads the Apple Silicon NAND storage die temperature via IOHIDEventSystem.
+ *
+ * Unprivileged thermal sensor fallback for internal Apple Silicon NVMe media.
+ *
+ * @return Temperature in degrees Celsius (e.g. 28), or 0 if unavailable / Intel.
+ */
+int32_t DiskReadAppleSiliconStorageDieTemperature(void);
+
+/**
+ * @brief Verifies PID ownership, process name match, and non-zombie state (TOCTOU guard).
+ *
+ * @param pid Process ID to verify.
+ * @param expectedName Expected process name (comm or path basename), or NULL to skip name match.
+ * @param requireCurrentUid If true, rejects process if not owned by getuid() (unless running as root).
+ * @param outIsZombie Output bool set to true if process is in SZOMB state.
+ * @return True if process is alive, matches criteria, and is not a zombie.
+ */
+bool DiskVerifyProcessForSignal(pid_t pid, const char *expectedName, bool requireCurrentUid, bool *outIsZombie);
+
+/**
+ * @brief Returns true if pid is owned by a non-system user (uid >= 501, matching getuid() if unprivileged)
+ *        and its executable path is not an immutable macOS system daemon under /System/ or /usr/libexec/.
+ *
+ * @param pid Process ID to check.
+ * @return True if safe for background I/O throttling.
+ */
+bool DiskIsSafeUserSpaceProcess(pid_t pid);
 
 #ifdef __APPLE__
 /**

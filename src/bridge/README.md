@@ -22,7 +22,18 @@ Declares the public C ABI structures and functions imported into Swift:
 
 ### [`DiskHealthBridge.c`](DiskHealthBridge.c)
 Implements hardware discovery and telemetry routines:
-1. **APFS Physical Store Resolution**: Traverses parent services recursively (`findParentBlockStorageDeviceRecursive`) through `kIOServicePlane` to resolve synthesized APFS containers (`diskXsY` -> `AppleAPFSVolume` -> `AppleAPFSContainer`) down to the underlying physical `IOMedia`, `IONVMeController`, or `IOBlockStorageDevice`.
-2. **128-Bit NVMe S.M.A.R.T. Decoding & Contention Guard (`BRIDGE-09`)**: Reads NVMe Log Page `02h` (`NVMeSMARTData`) via `IONVMeSMARTUserClient`, serialized with `sSmartClientMutex` (`pthread_mutex_t`), bounded retry on `kIOReturnNotPermitted` (`0xe00002be`), and last-known-good SMART cache fallback in `sStaticCache`. Decodes 16-byte little-endian counters (`nvmeLe128ToU64`) with saturation protection if upper 64 bits are non-zero.
-3. **Interconnect & Link Speed Detection**: Traverses parent registry nodes to inspect `UsbLinkSpeed`, `LinkSpeed`, and `Device Speed` properties across `IOUSBHostDevice`, `AppleUSBXHCI`, SATA/AHCI, and PCIe controllers.
-4. **Driver Statistics Extraction**: Extracts read/write operations, byte totals, I/O errors, retries, and cumulative latencies from `IOBlockStorageDriver` `Statistics` dictionaries.
+1. **APFS Physical Store & Container Resolution**: Traverses parent services recursively through `kIOServicePlane` to resolve synthesized APFS containers (`DiskListApfsContainerVolumes` with strict container `'s'`/`'\0'` prefix matching and `Encrypted`/`CapacityConsumed`/`getattrlist` capacity resolution) down to physical `IOMedia`/`IOBlockStorageDevice`.
+2. **128-Bit NVMe S.M.A.R.T., SAT ATA & Contention Guard (`BRIDGE-09`)**: Reads NVMe Log Page `02h` via `IONVMeSMARTUserClient`, serialized with `sSmartClientMutex` (`pthread_mutex_t`), 2.0s TTL rate limiting, bounded retries, SAT ATA pass-through (`smartSourceType`), and last-known-good SMART cache fallback in `sStaticCache`.
+3. **Interconnect, Bus Power & PHY Counters**: Inspects `UsbLinkSpeed`, `LinkSpeed`, `Device Speed`, USB power allocation (`mA`), PCIe/TB lane width, and refreshes dynamic PHY error/reset counters (`refreshDynamicBusErrorCounters`) even on `sStaticCache` hits.
+4. **Physical Bad Extent Pinpointing**: Translates logical file offsets into physical device LBAs via `DiskResolvePhysicalExtent` (`F_LOG2PHYS_EXT` / `F_LOG2PHYS`).
+
+### [`DiskProcessBridge.c`](DiskProcessBridge.c)
+Implements Darwin `<libproc.h>` process I/O and open-file blocker inspection:
+- `DiskSampleProcessIoMetrics`: Per-PID `proc_pid_rusage(RUSAGE_INFO_V4)` disk I/O sampler.
+- `DiskListOpenFileBlockers` & `DiskListProcessOpenFilesOnMount`: Resolves open file descriptors and APFS firmlinks on target mounts.
+- `DiskVerifyBlockerForTermination`, `DiskVerifyProcessForSignal`, `DiskIsSafeUserSpaceProcess`, and `DiskSetProcessBackgroundIoPriority` (`PRIO_DARWIN_BG`): Captures `startTimeSec` against PID reuse and enforces UID/path protections.
+
+### [`DiskPowerHidBridge.c`](DiskPowerHidBridge.c)
+Implements power session and Apple Silicon thermal queries:
+- `DiskIsDarkWakeActive`: Thread-safe `pthread_once` resolution of `CGSessionCopyCurrentDictionary` to detect Dark Wake without waking external drives.
+- `DiskReadAppleSiliconStorageDieTemperature`: Unprivileged `IOHIDEventSystemClient` fallback for Apple Silicon NAND thermal die sensors with `CLOCK_UPTIME_RAW` TTL caching (5s valid / 60s unavailable).

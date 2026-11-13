@@ -246,15 +246,103 @@ struct DiagnosticsAndExportTab: View {
                     }
                 }
 
+                SettingsCard(title: "Open File Blockers & Safe Volume Unmount (DA-01)", icon: "eject.circle.fill", iconColor: .orange) {
+                    let activeTarget = viewModel.inspectingBlockerTarget ?? monitor.publishedSnapshot?.mountPoint ?? "/"
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(alignment: .center) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Inspect Active Vnode Locks & Eject")
+                                    .font(.system(size: 13, weight: .semibold))
+                                Text("Identifies processes keeping '\(activeTarget)' busy using Darwin proc_pidinfo to safely resolve unmount failures.")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            HStack(spacing: 8) {
+                                Button(action: {
+                                    viewModel.inspectOpenFileBlockers(mountPath: activeTarget)
+                                }) {
+                                    HStack(spacing: 4) {
+                                        if viewModel.isLoadingBlockers {
+                                            ProgressView().controlSize(.small)
+                                        } else {
+                                            Image(systemName: "magnifyingglass")
+                                        }
+                                        Text("Scan Blockers")
+                                    }
+                                }
+                                .disabled(viewModel.isLoadingBlockers)
+
+                                if activeTarget != "/" {
+                                    Button(action: {
+                                        viewModel.unmountVolumeAction(mountPath: activeTarget, force: false)
+                                    }) {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "eject.fill")
+                                            Text("Unmount")
+                                        }
+                                    }
+                                    .disabled(viewModel.isUnmountingVolume)
+
+                                    Button(action: {
+                                        viewModel.unmountVolumeAction(mountPath: activeTarget, force: true)
+                                    }) {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "exclamationmark.triangle.fill")
+                                            Text("Force Unmount")
+                                        }
+                                        .foregroundColor(.red)
+                                    }
+                                    .disabled(viewModel.isUnmountingVolume)
+                                }
+                            }
+                        }
+
+                        if let statusMsg = viewModel.unmountStatusMessage {
+                            HStack(spacing: 6) {
+                                Image(systemName: viewModel.unmountStatusIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                                    .foregroundColor(viewModel.unmountStatusIsError ? .red : .green)
+                                Text(statusMsg)
+                                    .font(.system(size: 11.5, weight: .medium))
+                                Spacer()
+                            }
+                            .padding(8)
+                            .background(RoundedRectangle(cornerRadius: 6).fill((viewModel.unmountStatusIsError ? Color.red : Color.green).opacity(0.12)))
+                        }
+
+                        if viewModel.openFileBlockers.isEmpty {
+                            Text(viewModel.isLoadingBlockers ? "Inspecting processes..." : "No open file blockers detected on '\(activeTarget)'. Volume is ready for safe eject.")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                        } else {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("\(viewModel.openFileBlockers.count) process(es) holding file descriptors on this volume:")
+                                    .font(.system(size: 11, weight: .medium))
+                                let topBlockers = Array(viewModel.openFileBlockers.prefix(8))
+                                ForEach(topBlockers) { blocker in
+                                    blockerRow(blocker, activeTarget: activeTarget)
+                                }
+                            }
+                            .padding(8)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.08)))
+                        }
+                    }
+                }
+
                 SettingsCard(title: "State & Baseline Maintenance", icon: "arrow.counterclockwise.circle.fill", iconColor: .orange) {
                     SettingsRow(
                         title: "Reset Persistent Baselines",
                         subtitle: "Clear recorded peak temperatures, baseline error counters, and alert cooldown timers."
                     ) {
                         Button(action: {
-                            DiskHealthMonitor.shared.resetBaselines()
-                            _ = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: false, allowNotifications: false)
-                            viewModel.diagnosticsStatusMsg = "Baselines and persistent state reset to clean defaults."
+                            viewModel.diagnosticsStatusMsg = "Resetting baselines..."
+                            DispatchQueue.global(qos: .userInitiated).async {
+                                DiskHealthMonitor.shared.resetBaselines()
+                                _ = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: false, allowNotifications: false)
+                                DispatchQueue.main.async {
+                                    viewModel.diagnosticsStatusMsg = "Baselines and persistent state reset to clean defaults."
+                                }
+                            }
                         }) {
                             Text("Reset Baselines")
                                 .frame(width: 128)
@@ -277,5 +365,38 @@ struct DiagnosticsAndExportTab: View {
             }
             .padding(8)
         }
+        .onReceive(monitor.$selectedDashboardDriveKey.dropFirst()) { _ in
+            viewModel.inspectingBlockerTarget = nil
+            viewModel.openFileBlockers = []
+        }
+    }
+
+    private func blockerRow(_ blocker: OpenFileBlocker, activeTarget: String) -> some View {
+        HStack(spacing: 8) {
+            Text("PID \(blocker.pid)")
+                .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                .foregroundColor(.orange)
+                .frame(width: 60, alignment: .leading)
+            Text(blocker.processName)
+                .font(.system(size: 11, weight: .semibold))
+                .frame(width: 120, alignment: .leading)
+            Text(blocker.filePath)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer()
+            if blocker.isTerminatable {
+                Button(action: {
+                    viewModel.terminateBlockerAction(blocker, mountPath: activeTarget)
+                }) {
+                    Text("Kill")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.red)
+                }
+                .buttonStyle(BorderlessButtonStyle())
+            }
+        }
+        .padding(.vertical, 2)
     }
 }

@@ -40,7 +40,7 @@ func printUsage() {
       --snapshots [path]    List APFS local Time Machine snapshots with age and timestamp
       --thin-snapshots [path] [GB] Thin APFS local snapshots by specified gigabytes (default: 20 GB)
       --metrics-server      Launch standalone OpenMetrics / Prometheus HTTP exporter
-      --metrics-port <port> Override OpenMetrics HTTP exporter port (default: 9108)
+      --metrics-port <port> Override OpenMetrics HTTP exporter port (default: 9102)
       --container-info [bsd] Show APFS container volume pool and role breakdown (APFS-03)
       --pre-sleep-shield [on|off|status|trigger] View or configure pre-sleep external drive shield (DA-02)
       --test-alert-script   Test execution of the configured custom alert shell script
@@ -75,7 +75,7 @@ func parseCommandLine() {
         "--container-info", "--pre-sleep-shield",
         "--test-alert-script", "--list-disks", "--json", "--cli", "--status",
         "--check", "--watch-mounts", "--deep", "--notify", "--notify-if-unhealthy",
-        "--verify", "--send-report", "--menubar"
+        "--verify", "--verify-volume", "--verify-apfs", "--send-report", "--menubar"
     ]
 
     var skipNext = false
@@ -221,7 +221,8 @@ func parseCommandLine() {
         }
 
         let isTTY = isatty(STDERR_FILENO) != 0
-        let res = DiskHealthMonitor.shared.runSurfaceReadScan(mode: selectedMode) { prog in
+        let targetMount = ConfigManager.shared.currentConfig.targetVolumePath
+        let res = DiskHealthMonitor.shared.runSurfaceReadScan(targetMount: targetMount, mode: selectedMode) { prog in
             guard isTTY && selectedMode != .quick else { return }
             let pct = Int((prog.fractionCompleted * 100.0).rounded())
             let etaStr: String
@@ -411,10 +412,22 @@ func parseCommandLine() {
         if let pIdx = args.firstIndex(of: "--metrics-port"), pIdx + 1 < args.count, let p = Int(args[pIdx + 1]) {
             port = max(1024, min(p, 65535))
         }
+        _ = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: false, allowNotifications: true, persistState: true)
         OpenMetricsServer.shared.start(port: port)
+
+        let interval = max(5.0, ConfigManager.shared.currentConfig.pollIntervalSeconds)
+        let pollTimer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        pollTimer.schedule(deadline: .now() + interval, repeating: interval, leeway: .seconds(1))
+        pollTimer.setEventHandler {
+            _ = DiskHealthMonitor.shared.evaluateAllMonitoredDisks(forceCanary: false, allowNotifications: true, persistState: true)
+        }
+        metricsServerPollTimer = pollTimer
+        pollTimer.resume()
+
         print("================================================================================")
         print("  OPENMETRICS / PROMETHEUS HTTP EXPORTER RUNNING")
         print("================================================================================")
+        print("  Poll interval: \(Int(interval))s")
         print("  Endpoints:")
         print("    http://127.0.0.1:\(port)/metrics       (Prometheus text format)")
         print("    http://127.0.0.1:\(port)/status.json    (Full JSON telemetry)")
@@ -738,6 +751,27 @@ func resolveAppBundleExecutableURL() -> (bundleURL: URL, executableURL: URL)? {
     return nil
 }
 
+private var metricsServerPollTimer: DispatchSourceTimer?
+
+func makeDetachedGuiEnvironment(from env: [String: String]) -> [String: String] {
+    var clean: [String: String] = [:]
+    let allowlist = [
+        "HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "LANG", "LC_ALL",
+        "__CF_USER_TEXT_ENCODING", "XPC_FLAGS", "XPC_SERVICE_NAME"
+    ]
+    for key in allowlist {
+        if let val = env[key] {
+            clean[key] = val
+        }
+    }
+    for (key, val) in env where key.hasPrefix("DISK_HEALTH_") {
+        clean[key] = val
+    }
+    clean["DISK_HEALTH_DETACHED"] = "1"
+    clean["DISK_HEALTH_REEXEC"] = "1"
+    return clean
+}
+
 func spawnDetachedSessionProcess(executablePath: String, arguments: [String], environment: [String: String]) -> Bool {
     var fileActions: posix_spawn_file_actions_t? = nil
     var attr: posix_spawnattr_t? = nil
@@ -809,13 +843,7 @@ func detachFromControllingTerminalIfNeeded() {
     }
 
     if !targetExecPath.isEmpty && FileManager.default.isExecutableFile(atPath: targetExecPath) {
-        var childEnv = env
-        childEnv["DISK_HEALTH_DETACHED"] = "1"
-        childEnv["DISK_HEALTH_REEXEC"] = "1"
-        childEnv.removeValue(forKey: "TERM")
-        childEnv.removeValue(forKey: "TERM_PROGRAM")
-        childEnv.removeValue(forKey: "TERM_PROGRAM_VERSION")
-        childEnv.removeValue(forKey: "TERM_SESSION_ID")
+        let childEnv = makeDetachedGuiEnvironment(from: env)
 
         if spawnDetachedSessionProcess(executablePath: targetExecPath, arguments: CommandLine.arguments, environment: childEnv) {
             _exit(0)
@@ -852,13 +880,7 @@ func ensureRunningFromAppBundleIfAvailable() {
     // immediately spawn a detached session process (POSIX_SPAWN_SETSID) and exit the parent.
     if !isHeadless && (hasTTY || hasTermEnv || isInvokedViaSymlinkOrNonBundlePath) &&
        (env["DISK_HEALTH_CONFIG_DIR"] == nil || env["DISK_HEALTH_FORCE_DETACH_TEST"] == "1") {
-        var childEnv = env
-        childEnv["DISK_HEALTH_DETACHED"] = "1"
-        childEnv["DISK_HEALTH_REEXEC"] = "1"
-        childEnv.removeValue(forKey: "TERM")
-        childEnv.removeValue(forKey: "TERM_PROGRAM")
-        childEnv.removeValue(forKey: "TERM_PROGRAM_VERSION")
-        childEnv.removeValue(forKey: "TERM_SESSION_ID")
+        let childEnv = makeDetachedGuiEnvironment(from: env)
 
         if spawnDetachedSessionProcess(executablePath: resolvedPath, arguments: CommandLine.arguments, environment: childEnv) {
             _exit(0)

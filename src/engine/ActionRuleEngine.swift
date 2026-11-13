@@ -44,7 +44,10 @@ final class ActionRuleEngine: @unchecked Sendable {
         ("VOLUME_VERIFY_FAILED", "File System Verification (fsck/diskutil) Failed"),
         ("REQUIRED_PATH_MISSING", "Required Critical Directory Path Missing"),
         ("HW_DISCONNECTED", "Physical Storage Hardware Disconnected"),
-        ("HOST_THERMAL_CRITICAL", "Mac Host System Thermal Throttling")
+        ("HOST_THERMAL_CRITICAL", "Mac Host System Thermal Throttling"),
+        ("IO_CONTROLLER_UNRESPONSIVE", "Storage Controller Unresponsive / Quarantined"),
+        ("BUS_PHY_ERRORS", "Storage Bus PHY CRC Errors or Recovery Resets"),
+        ("APFS_SWAP_PRESSURE", "APFS Container VM Swap Pressure")
     ]
 
     // MARK: - 1. Scope & Safety Guard Evaluation
@@ -98,7 +101,8 @@ final class ActionRuleEngine: @unchecked Sendable {
         rule: ActionRule,
         snapshot: DiskHealthSnapshot,
         previousSeverity: HealthSeverity? = nil,
-        historyRates: HistoryRateMetrics = .zero
+        historyRates: HistoryRateMetrics = .zero,
+        isSleepNotificationEvent: Bool = false
     ) -> (matched: Bool, triggerReason: String) {
         guard matchesScope(rule: rule, snapshot: snapshot) else {
             return (false, "Drive outside rule scope (\(rule.scope.displayName))")
@@ -217,8 +221,43 @@ final class ActionRuleEngine: @unchecked Sendable {
             return (ok, String(format: "Free Space Drop %.2f GB/hr %@ %.2f GB/hr", actual, op.rawValue, targetVal))
 
         case .systemWillSleep:
-            return (false, "System power sleep notification listener active")
+            return (
+                isSleepNotificationEvent,
+                isSleepNotificationEvent ? "System power pre-sleep event triggered" : "Awaiting macOS kIOMessageSystemWillSleep event"
+            )
         }
+    }
+
+    /// Evaluates and executes rules specifically triggered by macOS kernel system sleep notifications.
+    func triggerSystemWillSleepRules(for snapshot: DiskHealthSnapshot, nowTs: TimeInterval = Date().timeIntervalSince1970) -> [ActionExecutionRecord] {
+        let cfg = ConfigManager.shared.currentConfig
+        guard cfg.enableActionRulesEngine else { return [] }
+        var executed: [ActionExecutionRecord] = []
+
+        let sleepRules = cfg.actionRules.filter { $0.isEnabled && $0.triggerMetric == .systemWillSleep }
+        for rule in sleepRules {
+            let (matched, reason) = Self.evaluateRuleCondition(
+                rule: rule,
+                snapshot: snapshot,
+                previousSeverity: nil,
+                historyRates: HistoryRateMetrics(freeSpaceDropGBPerHour: 0, terabytesWrittenLast24h: 0),
+                isSleepNotificationEvent: true
+            )
+            guard matched else { continue }
+            let record = executeRuleAction(
+                rule: rule,
+                snapshot: snapshot,
+                triggerReason: reason,
+                nowTs: nowTs,
+                dryRun: rule.dryRunOnly
+            )
+            executed.append(record)
+        }
+
+        if !executed.isEmpty {
+            DiskHealthMonitor.shared.recordActionExecutions(executed)
+        }
+        return executed
     }
 
     // MARK: - 3. Stateful Hysteresis, Cooldown & Execution Pipeline
@@ -392,16 +431,21 @@ final class ActionRuleEngine: @unchecked Sendable {
             return (.succeeded, "Dispatched alert notification for '\(rule.name)' (\(triggerReason)).")
 
         case .safeUnmountDrive:
-            let target = !snapshot.mountPoint.isEmpty ? snapshot.mountPoint : (!snapshot.bsdName.isEmpty ? "/dev/\(snapshot.bsdName)" : "")
-            guard !target.isEmpty else {
+            if !snapshot.mountPoint.isEmpty {
+                let res = OpenFileBlockerInspector.shared.unmountVolume(mountPath: snapshot.mountPoint, force: false, timeoutSeconds: 20.0)
+                let out = (res.stdout + " " + res.stderr).trimmingCharacters(in: .whitespacesAndNewlines)
+                return res.exitCode == 0 ? (.succeeded, "Unmounted '\(snapshot.mountPoint)': \(out)") : (.failed, "diskutil unmount failed: \(out)")
+            }
+            guard !snapshot.bsdName.isEmpty else {
                 return (.failed, "Cannot unmount: no mount point or BSD name on snapshot.")
             }
+            let devTarget = "/dev/\(snapshot.bsdName)"
             let res = Self.runSandboxedCommand(
                 executablePath: "/usr/sbin/diskutil",
-                arguments: ["unmount", target],
+                arguments: ["unmount", devTarget],
                 timeoutSec: 20.0
             )
-            return res.ok ? (.succeeded, "Unmounted '\(target)': \(res.output)") : (.failed, "diskutil unmount failed: \(res.output)")
+            return res.ok ? (.succeeded, "Unmounted '\(devTarget)': \(res.output)") : (.failed, "diskutil unmount failed: \(res.output)")
 
         case .safeEjectDrive:
             let target = !snapshot.bsdName.isEmpty ? "/dev/\(snapshot.bsdName)" : snapshot.mountPoint
@@ -440,18 +484,15 @@ final class ActionRuleEngine: @unchecked Sendable {
 
         case .thinApfsSnapshots:
             let mountTarget = snapshot.mountPoint.isEmpty ? "/" : snapshot.mountPoint
-            guard snapshot.filesystemType.lowercased() == "apfs" || mountTarget == "/" else {
-                return (.failed, "APFS snapshot thinning skipped: '\(mountTarget)' is not an APFS volume (\(snapshot.filesystemType)).")
-            }
-            // Request thinning up to 10 GB (10_737_418_240 bytes) with urgency 4
-            let res = Self.runSandboxedCommand(
-                executablePath: "/usr/bin/tmutil",
-                arguments: ["thinLocalSnapshots", mountTarget, "10737418240", "4"],
-                timeoutSec: 30.0
+            let res = ApfsSnapshotService.shared.thinSnapshots(
+                mountPath: mountTarget,
+                targetPurgeBytes: 10_737_418_240,
+                urgency: 4
             )
-            return res.ok
-                ? (.succeeded, "Thinned APFS local snapshots on '\(mountTarget)': \(res.output.isEmpty ? "Completed" : res.output)")
-                : (.failed, "tmutil thinLocalSnapshots failed: \(res.output)")
+            let out = (res.stdout + " " + res.stderr).trimmingCharacters(in: .whitespacesAndNewlines)
+            return res.exitCode == 0
+                ? (.succeeded, "Thinned APFS local snapshots on '\(mountTarget)': \(out.isEmpty ? "Completed" : out)")
+                : (.failed, "tmutil thinlocalsnapshots failed: \(out)")
 
         case .runVolumeVerification:
             let mountTarget = !snapshot.mountPoint.isEmpty ? snapshot.mountPoint : (!snapshot.bsdName.isEmpty ? "/dev/\(snapshot.bsdName)" : "/")
@@ -465,13 +506,14 @@ final class ActionRuleEngine: @unchecked Sendable {
             return (.succeeded, "Initiated asynchronous diskutil verifyVolume on '\(mountTarget)'.")
 
         case .runQuickSurfaceScan:
+            let scanTarget = snapshot.mountPoint.isEmpty ? nil : snapshot.mountPoint
             DispatchQueue.global(qos: .utility).async {
-                _ = DiskHealthMonitor.shared.runSurfaceReadScan(mode: .quick)
+                _ = DiskHealthMonitor.shared.runSurfaceReadScan(targetMount: scanTarget, mode: .quick)
             }
-            return (.succeeded, "Initiated asynchronous Quick F_NOCACHE surface scan.")
+            return (.succeeded, "Initiated asynchronous Quick F_NOCACHE surface scan on '\(scanTarget ?? "default")'.")
 
         case .exportHtmlReport:
-            if let savedPath = DiagnosticExporter.shared.saveDiagnosticReportHTMLToFile(at: nil) {
+            if let savedPath = DiagnosticExporter.shared.saveDiagnosticReportHTMLToFile(at: nil, snapshot: snapshot) {
                 return (.succeeded, "Exported standalone HTML RMA report to \(savedPath)")
             }
             return (.failed, "Failed to write HTML diagnostic report.")

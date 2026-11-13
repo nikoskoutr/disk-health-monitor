@@ -86,6 +86,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Initial check
         refreshHealth(forceCanary: true, refreshDiskCache: true)
 
+        // Auto-start Pre-Sleep External Drive Shield if enabled
+        if ConfigManager.shared.currentConfig.preSleepShieldEnabled {
+            PowerManagementService.shared.startPreSleepShield()
+        }
+
+        // Auto-start Prometheus OpenMetrics Server if enabled
+        if ConfigManager.shared.currentConfig.metricsServerEnabled {
+            OpenMetricsServer.shared.start(port: ConfigManager.shared.currentConfig.metricsServerPort)
+        }
+
         // Dynamic timer polling
         schedulePollingTimer(interval: ConfigManager.shared.currentConfig.pollIntervalSeconds)
 
@@ -432,6 +442,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let volumeURL = note.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL
         let volumePath = volumeURL?.path
+        if let vp = volumePath {
+            ParallelDriveProber.shared.clearQuarantinedMount(vp)
+        }
         guard AppDelegate.shouldProcessVolumeNotification(volumePath: volumePath) else {
             return
         }
@@ -523,7 +536,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     static func formatStatusBarTitle(for multi: MultiDiskHealthSnapshot) -> String {
         if multi.disks.count > 1 {
             var maxTemp = 0
-            for d in multi.disks where d.smartValid && d.temperatureCelsius > maxTemp {
+            for d in multi.disks where d.hasTemperature && d.temperatureCelsius > maxTemp {
                 maxTemp = d.temperatureCelsius
             }
             let tempStr = maxTemp > 0 ? " \(maxTemp)°C" : ""
@@ -537,7 +550,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if let snap = multi.primarySnapshot ?? multi.disks.first {
             let rawName = snap.mountPoint.isEmpty ? (snap.bsdName.isEmpty ? "Disk" : snap.bsdName) : (snap.mountPoint as NSString).lastPathComponent
             let shortName = rawName.count > 18 ? String(rawName.prefix(16)) + "…" : rawName
-            let hasValidTemp = snap.smartValid && snap.temperatureCelsius > 0
+            let hasValidTemp = snap.hasTemperature
             if !snap.isMounted || !snap.hardwareFound {
                 return " \(shortName) ❌"
             } else if snap.overallSeverity == .critical {

@@ -59,10 +59,23 @@ final class TelemetryHistoryStore: @unchecked Sendable {
 
     private let lock = NSLock()
     private var container: TelemetryHistoryContainer
+    private var archiveHourlyByDriveKey: [String: [TelemetryHistoryPoint]] = [:]
+    private var lastPruneAttemptByKey: [String: TimeInterval] = [:]
     private var customFilePath: String?
 
     var historyFilePath: String {
         customFilePath ?? ConfigManager.shared.historyFilePath
+    }
+
+    private var archiveDirectoryPath: String {
+        if let customFilePath {
+            return "\(customFilePath).archive"
+        }
+        return "\(ConfigManager.shared.configDir)/history"
+    }
+
+    private func sanitizeArchiveKey(_ key: String) -> String {
+        key.components(separatedBy: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-")).inverted).joined(separator: "_")
     }
 
     init(customFilePath: String? = nil) {
@@ -115,10 +128,11 @@ final class TelemetryHistoryStore: @unchecked Sendable {
             series.removeFirst(series.count - Self.maxPointsPerDrive)
         }
         container.pointsByDriveKey[key] = series
+        updateArchiveBucketLocked(forKey: key, point: point)
 
         if persistToDisk {
             saveLocked()
-            appendArchiveRecord(snapshot: snapshot)
+            appendArchiveRecordLocked(snapshot: snapshot, point: point)
         }
         return true
     }
@@ -170,12 +184,17 @@ final class TelemetryHistoryStore: @unchecked Sendable {
 
     /// Computes rolling OLS linear regressions and p95 latency/temperature percentiles (HIST-01).
     func computeRollingForecasts(for snapshot: DiskHealthSnapshot) -> RollingForecastMetrics {
+        let nowTs = snapshot.timestamp
         lock.lock()
-        let series = container.pointsByDriveKey[snapshot.driveKey] ?? []
+        let inMemorySeries = container.pointsByDriveKey[snapshot.driveKey] ?? []
+        let archiveBuckets = loadArchiveHistoryLocked(for: snapshot.driveKey, nowTs: nowTs)
         lock.unlock()
 
+        let earliestInMemoryTs = inMemorySeries.first?.timestamp ?? Double.greatestFiniteMagnitude
+        let olderArchive = archiveBuckets.filter { $0.timestamp < earliestInMemoryTs }
+        let series = olderArchive + inMemorySeries
+
         guard !series.isEmpty else { return .zero }
-        let nowTs = snapshot.timestamp
 
         // OLS regression helper over window: (timestamp, TBW)
         func computeOlsSlope(windowSeconds: TimeInterval) -> Double {
@@ -247,15 +266,48 @@ final class TelemetryHistoryStore: @unchecked Sendable {
         )
     }
 
-    /// Appends a compact JSON record to the 90-day archive file ~/.config/disk-health-monitor/history/<driveKey>.jsonl.
-    func appendArchiveRecord(snapshot: DiskHealthSnapshot) {
-        let sanitizedKey = snapshot.driveKey.components(separatedBy: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-")).inverted).joined(separator: "_")
-        let dir = "\(ConfigManager.shared.configDir)/history"
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [
-            .posixPermissions: 0o700
-        ])
-        let filePath = "\(dir)/\(sanitizedKey).jsonl"
+    private func updateArchiveBucketLocked(forKey key: String, point: TelemetryHistoryPoint) {
+        guard var buckets = archiveHourlyByDriveKey[key] else { return }
+        let bucketHour = Int64(point.timestamp / 3600.0)
+        if let last = buckets.last, Int64(last.timestamp / 3600.0) == bucketHour {
+            buckets[buckets.count - 1] = point
+        } else {
+            buckets.append(point)
+        }
+        archiveHourlyByDriveKey[key] = buckets
+    }
 
+    private func loadArchiveHistoryLocked(for driveKey: String, nowTs: TimeInterval) -> [TelemetryHistoryPoint] {
+        if let cached = archiveHourlyByDriveKey[driveKey] {
+            return cached
+        }
+        let sanitizedKey = sanitizeArchiveKey(driveKey)
+        let filePath = "\(archiveDirectoryPath)/\(sanitizedKey).jsonl"
+        guard let content = try? String(contentsOfFile: filePath, encoding: .utf8) else {
+            archiveHourlyByDriveKey[driveKey] = []
+            return []
+        }
+
+        let cutoffTs = nowTs - (90.0 * 86400.0)
+        let decoder = JSONDecoder()
+        var byHour: [Int64: TelemetryHistoryPoint] = [:]
+
+        for line in content.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8),
+                  let point = try? decoder.decode(TelemetryHistoryPoint.self, from: data),
+                  point.timestamp >= cutoffTs else { continue }
+            let bucket = Int64(point.timestamp / 3600.0)
+            byHour[bucket] = point
+        }
+
+        let sorted = byHour.values.sorted { $0.timestamp < $1.timestamp }
+        archiveHourlyByDriveKey[driveKey] = sorted
+        return sorted
+    }
+
+    /// Appends a compact JSON record to the 90-day archive file `<historyDir>/<driveKey>.jsonl`.
+    func appendArchiveRecord(snapshot: DiskHealthSnapshot) {
         let point = TelemetryHistoryPoint(
             timestamp: snapshot.timestamp,
             overallSeverity: snapshot.overallSeverity,
@@ -267,23 +319,77 @@ final class TelemetryHistoryStore: @unchecked Sendable {
             avgReadLatencyMs: snapshot.avgReadLatencyMs,
             avgWriteLatencyMs: snapshot.avgWriteLatencyMs
         )
+        lock.lock()
+        defer { lock.unlock() }
+        appendArchiveRecordLocked(snapshot: snapshot, point: point)
+    }
+
+    private func appendArchiveRecordLocked(snapshot: DiskHealthSnapshot, point: TelemetryHistoryPoint) {
+        let sanitizedKey = sanitizeArchiveKey(snapshot.driveKey)
+        let dir = archiveDirectoryPath
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [
+            .posixPermissions: 0o700
+        ])
+        let filePath = "\(dir)/\(sanitizedKey).jsonl"
 
         let encoder = JSONEncoder()
         guard let data = try? encoder.encode(point),
-              let jsonStr = String(data: data, encoding: .utf8) else { return }
+              let jsonStr = String(data: data, encoding: .utf8),
+              let lineData = (jsonStr + "\n").data(using: .utf8) else { return }
 
-        let line = jsonStr + "\n"
-        if let lineData = line.data(using: .utf8) {
-            let url = URL(fileURLWithPath: filePath)
-            if FileManager.default.fileExists(atPath: filePath) {
-                if let handle = try? FileHandle(forWritingTo: url) {
-                    _ = try? handle.seekToEnd()
-                    try? handle.write(contentsOf: lineData)
-                    try? handle.close()
+        let fd = open(filePath, O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        if fd >= 0 {
+            _ = fchmod(fd, 0o600)
+            lineData.withUnsafeBytes { rawBuf in
+                guard let base = rawBuf.baseAddress else { return }
+                var written = 0
+                while written < rawBuf.count {
+                    let rc = write(fd, base.advanced(by: written), rawBuf.count - written)
+                    if rc > 0 {
+                        written += rc
+                    } else if rc < 0 && errno == EINTR {
+                        continue
+                    } else {
+                        break
+                    }
                 }
-            } else {
-                _ = AtomicFileWriter.writeRestricted(data: lineData, toPath: filePath, permissions: 0o600)
             }
+            close(fd)
+        }
+
+        let lastPrune = lastPruneAttemptByKey[snapshot.driveKey] ?? 0
+        if (snapshot.timestamp - lastPrune) >= 86400.0,
+           let attrs = try? FileManager.default.attributesOfItem(atPath: filePath),
+           let size = attrs[.size] as? UInt64,
+           size > 512 * 1024 {
+            lastPruneAttemptByKey[snapshot.driveKey] = snapshot.timestamp
+            pruneArchiveFileIfNeeded(filePath: filePath, nowTs: snapshot.timestamp, minSizeBytes: 128 * 1024)
+        }
+    }
+
+    /// Prunes JSONL archive entries older than 90 days and writes back atomically with 0600 permissions.
+    func pruneArchiveFileIfNeeded(filePath: String, nowTs: TimeInterval, minSizeBytes: UInt64 = 128 * 1024) {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: filePath),
+              let size = attrs[.size] as? UInt64, size > minSizeBytes else { return }
+
+        guard let content = try? String(contentsOfFile: filePath, encoding: .utf8) else { return }
+        let cutoffTs = nowTs - (90.0 * 86400.0)
+        var keptLines: [String] = []
+        let decoder = JSONDecoder()
+
+        for line in content.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { continue }
+            if let point = try? decoder.decode(TelemetryHistoryPoint.self, from: data) {
+                if point.timestamp >= cutoffTs {
+                    keptLines.append(trimmed)
+                }
+            }
+        }
+
+        let compacted = keptLines.joined(separator: "\n") + (keptLines.isEmpty ? "" : "\n")
+        if let compactedData = compacted.data(using: .utf8) {
+            _ = AtomicFileWriter.writeRestricted(data: compactedData, toPath: filePath, permissions: 0o600)
         }
     }
 
@@ -292,6 +398,8 @@ final class TelemetryHistoryStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         container = TelemetryHistoryContainer()
+        archiveHourlyByDriveKey.removeAll()
+        lastPruneAttemptByKey.removeAll()
         if persistToDisk {
             saveLocked()
         }

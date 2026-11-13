@@ -2,25 +2,15 @@
 // File: DiskHealthMonitor.swift
 // Module: Layer 3 (Telemetry & Domain Engine)
 // Purpose: Central coordinator for single-disk and fleet-wide storage evaluations,
-//          throughput delta tracking, baseline state persistence, and alert dispatch.
-// Concurrency: Thread-safe via NSRecursiveLock (engineLock). UI state synchronized
-//              via Combine @Published on @MainActor.
+//          throughput delta tracking, health rule evaluation, and scan/verify dispatch.
+// Concurrency: Unlocked Phase A (IOKit + ParallelDriveProber I/O) followed by
+//              Phase B under NSRecursiveLock (`engineLock`). UI state published on main.
 // ============================================================================
 
 import Foundation
 import Darwin
 import Combine
 import AppKit
-
-// MARK: - Types & Constants
-
-/// Synchronized ISO 8601 date formatter for daily summary digest comparisons.
-private let dailyDigestDateFormatter: SynchronizedDateFormatter = {
-    let df = SynchronizedDateFormatter()
-    df.locale = Locale(identifier: "en_US_POSIX")
-    df.dateFormat = "yyyy-MM-dd"
-    return df
-}()
 
 /// Primary telemetry coordinator orchestrating multi-disk evaluations,
 /// active canary write/read probes, volume verification, and alert delivery.
@@ -61,20 +51,10 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
     private let engineLock = NSRecursiveLock()
     private var state: DiskPersistentState
     private var lastSavedState: DiskPersistentState?
-    private var previousDriveKey: String = ""
-    private var previousBytesRead: UInt64 = 0
-    private var previousBytesWritten: UInt64 = 0
-    private var previousSampleTime: TimeInterval = 0
     private var lastWakeTime: TimeInterval = 0
     private(set) var isSystemSleeping: Bool = false
     private var recentTemperatureSamples: [String: [(timestamp: TimeInterval, tempC: Int)]] = [:]
     private var defaultTelemetryProvider: any DiskTelemetryProvider = IOKitTelemetryProvider.shared
-
-    private let prettyJSONEncoder: JSONEncoder = {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return encoder
-    }()
 
     private struct DriveThroughputSample {
         var bytesRead: UInt64 = 0
@@ -87,21 +67,41 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
     }
     private var throughputSamplesByDrive: [String: DriveThroughputSample] = [:]
 
+    private struct PreparedTargetInput {
+        let targetMount: String
+        let targetQuery: String
+        let driveKeyHint: String
+        let disambiguatedDriveKey: String?
+        let hardware: DiskHardwareMetrics
+        let mountToInspect: String
+        let isAutoDiscovered: Bool
+        let shouldCheckSubpaths: Bool
+    }
+
+    private struct PreparedTargetTelemetry {
+        let targetMount: String
+        let targetQuery: String
+        let disambiguatedDriveKey: String?
+        let hardware: DiskHardwareMetrics
+        let mountToInspect: String
+        let isAutoDiscovered: Bool
+        let fsMetrics: FilesystemMountMetrics
+        let subpathsStatus: [String: Bool]
+        let apfsContainer: ApfsContainerFleetMetrics?
+        let canaryOk: Bool
+        let canaryLatencyMs: Double
+        let canaryError: String
+        let isQuarantined: Bool
+    }
+
     private init() {
-        let loaded = DiskHealthMonitor.loadState()
+        let loaded = PersistentStateStore.loadState()
         self.state = loaded
         self.lastSavedState = loaded
         self.publishedActionLog = loaded.recentActionExecutions
     }
 
     /// Switches the currently inspected drive in the Menu Bar popover and Settings tabs.
-    ///
-    /// - Parameter key: Unique drive identifier (`serialNumber`, `bsdName`, or `mountPoint`).
-    /// - Note: Concurrency Optimization (SYS2-02): If invoked from the main UI thread,
-    ///   updates `@Published` properties immediately for instantaneous UI responsiveness,
-    ///   and dispatches `engineLock` synchronization asynchronously to a `.userInitiated`
-    ///   background queue. This prevents the main AppKit run loop from beachballing
-    ///   if a background poll is currently holding `engineLock` during `statfs` or `fsync`.
     func selectDashboardDrive(key: String) {
         let applySelectionToLock = { [weak self] in
             guard let self = self else { return }
@@ -162,90 +162,56 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
     // MARK: - State Persistence
 
     static func loadState() -> DiskPersistentState {
-        let path = ConfigManager.shared.stateFilePath
-        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-           var decoded = try? JSONDecoder().decode(DiskPersistentState.self, from: data) {
-            var migrated = false
-            for (k, var d) in decoded.drives {
-                if !d.lastVerifyOk && isNonCorruptionVerifyFailure(d.lastVerifyResult) {
-                    d.lastVerifyOk = true
-                    d.lastVerifyResult = "Skipped: Requires administrator privileges (-69863)"
-                    if d.lastOverallSeverity == HealthSeverity.critical.rawValue {
-                        d.lastOverallSeverity = HealthSeverity.healthy.rawValue
-                    }
-                    decoded.drives[k] = d
-                    migrated = true
-                }
-                if d.lastVerifyOk {
-                    let verifyAlertKey = "\(k):VOLUME_VERIFY_FAILED"
-                    if decoded.lastAlertTimestampByCode.removeValue(forKey: verifyAlertKey) != nil {
-                        migrated = true
-                    }
-                }
-                if d.lastVerifyResult == "Not run yet" && d.lastVerifyTimestamp > 0 {
-                    d.lastVerifyTimestamp = 0
-                    decoded.drives[k] = d
-                    migrated = true
-                }
-            }
-            if decoded.lastAlertTimestampByCode.removeValue(forKey: "VOLUME_VERIFY_FAILED") != nil {
-                migrated = true
-            }
-            if migrated {
-                if decoded.lastOverallSeverity == HealthSeverity.critical.rawValue &&
-                   !decoded.drives.values.contains(where: { $0.lastOverallSeverity == HealthSeverity.critical.rawValue }) {
-                    decoded.lastOverallSeverity = HealthSeverity.healthy.rawValue
-                }
-                let encoder = JSONEncoder()
-                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-                if let outData = try? encoder.encode(decoded) {
-                    _ = AtomicFileWriter.writeRestricted(data: outData, toPath: path, permissions: 0o600)
-                }
-            }
-            return decoded
-        }
-        return DiskPersistentState()
+        PersistentStateStore.loadState()
     }
 
     private func saveStateLocked(force: Bool = false) {
-        let path = ConfigManager.shared.stateFilePath
-        let lockPath = "\(ConfigManager.shared.stateDir)/state.lock"
-        let lockFd = open(lockPath, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
-        if lockFd >= 0 {
-            _ = flock(lockFd, LOCK_EX)
-        }
-        defer {
-            if lockFd >= 0 {
-                _ = flock(lockFd, LOCK_UN)
-                close(lockFd)
-            }
-        }
+        PersistentStateStore.saveState(self.state, lastSavedState: &self.lastSavedState, force: force)
+    }
 
-        if !force, let last = lastSavedState, last == state, FileManager.default.fileExists(atPath: path) {
-            return
+    func recordActionExecutions(_ records: [ActionExecutionRecord]) {
+        guard !records.isEmpty else { return }
+        engineLock.lock()
+        defer { engineLock.unlock() }
+        for rec in records {
+            ActionRuleEngine.shared.appendAuditRecord(rec, to: &self.state)
         }
-        if let data = try? prettyJSONEncoder.encode(state) {
-            if AtomicFileWriter.writeRestricted(data: data, toPath: path, permissions: 0o600) {
-                lastSavedState = state
-            }
-        }
+        saveStateLocked()
     }
 
     // MARK: - System Lifecycle & Sleep/Wake Management
 
     func noteSystemWillSleep() {
         engineLock.lock()
+        if isSystemSleeping {
+            engineLock.unlock()
+            return
+        }
         isSystemSleeping = true
-        previousSampleTime = 0
         engineLock.unlock()
-        ConfigManager.shared.log("System entering sleep; pausing telemetry deltas.")
+
+        let disksToNotify: [DiskHealthSnapshot] = {
+            snapshotLock.lock()
+            defer { snapshotLock.unlock() }
+            if let multi = self.latestMultiSnapshotInternal {
+                return multi.disks
+            }
+            if let single = self.latestSnapshotInternal {
+                return [single]
+            }
+            return []
+        }()
+
+        ConfigManager.shared.log("System entering sleep; pausing telemetry deltas and running pre-sleep rules.")
+        for disk in disksToNotify {
+            _ = ActionRuleEngine.shared.triggerSystemWillSleepRules(for: disk)
+        }
     }
 
     func noteSystemDidWake(at timestamp: TimeInterval = Date().timeIntervalSince1970) {
         engineLock.lock()
         isSystemSleeping = false
         lastWakeTime = timestamp
-        previousSampleTime = 0
         CanaryProbeService.shared.resetCache()
         engineLock.unlock()
         ConfigManager.shared.log("System woke from sleep; applying 8s hardware settle grace period.")
@@ -305,10 +271,6 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         state.monitoredTarget = newTarget
         if targetChanged {
             state.lastOverallSeverity = HealthSeverity.healthy.rawValue
-            previousDriveKey = ""
-            previousBytesRead = 0
-            previousBytesWritten = 0
-            previousSampleTime = 0
             CanaryProbeService.shared.resetCache()
         }
         saveStateLocked()
@@ -318,8 +280,6 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
     func resetBaselines() {
         engineLock.lock()
         defer { engineLock.unlock() }
-        let oldTarget = self.state.monitoredTarget
-        let oldDaily = self.state.dailySummaryEnabled
         let activeSnapshots: [DiskHealthSnapshot] = {
             snapshotLock.lock()
             defer { snapshotLock.unlock() }
@@ -331,76 +291,67 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             }
             return []
         }()
-        if !activeSnapshots.isEmpty {
-            for snap in activeSnapshots {
-                let key = snap.driveKey
-                self.state.updateDriveState(key: key) { d in
-                    d.bsdName = snap.bsdName
-                    d.serialNumber = snap.serialNumber
-                    d.peakTemperatureCelsius = snap.temperatureCelsius
-                    d.baselineUnsafeShutdowns = snap.unsafeShutdowns
-                    d.baselineMediaErrors = snap.mediaErrors
-                    d.baselineErrorLogEntries = snap.errorInfoLogEntries
-                    d.baselineIoReadErrors = snap.errorsRead
-                    d.baselineIoWriteErrors = snap.errorsWritten
-                    d.baselineIoReadRetries = snap.retriesRead
-                    d.baselineIoWriteRetries = snap.retriesWritten
-                }
-            }
-        } else {
-            for k in Array(self.state.drives.keys) {
-                self.state.updateDriveState(key: k) { d in
-                    // Retain known baseline error counts rather than wiping to nil (which would trigger immediate false alerts)
-                    d.baselineUnsafeShutdowns = d.baselineUnsafeShutdowns ?? 0
-                    d.baselineMediaErrors = d.baselineMediaErrors ?? 0
-                    d.baselineErrorLogEntries = d.baselineErrorLogEntries ?? 0
-                    d.baselineIoReadErrors = d.baselineIoReadErrors ?? 0
-                    d.baselineIoWriteErrors = d.baselineIoWriteErrors ?? 0
-                    d.baselineIoReadRetries = d.baselineIoReadRetries ?? 0
-                    d.baselineIoWriteRetries = d.baselineIoWriteRetries ?? 0
-                }
-            }
-            self.state.monitoredTarget = oldTarget
-            self.state.dailySummaryEnabled = oldDaily
-        }
-        for k in Array(self.state.drives.keys) {
-            self.state.updateDriveState(key: k) {
-                $0.lastVerifyOk = true
-                if !$0.lastVerifyResult.starts(with: "Verified OK") {
-                    $0.lastVerifyResult = "Not run yet"
-                    $0.lastVerifyTimestamp = 0
-                }
-                $0.lastOverallSeverity = HealthSeverity.healthy.rawValue
-                $0.consecutiveHealthyPolls = 0
-                $0.consecutiveUnhealthyPolls = 0
-                $0.lastNotifiedSeverity = HealthSeverity.healthy.rawValue
-            }
-        }
-        self.state.lastOverallSeverity = HealthSeverity.healthy.rawValue
-        self.state.lastAlertTimestampByCode.removeAll()
+        PersistentStateStore.resetBaselines(in: &self.state, activeSnapshots: activeSnapshots)
         self.recentTemperatureSamples.removeAll()
         saveStateLocked(force: true)
         ConfigManager.shared.log("Persistent baselines and health state reset for active fleet.")
     }
 
-    // MARK: - Health Evaluation Pipeline
+    // MARK: - Phase A Unlocked Telemetry Collection
 
-    private func evaluateSingleTargetLocked(
+    private func applyTransientSmartRecovery(
+        _ hw: inout DiskHardwareMetrics,
+        prevMulti: MultiDiskHealthSnapshot?,
+        prevSingle: DiskHealthSnapshot?,
+        nowTs: TimeInterval
+    ) {
+        guard hw.found, (!hw.smartValid || hw.temperatureCelsius <= 0) else { return }
+        let bsdName = cStringToSwift(hw.bsdName)
+        let serialNumber = cStringToSwift(hw.serialNumber)
+        let prevSnap = prevMulti?.disks.first(where: {
+            (!bsdName.isEmpty && $0.bsdName == bsdName) ||
+            (!serialNumber.isEmpty && $0.serialNumber == serialNumber)
+        }) ?? prevSingle
+        guard let prev = prevSnap, prev.smartValid, prev.temperatureCelsius > 0, (nowTs - prev.timestamp) < 15.0 else {
+            return
+        }
+        hw.smartValid = true
+        hw.temperatureCelsius = Int32(prev.temperatureCelsius)
+        hw.temperatureKelvin = Int32(prev.temperatureKelvin)
+        hw.criticalWarning = prev.criticalWarning
+        hw.availableSpare = prev.availableSpare
+        hw.availableSpareThreshold = prev.availableSpareThreshold
+        hw.percentageUsed = prev.percentageUsed
+        if hw.dataUnitsRead == 0 { hw.dataUnitsRead = prev.dataUnitsRead }
+        if hw.dataUnitsWritten == 0 { hw.dataUnitsWritten = prev.dataUnitsWritten }
+        if hw.powerCycles == 0 { hw.powerCycles = prev.powerCycles }
+        if hw.powerOnHours == 0 { hw.powerOnHours = prev.powerOnHours }
+        if hw.unsafeShutdowns == 0 { hw.unsafeShutdowns = prev.unsafeShutdowns }
+        if hw.mediaErrors == 0 { hw.mediaErrors = prev.mediaErrors }
+        if hw.errorInfoLogEntries == 0 { hw.errorInfoLogEntries = prev.errorInfoLogEntries }
+    }
+
+    private func shouldCheckSubpaths(cfg: DiskHealthConfig, mountPoint: String) -> Bool {
+        guard !mountPoint.isEmpty && !cfg.requiredSubpaths.isEmpty else { return false }
+        if !cfg.monitorAllDisks && cfg.monitoredTargets.count <= 1 { return true }
+        if let configuredVol = cfg.targetVolumePath, !configuredVol.isEmpty {
+            return mountPoint == (configuredVol as NSString).standardizingPath
+        }
+        return false
+    }
+
+    private func prepareInput(
         targetMount: String,
         targetQuery: String,
-        disambiguatedDriveKey: String? = nil,
+        disambiguatedDriveKey: String?,
         preloadedHardware: DiskHardwareMetrics?,
         isAutoDiscovered: Bool,
-        forceCanary: Bool,
-        allowNotifications: Bool,
-        now: Date,
-        nowTs: TimeInterval,
-        formattedTime: String,
-        formattedShortTime: String,
         cfg: DiskHealthConfig,
-        provider: any DiskTelemetryProvider
-    ) -> DiskHealthSnapshot {
-        // 1. Hardware Telemetry Query
+        provider: any DiskTelemetryProvider,
+        prevMulti: MultiDiskHealthSnapshot?,
+        prevSingle: DiskHealthSnapshot?,
+        nowTs: TimeInterval
+    ) -> PreparedTargetInput {
         var hw: DiskHardwareMetrics
         if let preloaded = preloadedHardware, preloaded.found {
             hw = preloaded
@@ -408,7 +359,279 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             let queryToPass = !targetMount.isEmpty ? targetMount : (!targetQuery.isEmpty ? targetQuery : "auto")
             hw = provider.readHardwareMetrics(query: queryToPass)
         }
+        applyTransientSmartRecovery(&hw, prevMulti: prevMulti, prevSingle: prevSingle, nowTs: nowTs)
 
+        let bsdName = hw.found ? cStringToSwift(hw.bsdName) : ""
+        var resolvedMount = targetMount
+        if resolvedMount.isEmpty && hw.found && !bsdName.isEmpty {
+            if let m = provider.findMountPoint(forBsdName: bsdName) {
+                resolvedMount = m
+            }
+        }
+        var mountToInspect = !resolvedMount.isEmpty ? resolvedMount : (!targetQuery.isEmpty && targetQuery.starts(with: "/") ? targetQuery : "")
+        if isAutoDiscovered && resolvedMount.isEmpty {
+            mountToInspect = ""
+        }
+        let hint = disambiguatedDriveKey ?? (bsdName.isEmpty ? (targetMount.isEmpty ? "default" : targetMount) : bsdName)
+        let checkSub = shouldCheckSubpaths(cfg: cfg, mountPoint: mountToInspect)
+
+        return PreparedTargetInput(
+            targetMount: targetMount,
+            targetQuery: targetQuery,
+            driveKeyHint: hint,
+            disambiguatedDriveKey: disambiguatedDriveKey,
+            hardware: hw,
+            mountToInspect: mountToInspect,
+            isAutoDiscovered: isAutoDiscovered,
+            shouldCheckSubpaths: checkSub
+        )
+    }
+
+    private func collectPhaseATelemetry(
+        cfg: DiskHealthConfig,
+        provider: any DiskTelemetryProvider,
+        forceCanary: Bool,
+        isSystemSleeping: Bool,
+        nowTs: TimeInterval
+    ) -> [PreparedTargetTelemetry] {
+        snapshotLock.lock()
+        let prevMulti = self.latestMultiSnapshotInternal
+        let prevSingle = self.latestSnapshotInternal
+        snapshotLock.unlock()
+
+        var inputs: [PreparedTargetInput] = []
+
+        if cfg.monitorAllDisks {
+            let all = provider.listAllDevices(maxCount: 32)
+            var serialCounts: [String: Int] = [:]
+            for dev in all where dev.found && !DiskHealthMonitor.isVirtualDiskMetrics(dev) {
+                let ser = cStringToSwift(dev.serialNumber).trimmingCharacters(in: .whitespacesAndNewlines)
+                if DiskHealthMonitor.isValidUniqueSerial(ser) {
+                    serialCounts[ser, default: 0] += 1
+                }
+            }
+
+            var seenKeys = Set<String>()
+            var enumeratedDevices: [(dev: DiskHardwareMetrics, key: String)] = []
+            enumeratedDevices.reserveCapacity(all.count)
+            for dev in all where dev.found && !DiskHealthMonitor.isVirtualDiskMetrics(dev) {
+                let ser = cStringToSwift(dev.serialNumber).trimmingCharacters(in: .whitespacesAndNewlines)
+                let bsd = cStringToSwift(dev.bsdName).trimmingCharacters(in: .whitespacesAndNewlines)
+                let key: String
+                if DiskHealthMonitor.isValidUniqueSerial(ser) && (serialCounts[ser] ?? 0) == 1 {
+                    key = ser
+                } else if !ser.isEmpty && !bsd.isEmpty {
+                    key = "\(ser)#\(bsd)"
+                } else {
+                    key = bsd
+                }
+                if key.isEmpty || !seenKeys.contains(key) {
+                    if !key.isEmpty { seenKeys.insert(key) }
+                    enumeratedDevices.append((dev, key))
+                }
+            }
+
+            if !enumeratedDevices.isEmpty {
+                for (dev, key) in enumeratedDevices {
+                    let bsd = cStringToSwift(dev.bsdName)
+                    inputs.append(prepareInput(
+                        targetMount: "",
+                        targetQuery: bsd,
+                        disambiguatedDriveKey: key,
+                        preloadedHardware: dev,
+                        isAutoDiscovered: true,
+                        cfg: cfg,
+                        provider: provider,
+                        prevMulti: prevMulti,
+                        prevSingle: prevSingle,
+                        nowTs: nowTs
+                    ))
+                }
+            } else {
+                inputs.append(prepareInput(
+                    targetMount: cfg.targetVolumePath ?? "",
+                    targetQuery: cfg.targetDeviceQuery ?? "",
+                    disambiguatedDriveKey: nil,
+                    preloadedHardware: nil,
+                    isAutoDiscovered: false,
+                    cfg: cfg,
+                    provider: provider,
+                    prevMulti: prevMulti,
+                    prevSingle: prevSingle,
+                    nowTs: nowTs
+                ))
+            }
+        } else if !cfg.monitoredTargets.isEmpty {
+            for target in cfg.monitoredTargets {
+                let isMount = target.hasPrefix("/")
+                inputs.append(prepareInput(
+                    targetMount: isMount ? target : "",
+                    targetQuery: isMount ? "" : target,
+                    disambiguatedDriveKey: nil,
+                    preloadedHardware: nil,
+                    isAutoDiscovered: false,
+                    cfg: cfg,
+                    provider: provider,
+                    prevMulti: prevMulti,
+                    prevSingle: prevSingle,
+                    nowTs: nowTs
+                ))
+            }
+        } else {
+            inputs.append(prepareInput(
+                targetMount: cfg.targetVolumePath ?? "",
+                targetQuery: cfg.targetDeviceQuery ?? "",
+                disambiguatedDriveKey: nil,
+                preloadedHardware: nil,
+                isAutoDiscovered: false,
+                cfg: cfg,
+                provider: provider,
+                prevMulti: prevMulti,
+                prevSingle: prevSingle,
+                nowTs: nowTs
+            ))
+        }
+
+        if inputs.isEmpty {
+            inputs.append(prepareInput(
+                targetMount: cfg.targetVolumePath ?? "",
+                targetQuery: cfg.targetDeviceQuery ?? "",
+                disambiguatedDriveKey: nil,
+                preloadedHardware: nil,
+                isAutoDiscovered: false,
+                cfg: cfg,
+                provider: provider,
+                prevMulti: prevMulti,
+                prevSingle: prevSingle,
+                nowTs: nowTs
+            ))
+        }
+
+        let batchTargets: [DriveProbeTarget] = inputs.compactMap { inp in
+            guard !inp.mountToInspect.isEmpty else { return nil }
+            return DriveProbeTarget(
+                driveKey: inp.driveKeyHint,
+                mountPath: inp.mountToInspect,
+                isInternal: inp.hardware.isInternal,
+                runCanary: cfg.enableActiveCanary,
+                requiredSubpaths: inp.shouldCheckSubpaths ? cfg.requiredSubpaths : [],
+                inspectApfs: true
+            )
+        }
+
+        let probeResults = ParallelDriveProber.shared.probeAll(
+            targets: batchTargets,
+            forceCanary: forceCanary,
+            isSystemSleeping: isSystemSleeping,
+            nowTs: nowTs,
+            timeoutSeconds: 3.0,
+            telemetry: provider
+        )
+
+        return inputs.map { inp in
+            let probe = probeResults[inp.driveKeyHint]
+            let isQuarantined = probe?.isQuarantined ?? (!inp.mountToInspect.isEmpty && ParallelDriveProber.shared.isMountQuarantined(inp.mountToInspect))
+
+            let fsMetrics: FilesystemMountMetrics
+            if isQuarantined {
+                let totalB = probe?.fsMetrics.totalBytes ?? 0
+                fsMetrics = FilesystemMountMetrics(
+                    isMounted: true,
+                    mountPoint: inp.mountToInspect,
+                    filesystemType: "quarantined",
+                    isReadOnly: false,
+                    totalBytes: totalB,
+                    freeBytes: 0,
+                    purgeableBytes: 0,
+                    usedBytes: totalB,
+                    usedPercent: 0.0
+                )
+            } else if let probedFs = probe?.fsMetrics {
+                fsMetrics = probedFs
+            } else {
+                fsMetrics = provider.inspectFilesystem(mountPath: inp.mountToInspect)
+            }
+
+            let effectiveMount = (inp.isAutoDiscovered && !fsMetrics.isMounted) ? "" : inp.mountToInspect
+            let checkSub = shouldCheckSubpaths(cfg: cfg, mountPoint: effectiveMount)
+            let subpathsStatus: [String: Bool]
+            if !checkSub {
+                subpathsStatus = [:]
+            } else if let probedSub = probe?.subpathsStatus, !probedSub.isEmpty || cfg.requiredSubpaths.isEmpty {
+                subpathsStatus = probedSub
+            } else {
+                subpathsStatus = provider.checkSubpaths(
+                    mountPoint: fsMetrics.mountPoint,
+                    isMounted: fsMetrics.isMounted,
+                    requiredSubpaths: cfg.requiredSubpaths
+                )
+            }
+
+            let apfsContainer: ApfsContainerFleetMetrics?
+            if let probedApfs = probe?.apfsContainer {
+                apfsContainer = probedApfs
+            } else if !isQuarantined && fsMetrics.isMounted && fsMetrics.filesystemType.lowercased() == "apfs" {
+                apfsContainer = provider.inspectApfsContainer(mountPath: fsMetrics.mountPoint)
+            } else {
+                apfsContainer = nil
+            }
+
+            var canaryOk = false
+            var canaryLatencyMs = 0.0
+            var canaryError = fsMetrics.isMounted ? "Canary disabled" : "Volume not mounted"
+            if isQuarantined {
+                canaryOk = false
+                canaryLatencyMs = 3000.0
+                canaryError = probe?.canaryResult?.error ?? "CONTROLLER_UNRESPONSIVE_CIRCUIT_OPEN"
+            } else if fsMetrics.isMounted && cfg.enableActiveCanary {
+                if isSystemSleeping {
+                    canaryOk = true
+                    canaryError = "Suppressed while system is sleeping"
+                } else {
+                    let res = probe?.canaryResult ?? provider.runCanaryProbe(targetMount: fsMetrics.mountPoint, force: forceCanary, nowTs: nowTs)
+                    canaryOk = res.ok
+                    canaryLatencyMs = res.latencyMs
+                    canaryError = res.error
+                    if !canaryOk && inp.isAutoDiscovered {
+                        let postCheck = provider.inspectFilesystem(mountPath: fsMetrics.mountPoint)
+                        if !postCheck.isMounted {
+                            canaryOk = true
+                            canaryError = "Volume unmounted during probe"
+                        }
+                    }
+                }
+            }
+
+            return PreparedTargetTelemetry(
+                targetMount: inp.targetMount,
+                targetQuery: inp.targetQuery,
+                disambiguatedDriveKey: inp.disambiguatedDriveKey,
+                hardware: inp.hardware,
+                mountToInspect: effectiveMount,
+                isAutoDiscovered: inp.isAutoDiscovered,
+                fsMetrics: fsMetrics,
+                subpathsStatus: subpathsStatus,
+                apfsContainer: apfsContainer,
+                canaryOk: canaryOk,
+                canaryLatencyMs: canaryLatencyMs,
+                canaryError: canaryError,
+                isQuarantined: isQuarantined
+            )
+        }
+    }
+
+    // MARK: - Phase B In-Memory Evaluation Under engineLock
+
+    private func evaluatePreparedTargetLocked(
+        prepared: PreparedTargetTelemetry,
+        allowNotifications: Bool,
+        nowTs: TimeInterval,
+        formattedTime: String,
+        formattedShortTime: String,
+        cfg: DiskHealthConfig,
+        provider: any DiskTelemetryProvider
+    ) -> DiskHealthSnapshot {
+        let hw = prepared.hardware
         let vendorName = hw.found ? cStringToSwift(hw.vendorName) : "Generic"
         let productName = hw.found ? cStringToSwift(hw.productName) : "Storage Device"
         let productRevision = hw.found ? cStringToSwift(hw.productRevision) : ""
@@ -417,76 +640,10 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         let interconnect = hw.found ? cStringToSwift(hw.interconnectType) : "Storage"
         let protocolType = hw.found ? cStringToSwift(hw.protocolType) : ""
         let linkSpeedFormatted = formatLinkSpeed(hw.linkSpeedBps, interconnect: interconnect)
-
-        // Transient SMART Glitch Recovery: If drive is physically present but SMART read was dropped due to driver contention,
-        // preserve recent valid SMART telemetry from previous snapshot (< 15s) to prevent menu bar title flapping.
-        if hw.found && (!hw.smartValid || hw.temperatureCelsius <= 0) {
-            let prevSnap = latestMultiSnapshotInternal?.disks.first(where: {
-                (!bsdName.isEmpty && $0.bsdName == bsdName) ||
-                (!serialNumber.isEmpty && $0.serialNumber == serialNumber)
-            }) ?? latestSnapshotInternal
-            if let prev = prevSnap, prev.smartValid && prev.temperatureCelsius > 0 {
-                if (nowTs - prev.timestamp) < 15.0 {
-                    hw.smartValid = true
-                    hw.temperatureCelsius = Int32(prev.temperatureCelsius)
-                    hw.temperatureKelvin = Int32(prev.temperatureKelvin)
-                    hw.criticalWarning = prev.criticalWarning
-                    hw.availableSpare = prev.availableSpare
-                    hw.availableSpareThreshold = prev.availableSpareThreshold
-                    hw.percentageUsed = prev.percentageUsed
-                    if hw.dataUnitsRead == 0 { hw.dataUnitsRead = prev.dataUnitsRead }
-                    if hw.dataUnitsWritten == 0 { hw.dataUnitsWritten = prev.dataUnitsWritten }
-                    if hw.powerCycles == 0 { hw.powerCycles = prev.powerCycles }
-                    if hw.powerOnHours == 0 { hw.powerOnHours = prev.powerOnHours }
-                    if hw.unsafeShutdowns == 0 { hw.unsafeShutdowns = prev.unsafeShutdowns }
-                    if hw.mediaErrors == 0 { hw.mediaErrors = prev.mediaErrors }
-                    if hw.errorInfoLogEntries == 0 { hw.errorInfoLogEntries = prev.errorInfoLogEntries }
-                }
-            }
-        }
-
-        // 2. Resolve Mount Point for this Hardware Device if targetMount is not explicitly set
-        var resolvedMount = targetMount
-        if resolvedMount.isEmpty && hw.found && !bsdName.isEmpty {
-            if let m = provider.findMountPoint(forBsdName: bsdName) {
-                resolvedMount = m
-            }
-        }
-
-        // 3. Mount & Filesystem Inspection
-        var mountToInspect = !resolvedMount.isEmpty ? resolvedMount : (!targetQuery.isEmpty && targetQuery.starts(with: "/") ? targetQuery : "")
-        if isAutoDiscovered && resolvedMount.isEmpty {
-            mountToInspect = ""
-        }
-        let fsMetrics = provider.inspectFilesystem(mountPath: mountToInspect)
-        // If an auto-discovered drive was unmounted/ejected mid-cycle between findMountPoint and statfs,
-        // clear mountToInspect so it is treated as an unmounted physical disk rather than a missing target volume.
-        if isAutoDiscovered && !fsMetrics.isMounted {
-            mountToInspect = ""
-        }
-
-        // 4. Required Subpaths Check (scoped to explicitly configured target volume or single-disk mode)
-        let shouldCheckSubpaths: Bool = {
-            guard !mountToInspect.isEmpty && !cfg.requiredSubpaths.isEmpty else { return false }
-            if !cfg.monitorAllDisks && cfg.monitoredTargets.count <= 1 { return true }
-            if let configuredVol = cfg.targetVolumePath, !configuredVol.isEmpty {
-                return fsMetrics.mountPoint == (configuredVol as NSString).standardizingPath
-            }
-            return false
-        }()
-        let subpathsStatus: [String: Bool]
-        if !shouldCheckSubpaths {
-            subpathsStatus = [:]
-        } else {
-            subpathsStatus = provider.checkSubpaths(
-                mountPoint: fsMetrics.mountPoint,
-                isMounted: fsMetrics.isMounted,
-                requiredSubpaths: cfg.requiredSubpaths
-            )
-        }
+        let fsMetrics = prepared.fsMetrics
 
         let driveKey: String = {
-            if let disambiguated = disambiguatedDriveKey, !disambiguated.isEmpty {
+            if let disambiguated = prepared.disambiguatedDriveKey, !disambiguated.isEmpty {
                 return disambiguated
             }
             if !serialNumber.isEmpty && !DiskHealthSnapshot.isPlaceholderSerial(serialNumber) {
@@ -496,36 +653,12 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
                 return "\(serialNumber)#\(bsdName)"
             }
             if !bsdName.isEmpty { return bsdName }
-            if !resolvedMount.isEmpty { return resolvedMount }
-            if !targetQuery.isEmpty { return targetQuery }
+            if !prepared.mountToInspect.isEmpty { return prepared.mountToInspect }
+            if !prepared.targetQuery.isEmpty { return prepared.targetQuery }
             return "default"
         }()
 
-        // 5. Active I/O Canary Probe
-        var canaryOk = false
-        var canaryLatencyMs = 0.0
-        var canaryError = fsMetrics.isMounted ? "Canary disabled" : "Volume not mounted"
-        if fsMetrics.isMounted && cfg.enableActiveCanary {
-            if isSystemSleeping {
-                canaryOk = true
-                canaryError = "Suppressed while system is sleeping"
-            } else {
-                let res = provider.runCanaryProbe(targetMount: fsMetrics.mountPoint, force: forceCanary, nowTs: nowTs)
-                canaryOk = res.ok
-                canaryLatencyMs = res.latencyMs
-                canaryError = res.error
-                // Guard against mid-probe unmount/ejection of an auto-discovered external drive
-                if !canaryOk && isAutoDiscovered {
-                    let postCheck = provider.inspectFilesystem(mountPath: fsMetrics.mountPoint)
-                    if !postCheck.isMounted {
-                        canaryOk = true
-                        canaryError = "Volume unmounted during probe"
-                    }
-                }
-            }
-        }
-
-        // 6. Throughput & Latency Calculations (tracked per driveKey)
+        // Throughput & Latency Calculations (tracked per driveKey)
         var readMBps = 0.0
         var writeMBps = 0.0
         var intervalReadLatMs = 0.0
@@ -576,92 +709,10 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             ? (Double(hw.totalTimeWriteNs) / Double(hw.operationsWritten) / 1_000_000.0)
             : 0.0)
 
-        // 7. Update Peak Temp & Baselines for this specific physical drive
         var driveState = state.getDriveState(key: driveKey, bsdName: bsdName, serial: serialNumber)
-
-        let tempC = Int(hw.temperatureCelsius)
-        if hw.smartValid && tempC > driveState.peakTemperatureCelsius {
-            driveState.peakTemperatureCelsius = tempC
-        }
-        if hw.smartValid {
-            if driveState.baselineUnsafeShutdowns == nil { driveState.baselineUnsafeShutdowns = hw.unsafeShutdowns }
-            if driveState.baselineMediaErrors == nil { driveState.baselineMediaErrors = 0 }
-            if driveState.baselineErrorLogEntries == nil { driveState.baselineErrorLogEntries = hw.errorInfoLogEntries }
-
-            // Re-baseline on counter decrease (controller reset / firmware refresh)
-            if let prevMedia = driveState.baselineMediaErrors, hw.mediaErrors < prevMedia {
-                driveState.baselineMediaErrors = hw.mediaErrors
-            }
-            if let prevLog = driveState.baselineErrorLogEntries, hw.errorInfoLogEntries < prevLog {
-                driveState.baselineErrorLogEntries = hw.errorInfoLogEntries
-            }
-        }
-        if hw.statsValid {
-            if driveState.baselineIoReadErrors == nil { driveState.baselineIoReadErrors = 0 }
-            if driveState.baselineIoWriteErrors == nil { driveState.baselineIoWriteErrors = 0 }
-            if driveState.baselineIoReadRetries == nil { driveState.baselineIoReadRetries = hw.retriesRead }
-            if driveState.baselineIoWriteRetries == nil { driveState.baselineIoWriteRetries = hw.retriesWritten }
-
-            // Re-baseline on driver stats counter reset (system reboot / drive replug)
-            if let prevR = driveState.baselineIoReadErrors, hw.errorsRead < prevR {
-                driveState.baselineIoReadErrors = hw.errorsRead
-            }
-            if let prevW = driveState.baselineIoWriteErrors, hw.errorsWritten < prevW {
-                driveState.baselineIoWriteErrors = hw.errorsWritten
-            }
-            if let prevRetR = driveState.baselineIoReadRetries, hw.retriesRead < prevRetR {
-                driveState.baselineIoReadRetries = hw.retriesRead
-            }
-            if let prevRetW = driveState.baselineIoWriteRetries, hw.retriesWritten < prevRetW {
-                driveState.baselineIoWriteRetries = hw.retriesWritten
-            }
-        }
-
-        if driveState.baselineBusErrors == 0 && hw.busErrorCount > 0 {
-            driveState.baselineBusErrors = hw.busErrorCount
-        }
-        if driveState.baselineBusResets == 0 && hw.busResetCount > 0 {
-            driveState.baselineBusResets = hw.busResetCount
-        }
-
-        if fsMetrics.isMounted && !fsMetrics.isReadOnly {
-            driveState.wasWritable = true
-        }
-
+        PersistentStateStore.synchronizeBaselines(driveState: &driveState, hardware: hw, filesystem: fsMetrics)
         state.drives[driveKey] = driveState
 
-        // 8. APFS Container Telemetry Inspection (APFS-03)
-        var containerMetrics: ApfsContainerFleetMetrics? = nil
-        if fsMetrics.isMounted && fsMetrics.filesystemType == "apfs" {
-            var cMetrics = DiskApfsContainerMetrics()
-            var vMetrics = [DiskApfsVolumeMetrics](repeating: DiskApfsVolumeMetrics(), count: 32)
-            let vCount = mountToInspect.withCString { cMount in
-                DiskListApfsContainerVolumes(cMount, &cMetrics, &vMetrics, 32)
-            }
-            if vCount > 0 {
-                var vols: [ApfsVolumeRoleMetrics] = []
-                for i in 0..<Int(vCount) {
-                    let item = vMetrics[i]
-                    vols.append(ApfsVolumeRoleMetrics(
-                        bsdName: cStringToSwift(item.bsdName),
-                        name: cStringToSwift(item.name),
-                        role: cStringToSwift(item.role),
-                        totalBytes: item.totalBytes,
-                        usedBytes: item.usedBytes,
-                        freeBytes: item.freeBytes,
-                        isEncrypted: item.isEncrypted
-                    ))
-                }
-                containerMetrics = ApfsContainerFleetMetrics(
-                    containerBsd: cStringToSwift(cMetrics.containerBsd),
-                    totalCapacityBytes: cMetrics.totalCapacityBytes,
-                    freeSpaceBytes: cMetrics.freeSpaceBytes,
-                    volumes: vols
-                )
-            }
-        }
-
-        // 9. Evaluate Health Rules Pipeline
         let inWakeGrace = isSystemSleeping || (lastWakeTime > 0 && (nowTs - lastWakeTime < 8.0))
         let evaluationContext = HealthEvaluationContext(
             nowTs: nowTs,
@@ -669,19 +720,20 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             hardware: hw,
             linkSpeedFormatted: linkSpeedFormatted,
             interconnect: interconnect,
-            mountToInspect: mountToInspect,
+            mountToInspect: prepared.mountToInspect,
             filesystem: fsMetrics,
-            subpathsStatus: subpathsStatus,
-            canaryOk: canaryOk,
-            canaryLatencyMs: canaryLatencyMs,
-            canaryError: canaryError,
+            subpathsStatus: prepared.subpathsStatus,
+            canaryOk: prepared.canaryOk,
+            canaryLatencyMs: prepared.canaryLatencyMs,
+            canaryError: prepared.canaryError,
             avgReadLatMs: avgReadLatMs,
             avgWriteLatMs: avgWriteLatMs,
             inWakeGrace: inWakeGrace,
             hostThermalState: provider.currentHostThermalState(),
             driveState: driveState,
             recentTemperatureSamples: recentTemperatureSamples[driveKey] ?? [],
-            apfsContainer: containerMetrics
+            apfsContainer: prepared.apfsContainer,
+            isControllerUnresponsive: prepared.isQuarantined
         )
 
         var issues: [HealthIssue] = []
@@ -717,8 +769,9 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         let tbRead = Double(hw.dataUnitsRead) * 512_000.0 / 1_000_000_000_000.0
         let tbWritten = Double(hw.dataUnitsWritten) * 512_000.0 / 1_000_000_000_000.0
         let lifeRemaining = max(0, 100 - Int(hw.percentageUsed))
+        let tempC = Int(hw.temperatureCelsius)
 
-        let snapshot = DiskHealthSnapshot(
+        var finalSnapshot = DiskHealthSnapshot(
             timestamp: nowTs,
             formattedTime: formattedTime,
             formattedShortTime: formattedShortTime,
@@ -747,10 +800,10 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             purgeableBytes: fsMetrics.purgeableBytes,
             usedBytes: fsMetrics.usedBytes,
             usedPercent: fsMetrics.usedPercent,
-            subpathsStatus: subpathsStatus,
-            canaryOk: canaryOk,
-            canaryLatencyMs: canaryLatencyMs,
-            canaryError: canaryError,
+            subpathsStatus: prepared.subpathsStatus,
+            canaryOk: prepared.canaryOk,
+            canaryLatencyMs: prepared.canaryLatencyMs,
+            canaryError: prepared.canaryError,
             smartValid: hw.smartValid,
             criticalWarning: hw.criticalWarning,
             temperatureCelsius: tempC,
@@ -787,17 +840,46 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             writeThroughputMBps: writeMBps,
             lastVerifyResult: driveState.lastVerifyResult,
             lastVerifyOk: driveState.lastVerifyOk,
-            customDriveKey: disambiguatedDriveKey,
+            customDriveKey: prepared.disambiguatedDriveKey,
             usbCurrentAvailableMa: hw.usbCurrentAvailableMa,
             usbCurrentRequiredMa: hw.usbCurrentRequiredMa,
-            linkWidthLanes: hw.linkWidthLanes
+            linkWidthLanes: hw.linkWidthLanes,
+            smartSourceType: hw.smartSourceType,
+            isControllerUnresponsive: prepared.isQuarantined,
+            busErrorCount: hw.busErrorCount,
+            busResetCount: hw.busResetCount,
+            damagedExtents: SurfaceScannerService.shared.damagedExtents(forMount: fsMetrics.mountPoint),
+            apfsContainer: prepared.apfsContainer
         )
 
-        if allowNotifications {
-            processAlertsAndDigestLocked(snapshot: snapshot, rawMetrics: hw, driveKey: driveKey)
+        let rolling = TelemetryHistoryStore.shared.computeRollingForecasts(for: finalSnapshot)
+        finalSnapshot.rolling7dTerabytesWrittenPerDay = rolling.rolling7dTBPerDay
+        finalSnapshot.rolling30dTerabytesWrittenPerDay = rolling.rolling30dTBPerDay
+        finalSnapshot.p95WriteLatencyMs = rolling.p95WriteLatencyMs
+        finalSnapshot.p95TemperatureCelsius = rolling.p95TempCelsius
+
+        if let disambiguated = prepared.disambiguatedDriveKey, !disambiguated.isEmpty, disambiguated != finalSnapshot.serialNumber {
+            finalSnapshot.customDriveKey = disambiguated
         }
 
-        // Check if scheduled background volume verification is due
+        if allowNotifications {
+            AlertCoordinator.shared.processAlertsAndDigestLocked(
+                snapshot: finalSnapshot,
+                rawMetrics: hw,
+                driveKey: driveKey,
+                state: &self.state,
+                config: cfg
+            ) { [weak self] updatedLog in
+                if Thread.isMainThread {
+                    self?.publishedActionLog = updatedLog
+                } else {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.publishedActionLog = updatedLog
+                    }
+                }
+            }
+        }
+
         if allowNotifications && !isSystemSleeping && !isVerifyingInternal && cfg.scheduledVerifyIntervalHours > 0 && fsMetrics.isMounted {
             let intervalSec = Double(cfg.scheduledVerifyIntervalHours) * 3600.0
             if (nowTs - driveState.lastVerifyTimestamp) >= intervalSec {
@@ -809,20 +891,6 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             }
         }
 
-        var finalSnapshot = snapshot
-        finalSnapshot.busErrorCount = hw.busErrorCount
-        finalSnapshot.busResetCount = hw.busResetCount
-        finalSnapshot.apfsContainer = containerMetrics
-
-        let rolling = TelemetryHistoryStore.shared.computeRollingForecasts(for: finalSnapshot)
-        finalSnapshot.rolling7dTerabytesWrittenPerDay = rolling.rolling7dTBPerDay
-        finalSnapshot.rolling30dTerabytesWrittenPerDay = rolling.rolling30dTBPerDay
-        finalSnapshot.p95WriteLatencyMs = rolling.p95WriteLatencyMs
-        finalSnapshot.p95TemperatureCelsius = rolling.p95TempCelsius
-
-        if let disambiguated = disambiguatedDriveKey, !disambiguated.isEmpty, disambiguated != finalSnapshot.serialNumber {
-            finalSnapshot.customDriveKey = disambiguated
-        }
         return finalSnapshot
     }
 
@@ -844,14 +912,8 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
     }
 
     /// Evaluates health, performance, and SMART telemetry across all monitored physical storage devices.
-    ///
-    /// - Parameters:
-    ///   - forceCanary: If true, forces an immediate active 512B write probe bypassing the 300s cache.
-    ///   - allowNotifications: If true, dispatches alert notifications for detected issues violating cooldowns.
-    ///   - persistState: If true, saves state.json and latest_status.json (false for read-only CLI calls).
-    ///   - telemetryProvider: Optional custom telemetry provider (used for unit test fault injection).
-    /// - Returns: Aggregated `MultiDiskHealthSnapshot` summarizing fleet health and per-drive metrics.
-    /// - Note: Concurrency: Synchronized via `engineLock`. Dispatches `@Published` updates to main thread.
+    /// Phase A collects IOKit/VFS/canary telemetry without holding `engineLock`; Phase B evaluates
+    /// pure rules and updates persistent state atomically under `engineLock`.
     @discardableResult
     func evaluateAllMonitoredDisks(
         forceCanary: Bool = false,
@@ -859,9 +921,6 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         persistState: Bool = true,
         telemetryProvider: (any DiskTelemetryProvider)? = nil
     ) -> MultiDiskHealthSnapshot {
-        engineLock.lock()
-        defer { engineLock.unlock() }
-
         let provider = telemetryProvider ?? self.defaultTelemetryProvider
         let now = Date()
         let nowTs = now.timeIntervalSince1970
@@ -869,129 +928,31 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         let formattedShortTime = shortTimeFormatter.string(from: now)
         let cfg = ConfigManager.shared.currentConfig
 
-        var snapshots: [DiskHealthSnapshot] = []
+        engineLock.lock()
+        let sleepingAtStart = self.isSystemSleeping
+        engineLock.unlock()
 
-        if cfg.monitorAllDisks {
-            let all = provider.listAllDevices(maxCount: 32)
-            var serialCounts: [String: Int] = [:]
-            for dev in all where dev.found && !DiskHealthMonitor.isVirtualDiskMetrics(dev) {
-                let ser = cStringToSwift(dev.serialNumber).trimmingCharacters(in: .whitespacesAndNewlines)
-                if DiskHealthMonitor.isValidUniqueSerial(ser) {
-                    serialCounts[ser, default: 0] += 1
-                }
-            }
+        // Phase A: Concurrent Unlocked Telemetry Acquisition
+        let preparedTargets = collectPhaseATelemetry(
+            cfg: cfg,
+            provider: provider,
+            forceCanary: forceCanary,
+            isSystemSleeping: sleepingAtStart,
+            nowTs: nowTs
+        )
 
-            var seenKeys = Set<String>()
-            var enumeratedDevices: [(dev: DiskHardwareMetrics, key: String)] = []
-            enumeratedDevices.reserveCapacity(all.count)
-            for dev in all where dev.found && !DiskHealthMonitor.isVirtualDiskMetrics(dev) {
-                let ser = cStringToSwift(dev.serialNumber).trimmingCharacters(in: .whitespacesAndNewlines)
-                let bsd = cStringToSwift(dev.bsdName).trimmingCharacters(in: .whitespacesAndNewlines)
-                let key: String
-                if DiskHealthMonitor.isValidUniqueSerial(ser) && (serialCounts[ser] ?? 0) == 1 {
-                    key = ser
-                } else if !ser.isEmpty && !bsd.isEmpty {
-                    key = "\(ser)#\(bsd)"
-                } else {
-                    key = bsd
-                }
-                if key.isEmpty || !seenKeys.contains(key) {
-                    if !key.isEmpty { seenKeys.insert(key) }
-                    enumeratedDevices.append((dev, key))
-                }
-            }
-
-            if !enumeratedDevices.isEmpty {
-                for (dev, key) in enumeratedDevices {
-                    let bsd = cStringToSwift(dev.bsdName)
-                    let snap = evaluateSingleTargetLocked(
-                        targetMount: "",
-                        targetQuery: bsd,
-                        disambiguatedDriveKey: key,
-                        preloadedHardware: dev,
-                        isAutoDiscovered: true,
-                        forceCanary: forceCanary,
-                        allowNotifications: allowNotifications,
-                        now: now,
-                        nowTs: nowTs,
-                        formattedTime: formattedTime,
-                        formattedShortTime: formattedShortTime,
-                        cfg: cfg,
-                        provider: provider
-                    )
-                    snapshots.append(snap)
-                }
-            } else {
-                let snap = evaluateSingleTargetLocked(
-                    targetMount: cfg.targetVolumePath ?? "",
-                    targetQuery: cfg.targetDeviceQuery ?? "",
-                    preloadedHardware: nil,
-                    isAutoDiscovered: false,
-                    forceCanary: forceCanary,
-                    allowNotifications: allowNotifications,
-                    now: now,
-                    nowTs: nowTs,
-                    formattedTime: formattedTime,
-                    formattedShortTime: formattedShortTime,
-                    cfg: cfg,
-                    provider: provider
-                )
-                snapshots.append(snap)
-            }
-        } else if !cfg.monitoredTargets.isEmpty {
-            for target in cfg.monitoredTargets {
-                let isMount = target.hasPrefix("/")
-                let snap = evaluateSingleTargetLocked(
-                    targetMount: isMount ? target : "",
-                    targetQuery: isMount ? "" : target,
-                    preloadedHardware: nil,
-                    isAutoDiscovered: false,
-                    forceCanary: forceCanary,
-                    allowNotifications: allowNotifications,
-                    now: now,
-                    nowTs: nowTs,
-                    formattedTime: formattedTime,
-                    formattedShortTime: formattedShortTime,
-                    cfg: cfg,
-                    provider: provider
-                )
-                snapshots.append(snap)
-            }
-        } else {
-            let snap = evaluateSingleTargetLocked(
-                targetMount: cfg.targetVolumePath ?? "",
-                targetQuery: cfg.targetDeviceQuery ?? "",
-                preloadedHardware: nil,
-                isAutoDiscovered: false,
-                forceCanary: forceCanary,
+        // Phase B: Synchronized Delta, Rule, State & Alert Evaluation
+        engineLock.lock()
+        let snapshots = preparedTargets.map { prepared in
+            evaluatePreparedTargetLocked(
+                prepared: prepared,
                 allowNotifications: allowNotifications,
-                now: now,
                 nowTs: nowTs,
                 formattedTime: formattedTime,
                 formattedShortTime: formattedShortTime,
                 cfg: cfg,
                 provider: provider
             )
-            snapshots.append(snap)
-        }
-
-        // Safe fallback if target filtering yielded 0 snapshots (eliminates force unwrap trap)
-        if snapshots.isEmpty {
-            let fallback = evaluateSingleTargetLocked(
-                targetMount: cfg.targetVolumePath ?? "",
-                targetQuery: cfg.targetDeviceQuery ?? "",
-                preloadedHardware: nil,
-                isAutoDiscovered: false,
-                forceCanary: forceCanary,
-                allowNotifications: allowNotifications,
-                now: now,
-                nowTs: nowTs,
-                formattedTime: formattedTime,
-                formattedShortTime: formattedShortTime,
-                cfg: cfg,
-                provider: provider
-            )
-            snapshots.append(fallback)
         }
 
         var worstSeverity: HealthSeverity = .healthy
@@ -1037,19 +998,10 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             for snap in snapshots {
                 _ = TelemetryHistoryStore.shared.recordSnapshot(snap, persistToDisk: true)
             }
-            // Save latest_status.json (single disk writes primary for full backward compatibility, multi writes multi)
-            if multi.disks.count > 1 {
-                if let jsonData = try? prettyJSONEncoder.encode(multi) {
-                    _ = AtomicFileWriter.writeRestricted(data: jsonData, toPath: ConfigManager.shared.latestJsonPath, permissions: 0o600)
-                }
-            } else {
-                if let jsonData = try? prettyJSONEncoder.encode(primary) {
-                    _ = AtomicFileWriter.writeRestricted(data: jsonData, toPath: ConfigManager.shared.latestJsonPath, permissions: 0o600)
-                }
-            }
-
+            PersistentStateStore.saveLatestStatus(multi: multi, primary: primary)
             saveStateLocked()
         }
+        engineLock.unlock()
 
         if Thread.isMainThread {
             if self.selectedDashboardDriveKey != resolvedSelectedKey {
@@ -1072,13 +1024,6 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
     }
 
     /// Backward-compatible single-drive evaluation returning the snapshot of the selected drive.
-    ///
-    /// - Parameters:
-    ///   - forceCanary: If true, forces an immediate active 512B write probe bypassing the 300s cache.
-    ///   - allowNotifications: If true, dispatches alert notifications for detected issues violating cooldowns.
-    ///   - persistState: If true, saves state.json and latest_status.json (false for read-only CLI calls).
-    ///   - telemetryProvider: Optional custom telemetry provider (used for unit test fault injection).
-    /// - Returns: `DiskHealthSnapshot` of the currently selected or primary dashboard drive.
     @discardableResult
     func evaluateHealth(
         forceCanary: Bool = false,
@@ -1093,211 +1038,6 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             telemetryProvider: telemetryProvider
         )
         return self.currentSnapshot ?? multi.primarySnapshot ?? multi.disks[0]
-    }
-
-    private static let transientWarningCodes: Set<String> = [
-        "IO_LATENCY_WARNING",
-        "CANARY_HIGH_LATENCY",
-        "TEMP_RAPID_RISE"
-    ]
-
-    private func processAlertsAndDigestLocked(snapshot: DiskHealthSnapshot, rawMetrics hw: DiskHardwareMetrics, driveKey: String) {
-        let nowTs = snapshot.timestamp
-        let cfg = ConfigManager.shared.currentConfig
-        let cooldown = cfg.alertCooldownSeconds
-        var shouldSendAlert = false
-        var deferSeverityUpdateForHysteresis = false
-
-        if snapshot.overallSeverity != .healthy && !snapshot.issues.isEmpty {
-            var currentUnhealthyPolls = 1
-            self.state.updateDriveState(key: driveKey) {
-                $0.consecutiveUnhealthyPolls += 1
-                $0.consecutiveHealthyPolls = 0
-                currentUnhealthyPolls = $0.consecutiveUnhealthyPolls
-            }
-
-            let isPurelyTransientSpike = snapshot.overallSeverity == .warning &&
-                snapshot.issues.allSatisfy { DiskHealthMonitor.transientWarningCodes.contains($0.code) }
-
-            if isPurelyTransientSpike && currentUnhealthyPolls < 2 {
-                // Defer single-poll transient latency/thermal spike alert until confirmed on 2nd consecutive poll
-                deferSeverityUpdateForHysteresis = true
-            } else {
-                for issue in snapshot.issues {
-                    let scopedKey = "\(driveKey):\(issue.code)"
-                    if let legacyTs = state.lastAlertTimestampByCode.removeValue(forKey: issue.code) {
-                        if state.lastAlertTimestampByCode[scopedKey] == nil {
-                            state.lastAlertTimestampByCode[scopedKey] = legacyTs
-                        }
-                    }
-                    let lastSent = state.lastAlertTimestampByCode[scopedKey] ?? 0
-                    if (nowTs - lastSent) >= cooldown {
-                        shouldSendAlert = true
-                        state.lastAlertTimestampByCode[scopedKey] = nowTs
-                    }
-                }
-            }
-        }
-
-        if shouldSendAlert {
-            let alertTitle = snapshot.overallSeverity == .critical
-                ? "\(snapshot.productName) CRITICAL HEALTH ALERT"
-                : "\(snapshot.productName) HEALTH WARNING"
-
-            ConfigManager.shared.log("Alert triggered: \(alertTitle) — \(snapshot.issues.map { $0.title }.joined(separator: ", "))")
-
-            if cfg.enableCriticalSoundAlert && snapshot.overallSeverity == .critical && MacOSNotifier.hasValidAppBundle {
-                DispatchQueue.main.async {
-                    NSSound.beep()
-                }
-            }
-
-            // Send macOS notification
-            if cfg.enableNativeNotifications {
-                let body = snapshot.issues.map { "• \($0.title)" }.joined(separator: "\n")
-                MacOSNotifier.shared.postNotification(
-                    title: alertTitle,
-                    subtitle: "Score: \(snapshot.healthScore)/100 (\(snapshot.overallSeverity.rawValue))",
-                    body: body,
-                    identifier: "disk-health-alert-\(driveKey)"
-                )
-            }
-
-            // Advance persistent baselines so user is not repeatedly alerted for the same historical event
-            if snapshot.issues.contains(where: { $0.code == "NEW_UNSAFE_SHUTDOWN" }) && hw.smartValid {
-                self.state.updateDriveState(key: driveKey) { $0.baselineUnsafeShutdowns = hw.unsafeShutdowns }
-            }
-            if snapshot.issues.contains(where: { $0.code == "ERROR_LOG_INCREASED" }) && hw.smartValid {
-                self.state.updateDriveState(key: driveKey) { $0.baselineErrorLogEntries = hw.errorInfoLogEntries }
-            }
-            if snapshot.issues.contains(where: { $0.code == "IO_DRIVER_RETRIES" }) && hw.statsValid {
-                self.state.updateDriveState(key: driveKey) {
-                    $0.baselineIoReadRetries = hw.retriesRead
-                    $0.baselineIoWriteRetries = hw.retriesWritten
-                }
-            }
-            if snapshot.issues.contains(where: { $0.code == "IO_DRIVER_ERRORS" }) && hw.statsValid {
-                self.state.updateDriveState(key: driveKey) {
-                    $0.baselineIoReadErrors = hw.errorsRead
-                    $0.baselineIoWriteErrors = hw.errorsWritten
-                }
-            }
-            if snapshot.issues.contains(where: { $0.code == "MEDIA_ERRORS" }) && hw.smartValid {
-                self.state.updateDriveState(key: driveKey) {
-                    $0.baselineMediaErrors = hw.mediaErrors
-                }
-            }
-
-            self.state.updateDriveState(key: driveKey) {
-                $0.lastNotifiedSeverity = snapshot.overallSeverity.rawValue
-            }
-
-            // Send Telegram alert
-            let htmlMsg = TelegramNotifier.shared.formatReportHTML(snapshot: snapshot, title: alertTitle)
-            notificationGroup.enter()
-            TelegramNotifier.shared.sendMessageAsync(htmlText: htmlMsg, disableNotification: false) { [weak self] _ in
-                self?.notificationGroup.leave()
-            }
-            notificationGroup.enter()
-            WebhookNotifier.shared.sendWebhookAsync(snapshot: snapshot, title: alertTitle, eventType: "health_alert") { [weak self] _ in
-                self?.notificationGroup.leave()
-            }
-            executeAlertScriptAsync(snapshot: snapshot, title: alertTitle, eventType: "health_alert")
-        } else if snapshot.overallSeverity == .healthy {
-            var driveState = self.state.getDriveState(key: driveKey)
-            driveState.consecutiveHealthyPolls += 1
-            driveState.consecutiveUnhealthyPolls = 0
-
-            let previouslyAlerted = driveState.lastNotifiedSeverity != HealthSeverity.healthy.rawValue
-            if previouslyAlerted && driveState.consecutiveHealthyPolls >= 2 {
-                let recoveryTitle = "\(snapshot.productName) RECOVERED — HEALTHY"
-                ConfigManager.shared.log("Drive \(driveKey) recovered to HEALTHY state.")
-                driveState.lastNotifiedSeverity = HealthSeverity.healthy.rawValue
-                driveState.lastRecoveryTimestamp = nowTs
-
-                // Recovery hold: retain cooldowns older than 900s, preventing rapid flapping alert spam
-                let prefix = "\(driveKey):"
-                for key in Array(state.lastAlertTimestampByCode.keys) where key.hasPrefix(prefix) || !key.contains(":") {
-                    let ts = state.lastAlertTimestampByCode[key] ?? 0
-                    if (nowTs - ts) > 900.0 {
-                        state.lastAlertTimestampByCode.removeValue(forKey: key)
-                    }
-                }
-
-                if cfg.enableNativeNotifications {
-                    MacOSNotifier.shared.postNotification(
-                        title: recoveryTitle,
-                        subtitle: "Score: \(snapshot.healthScore)/100",
-                        body: "All storage and filesystem health checks passed.",
-                        identifier: "disk-health-alert-\(driveKey)"
-                    )
-                }
-
-                let msg = TelegramNotifier.shared.formatReportHTML(snapshot: snapshot, title: recoveryTitle)
-                notificationGroup.enter()
-                TelegramNotifier.shared.sendMessageAsync(htmlText: msg, disableNotification: false) { [weak self] _ in
-                    self?.notificationGroup.leave()
-                }
-                notificationGroup.enter()
-                WebhookNotifier.shared.sendWebhookAsync(snapshot: snapshot, title: recoveryTitle, eventType: "health_recovered") { [weak self] _ in
-                    self?.notificationGroup.leave()
-                }
-                executeAlertScriptAsync(snapshot: snapshot, title: recoveryTitle, eventType: "health_recovered")
-            }
-            state.drives[driveKey] = driveState
-        }
-
-        let prevOverallSeverity = HealthSeverity(rawValue: self.state.getDriveState(key: driveKey).lastOverallSeverity)
-        if !deferSeverityUpdateForHysteresis {
-            state.updateDriveState(key: driveKey) {
-                $0.lastOverallSeverity = snapshot.overallSeverity.rawValue
-            }
-        }
-
-        // Evaluate Declarative Action Rules ("When X Happens, Do Y")
-        let historyRates = TelemetryHistoryStore.shared.computeRateMetrics(for: snapshot)
-        let executedRecords = ActionRuleEngine.shared.evaluateAndExecuteRules(
-            for: snapshot,
-            previousSeverity: prevOverallSeverity,
-            state: &self.state,
-            config: cfg,
-            historyRates: historyRates,
-            nowTs: nowTs,
-            forceDryRun: false
-        )
-        if !executedRecords.isEmpty {
-            let updatedLog = self.state.recentActionExecutions
-            if Thread.isMainThread {
-                self.publishedActionLog = updatedLog
-            } else {
-                DispatchQueue.main.async { [weak self] in
-                    self?.publishedActionLog = updatedLog
-                }
-            }
-        }
-
-        // Daily Digest at 09:00 (Per-Drive Scoped)
-        if state.dailySummaryEnabled {
-            let digestScopedKey = "\(driveKey):DAILY_DIGEST"
-            let lastDigestTs = state.lastAlertTimestampByCode[digestScopedKey] ?? 0
-            if lastDigestTs == 0 {
-                state.lastAlertTimestampByCode[digestScopedKey] = nowTs
-                if state.lastDailySummaryDate.isEmpty {
-                    state.lastDailySummaryDate = dailyDigestDateFormatter.string(from: Date(timeIntervalSince1970: nowTs))
-                }
-            } else if (nowTs - lastDigestTs) >= 20 * 3600 {
-                let nowDate = Date(timeIntervalSince1970: nowTs)
-                if Calendar.current.component(.hour, from: nowDate) >= 9 {
-                    state.lastDailySummaryDate = dailyDigestDateFormatter.string(from: nowDate)
-                    state.lastAlertTimestampByCode[digestScopedKey] = nowTs
-                    let msg = TelegramNotifier.shared.formatReportHTML(snapshot: snapshot, title: "\(snapshot.productName) Daily Health Digest")
-                    notificationGroup.enter()
-                    TelegramNotifier.shared.sendMessageAsync(htmlText: msg, disableNotification: true) { [weak self] _ in
-                        self?.notificationGroup.leave()
-                    }
-                }
-            }
-        }
     }
 
     // MARK: - Volume Verification Delegation
@@ -1376,47 +1116,14 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         }
     }
 
-    // MARK: - Custom Alert Script Execution Hook
-
-    private let notificationGroup = DispatchGroup()
+    // MARK: - Alert Coordinator Forwarding & Automation Simulation
 
     func waitForPendingNotifications(timeout: TimeInterval = 16.0) {
-        _ = notificationGroup.wait(timeout: .now() + timeout)
-    }
-
-    private static func makeCleanAlertScriptEnvironment(snapshot: DiskHealthSnapshot, title: String, eventType: String) -> [String: String] {
-        var env: [String: String] = [:]
-        let safeKeys = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "SHELL", "TMPDIR"]
-        let currentEnv = ProcessInfo.processInfo.environment
-        for k in safeKeys {
-            if let val = currentEnv[k] { env[k] = val }
-        }
-        if env["PATH"] == nil {
-            env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
-        }
-        env["DISK_HEALTH_EVENT"] = eventType
-        env["DISK_HEALTH_TITLE"] = title
-        env["DISK_HEALTH_SEVERITY"] = snapshot.overallSeverity.rawValue
-        env["DISK_HEALTH_SCORE"] = "\(snapshot.healthScore)"
-        env["DISK_HEALTH_DEVICE"] = "\(snapshot.vendorName) \(snapshot.productName)".trimmingCharacters(in: .whitespaces)
-        env["DISK_HEALTH_BSD_NAME"] = snapshot.bsdName
-        env["DISK_HEALTH_MOUNT_POINT"] = snapshot.mountPoint
-        env["DISK_HEALTH_TEMP_C"] = "\(snapshot.temperatureCelsius)"
-        env["DISK_HEALTH_ISSUES"] = snapshot.issues.map { "[\($0.code)] \($0.title)" }.joined(separator: "; ")
-        return env
+        AlertCoordinator.shared.waitForPendingNotifications(timeout: timeout)
     }
 
     static func makeRuleScriptEnvironment(snapshot: DiskHealthSnapshot, rule: ActionRule, triggerReason: String) -> [String: String] {
-        var env = makeCleanAlertScriptEnvironment(
-            snapshot: snapshot,
-            title: "Automation Rule: \(rule.name)",
-            eventType: "automation_rule"
-        )
-        env["DISK_HEALTH_RULE_ID"] = rule.id
-        env["DISK_HEALTH_RULE_NAME"] = rule.name
-        env["DISK_HEALTH_TRIGGER_REASON"] = triggerReason
-        env["DISK_HEALTH_ACTION_TYPE"] = rule.actionType.rawValue
-        return env
+        AlertCoordinator.makeRuleScriptEnvironment(snapshot: snapshot, rule: rule, triggerReason: triggerReason)
     }
 
     /// Simulates or live-executes an `ActionRule` against either a provided snapshot or a synthetic matching snapshot,
@@ -1435,7 +1142,8 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
             rule: rule,
             snapshot: targetSnap,
             previousSeverity: prevSev,
-            historyRates: simRates
+            historyRates: simRates,
+            isSleepNotificationEvent: (rule.triggerMetric == .systemWillSleep)
         )
 
         let record = ActionRuleEngine.shared.executeRuleAction(
@@ -1479,87 +1187,9 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         }
     }
 
-    /// Executes the user-configured alert script synchronously with a timeout watchdog.
-    ///
-    /// - Parameter timeoutSec: Watchdog duration in seconds (default 15.0s).
-    /// - Returns: Success with stdout/stderr output, or DiskHealthError.
-    /// - Note: Invariant (PROC-PIPE-01): Strips sensitive secrets (TELEGRAM_BOT_TOKEN, WEBHOOK_URL)
-    ///   from child process environment and drains pipe file handle to prevent buffer deadlock.
     func testAlertScriptResult(timeoutSec: TimeInterval = 15.0) -> Result<String, DiskHealthError> {
-        let rawScriptPath = ConfigManager.shared.resolvedAlertScriptPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !rawScriptPath.isEmpty else {
-            return .failure(.configurationInvalid(reason: "No alert script configured. Set alertScriptPath in Settings or via ALERT_SCRIPT_PATH environment variable."))
-        }
-        let expandedPath = (rawScriptPath as NSString).expandingTildeInPath
-        guard FileManager.default.isExecutableFile(atPath: expandedPath) else {
-            return .failure(.scriptNotExecutable(path: expandedPath))
-        }
-        guard ConfigManager.isSecureUserOwnedFile(atPath: expandedPath) else {
-            return .failure(.configurationInvalid(reason: "Alert script '\(expandedPath)' must be owned by current user (or root) and not group/world-writable."))
-        }
-
         let snap = self.currentSnapshot ?? self.evaluateHealth(forceCanary: false, allowNotifications: false, persistState: false)
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: expandedPath)
-        let pipeOut = Pipe()
-        proc.standardInput = FileHandle.nullDevice
-        proc.standardOutput = pipeOut
-        proc.standardError = pipeOut
-        let readHandle = pipeOut.fileHandleForReading
-
-        proc.environment = DiskHealthMonitor.makeCleanAlertScriptEnvironment(snapshot: snap, title: "\(snap.productName) Alert Script Test", eventType: "test_alert")
-
-        do {
-            try proc.run()
-            let pid = proc.processIdentifier
-            let timeoutLock = NSLock()
-            var timedOut = false
-            var killWorkItem: DispatchWorkItem?
-            let watchdog = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-            watchdog.schedule(deadline: .now() + timeoutSec)
-            watchdog.setEventHandler {
-                if proc.isRunning {
-                    timeoutLock.lock()
-                    timedOut = true
-                    timeoutLock.unlock()
-                    VolumeVerifierService.terminateProcessAndChildren(pid: pid, signal: SIGTERM)
-                    proc.terminate()
-                    let escalation = DispatchWorkItem {
-                        if pid > 0 {
-                            VolumeVerifierService.terminateProcessAndChildren(pid: pid, signal: SIGKILL)
-                        }
-                    }
-                    timeoutLock.lock()
-                    killWorkItem = escalation
-                    timeoutLock.unlock()
-                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0, execute: escalation)
-                }
-            }
-            watchdog.resume()
-
-            let outputData = (try? readHandle.readToEnd()) ?? Data()
-            proc.waitUntilExit()
-            watchdog.cancel()
-            timeoutLock.lock()
-            killWorkItem?.cancel()
-            let didTimeout = timedOut
-            timeoutLock.unlock()
-            try? readHandle.close()
-
-            let outputStr = String(data: outputData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let outSuffix = outputStr.isEmpty ? "" : "\n\(outputStr)"
-            if didTimeout {
-                return .failure(.scriptExecutionFailed(exitCode: -1, output: "❌ Alert script timed out after \(Int(timeoutSec))s.\(outSuffix)"))
-            }
-            if proc.terminationStatus == 0 {
-                return .success("✅ Alert script executed successfully (exit code 0).\(outSuffix)")
-            } else {
-                return .failure(.scriptExecutionFailed(exitCode: proc.terminationStatus, output: "❌ Alert script failed with exit code \(proc.terminationStatus).\(outSuffix)"))
-            }
-        } catch {
-            try? readHandle.close()
-            return .failure(.scriptExecutionFailed(exitCode: -1, output: "❌ Failed to execute alert script: \(error.localizedDescription)"))
-        }
+        return AlertCoordinator.shared.testAlertScriptResult(snapshot: snap, timeoutSec: timeoutSec)
     }
 
     func testAlertScript() -> (ok: Bool, summary: String) {
@@ -1580,84 +1210,56 @@ final class DiskHealthMonitor: ObservableObject, @unchecked Sendable {
         }
     }
 
-    private func executeAlertScriptAsync(snapshot: DiskHealthSnapshot, title: String, eventType: String) {
-        let rawScriptPath = ConfigManager.shared.resolvedAlertScriptPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !rawScriptPath.isEmpty else { return }
-        let expandedPath = (rawScriptPath as NSString).expandingTildeInPath
-        guard FileManager.default.isExecutableFile(atPath: expandedPath) else {
-            ConfigManager.shared.log("Alert script skipped (not executable): \(expandedPath)")
-            return
-        }
-        guard ConfigManager.isSecureUserOwnedFile(atPath: expandedPath) else {
-            ConfigManager.shared.log("Alert script skipped (insecure permissions/ownership): \(expandedPath)")
-            return
-        }
-
-        notificationGroup.enter()
-        DispatchQueue.global(qos: .utility).async {
-            defer { self.notificationGroup.leave() }
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: expandedPath)
-            proc.standardInput = FileHandle.nullDevice
-            proc.standardOutput = FileHandle.nullDevice
-            proc.standardError = FileHandle.nullDevice
-            proc.environment = DiskHealthMonitor.makeCleanAlertScriptEnvironment(snapshot: snapshot, title: title, eventType: eventType)
-
-            do {
-                try proc.run()
-                let pid = proc.processIdentifier
-                let timeoutLock = NSLock()
-                var killWorkItem: DispatchWorkItem?
-                let watchdog = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-                watchdog.schedule(deadline: .now() + 15.0)
-                watchdog.setEventHandler {
-                    if proc.isRunning {
-                        VolumeVerifierService.terminateProcessAndChildren(pid: pid, signal: SIGTERM)
-                        proc.terminate()
-                        let escalation = DispatchWorkItem {
-                            if proc.isRunning && pid > 0 {
-                                VolumeVerifierService.terminateProcessAndChildren(pid: pid, signal: SIGKILL)
-                            }
-                        }
-                        timeoutLock.lock()
-                        killWorkItem = escalation
-                        timeoutLock.unlock()
-                        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0, execute: escalation)
-                    }
-                }
-                watchdog.resume()
-                proc.waitUntilExit()
-                watchdog.cancel()
-                timeoutLock.lock()
-                killWorkItem?.cancel()
-                timeoutLock.unlock()
-                ConfigManager.shared.log("Alert script executed (\(expandedPath)): exit=\(proc.terminationStatus)")
-            } catch {
-                ConfigManager.shared.log("Alert script failed to launch (\(expandedPath)): \(error.localizedDescription)")
-            }
-        }
-    }
-
     // MARK: - Surface Read Scan Delegation
 
     func runSurfaceReadScan(
+        targetMount: String? = nil,
         mode: SurfaceScanMode = .quick,
         maxBytesToScan: UInt64? = nil,
         cancellationToken: SurfaceScanCancellationToken? = nil,
         progressHandler: ((SurfaceScanProgress) -> Void)? = nil
     ) -> (ok: Bool, filesScanned: Int, bytesScanned: UInt64, readErrors: Int, elapsedMs: Double, summary: String) {
-        let snap = self.currentSnapshot ?? self.evaluateHealth(forceCanary: false, allowNotifications: false)
-        guard snap.isMounted, !snap.mountPoint.isEmpty else {
-            return (false, 0, 0, 1, 0.0, "Surface scan aborted: Target volume is not mounted.")
+        let provider = self.defaultTelemetryProvider
+        let targetPath: String = {
+            if let explicit = targetMount, !explicit.isEmpty { return explicit }
+            if let cfgTarget = ConfigManager.shared.currentConfig.targetVolumePath, !cfgTarget.isEmpty { return cfgTarget }
+            if let snap = self.currentSnapshot, snap.isMounted, !snap.mountPoint.isEmpty, !snap.isControllerUnresponsive {
+                return snap.mountPoint
+            }
+            if let multi = self.currentMultiSnapshot {
+                if let healthyInternal = multi.disks.first(where: { $0.isInternal && $0.isMounted && !$0.isControllerUnresponsive }) {
+                    return healthyInternal.mountPoint
+                }
+                if let healthyAny = multi.disks.first(where: { $0.isMounted && !$0.isControllerUnresponsive }) {
+                    return healthyAny.mountPoint
+                }
+            }
+            return "/"
+        }()
+
+        if ParallelDriveProber.shared.isMountQuarantined(targetPath) {
+            return (false, 0, 0, 1, 0.0, "Surface scan aborted: Target volume '\(targetPath)' is quarantined due to unresponsive storage controller.")
         }
-        return SurfaceScannerService.shared.runSurfaceReadScan(
-            mountPoint: snap.mountPoint,
-            totalBytes: snap.totalBytes,
-            freeBytes: snap.freeBytes,
+
+        let fsMetrics = provider.inspectFilesystem(mountPath: targetPath)
+        guard fsMetrics.isMounted, !fsMetrics.mountPoint.isEmpty else {
+            return (false, 0, 0, 1, 0.0, "Surface scan aborted: Target volume '\(targetPath)' is not mounted.")
+        }
+
+        let res = SurfaceScannerService.shared.runSurfaceReadScan(
+            mountPoint: fsMetrics.mountPoint,
+            totalBytes: fsMetrics.totalBytes,
+            freeBytes: fsMetrics.freeBytes,
             mode: mode,
             maxBytesToScan: maxBytesToScan,
             cancellationToken: cancellationToken,
             progressHandler: progressHandler
         )
+        if res.readErrors > 0 || !SurfaceScannerService.shared.damagedExtents(forMount: fsMetrics.mountPoint).isEmpty {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                _ = self?.evaluateAllMonitoredDisks(forceCanary: false, allowNotifications: false, persistState: false)
+            }
+        }
+        return res
     }
 }

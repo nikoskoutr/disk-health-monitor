@@ -758,8 +758,8 @@ struct CoreLogicTestRunner {
         assertTrue(!kAppArchitecture.isEmpty, "kAppArchitecture must not be empty")
         assertTrue(!kAppArchShort.isEmpty, "kAppArchShort must not be empty")
         assertTrue(kAppArchShort == "arm64" || kAppArchShort == "x86_64", "kAppArchShort must be either arm64 or x86_64")
-        assertTrue(kAppVersion == "3.1.0", "kAppVersion must match 3.1.0")
-        assertTrue(kAppBuildNumber == "14", "kAppBuildNumber must match 14")
+        assertTrue(kAppVersion == "3.2.0", "kAppVersion must match 3.2.0")
+        assertTrue(kAppBuildNumber == "15", "kAppBuildNumber must match 15")
 
         let diag = DiagnosticExporter.shared.generateDiagnosticReport()
         guard let sys = diag["system"] as? [String: Any] else {
@@ -2649,8 +2649,14 @@ struct CoreLogicTestRunner {
             assertTrue(brandNewNvme.dailyTerabytesWritten == 0.0, "dailyTerabytesWritten must be 0.0 for NVMe with 0 POH")
             assertTrue(brandNewNvme.estimatedRemainingLifeFormatted == "Calibrating (< 24h POH)", "Brand new drive (<24h POH) must report Calibrating status, got \(brandNewNvme.estimatedRemainingLifeFormatted)")
 
-            // 40d. Subprocess Grandchild Termination Safety (SYS2-05)
-            VolumeVerifierService.terminateProcessAndChildren(pid: 0, signal: SIGTERM) // Must safely no-op for pid <= 0
+            // 40d. Subprocess Grandchild Termination Safety (SYS2-05 / PROC-02)
+            let timeoutResult = SubprocessRunner.run(
+                executable: "/bin/sleep",
+                arguments: ["5"],
+                timeoutSeconds: 0.2
+            )
+            assertTrue(timeoutResult.timedOut, "SubprocessRunner must time out and terminate long-running child process group")
+            assertTrue(timeoutResult.exitCode == -9, "Timed-out SubprocessRunner run must report exitCode -9")
 
             print("  [OK] Canary sector-alignment, orphan self-healing, UI drive synchronization, brand-new drive metrics, and child termination verified")
         }
@@ -3682,7 +3688,7 @@ struct CoreLogicTestRunner {
             let results = prober.probeAll(targets: [targetA], timeoutSeconds: 3.0)
             assertTrue(results["disk0"] != nil, "Prober must return results for disk0")
             assertTrue(!results["disk0"]!.timedOut, "Root volume probe must not time out")
-            assertTrue(results["disk0"]!.fsMetrics != nil, "Root volume must return fsMetrics")
+            assertTrue(results["disk0"]!.fsMetrics.isMounted || !results["disk0"]!.fsMetrics.mountPoint.isEmpty, "Root volume must return populated fsMetrics")
 
             print("  [OK] ParallelDriveProber bounded execution and circuit breaker state verified")
         }
@@ -4068,9 +4074,10 @@ struct CoreLogicTestRunner {
             print("=== Swift Unit Test 64: Process I/O Throttling & System Guards (PROC-03) ===")
             let inspector = ProcessIoInspector.shared
 
-            // Ensure system critical mounts and system PIDs are rejected
-            let rootRes = inspector.throttleRunawayProcess(forMount: "/")
-            assertTrue(!rootRes.throttled, "Throttling runaway processes on system root volume '/' must be refused for safety")
+            // Ensure protected OS subpaths and nonexistent mounts are rejected
+            let systemRes = inspector.throttleRunawayProcess(forMount: "/System/Library")
+            assertTrue(!systemRes.throttled, "Throttling runaway processes on /System/Library must be refused for safety")
+            assertTrue(systemRes.message.contains("prohibited"), "Protected /System path rejection should explain safety refusal")
 
             let nonExistentRes = inspector.throttleRunawayProcess(forMount: "/Nonexistent/Mount/999")
             assertTrue(!nonExistentRes.throttled, "Throttling on nonexistent mount must be false")
@@ -4216,6 +4223,458 @@ struct CoreLogicTestRunner {
             }
 
             print("  [OK] Menu bar status title formatting and concurrent SMART contention guard verified")
+        }
+
+        print("=== Swift Unit Test 67: v3.2 Features: Controller Quarantine, Bad Extent Propagation, OpenMetrics & 90d Retention ===")
+        do {
+            // 67a. ControllerQuarantineRule & IO_CONTROLLER_UNRESPONSIVE (-55)
+            let cfg = ConfigManager.shared.currentConfig
+            let fsMetrics = FilesystemMountMetrics(
+                isMounted: true,
+                mountPoint: "/Volumes/QuarantinedDrive",
+                filesystemType: "apfs",
+                isReadOnly: false,
+                totalBytes: 1000000000,
+                freeBytes: 500000000,
+                purgeableBytes: 0,
+                usedBytes: 500000000,
+                usedPercent: 50.0
+            )
+            let qCtx = HealthEvaluationContext(
+                nowTs: 1000,
+                config: cfg,
+                hardware: DiskHardwareMetrics(),
+                linkSpeedFormatted: "10 Gbps",
+                interconnect: "USB",
+                mountToInspect: "/Volumes/QuarantinedDrive",
+                filesystem: fsMetrics,
+                subpathsStatus: [:],
+                canaryOk: false,
+                canaryLatencyMs: 3000.0,
+                canaryError: "CONTROLLER_UNRESPONSIVE_CIRCUIT_OPEN",
+                avgReadLatMs: 0.0,
+                avgWriteLatMs: 0.0,
+                inWakeGrace: false,
+                hostThermalState: .nominal,
+                driveState: DriveBaselineState(),
+                recentTemperatureSamples: [],
+                apfsContainer: nil,
+                isControllerUnresponsive: true
+            )
+            let qRule = ControllerQuarantineRule()
+            let qOutcome = qRule.evaluate(context: qCtx)
+            assertTrue(qOutcome.scorePenalty == 55, "Expected -55 score penalty for unresponsive controller, got \(qOutcome.scorePenalty)")
+            assertTrue(qOutcome.issues.contains(where: { $0.code == "IO_CONTROLLER_UNRESPONSIVE" }), "Expected IO_CONTROLLER_UNRESPONSIVE issue")
+            assertTrue(StandardHealthRulePipeline.defaultRules.count == 15, "Standard pipeline must contain exactly 15 rules")
+
+            // 67b. OpenMetrics / Prometheus Exporter v3.2 Telemetry
+            let promMetrics = OpenMetricsServer.shared.generatePrometheusMetrics()
+            assertTrue(promMetrics.contains("disk_health_score"), "Must contain disk_health_score")
+            assertTrue(promMetrics.contains("disk_total_terabytes_written"), "Must contain disk_total_terabytes_written")
+            assertTrue(promMetrics.contains("disk_total_terabytes_read"), "Must contain disk_total_terabytes_read")
+            assertTrue(promMetrics.contains("disk_power_on_hours"), "Must contain disk_power_on_hours")
+            assertTrue(promMetrics.contains("disk_bus_phy_errors_total"), "Must contain disk_bus_phy_errors_total")
+            assertTrue(promMetrics.contains("disk_bus_resets_total"), "Must contain disk_bus_resets_total")
+            assertTrue(promMetrics.contains("disk_canary_latency_ms"), "Must contain disk_canary_latency_ms")
+            assertTrue(promMetrics.contains("disk_canary_ok"), "Must contain disk_canary_ok")
+            assertTrue(promMetrics.contains("disk_rolling_30d_tbw_per_day"), "Must contain disk_rolling_30d_tbw_per_day")
+            assertTrue(promMetrics.contains("disk_p95_write_latency_ms"), "Must contain disk_p95_write_latency_ms")
+            assertTrue(OpenMetricsServer.defaultPort == 9102, "Default server port must be 9102")
+            assertTrue(ConfigManager.shared.currentConfig.metricsServerPort == 9102, "Config default server port must be 9102")
+
+            // 67c. Damaged Extent Telemetry in DiagnosticExporter
+            var mockSnap = DiskHealthMonitor.shared.evaluateHealth(forceCanary: false, allowNotifications: false, persistState: false)
+            mockSnap.busErrorCount = 3
+            mockSnap.busResetCount = 1
+            mockSnap.damagedExtents = [
+                DamagedPhysicalExtent(filePath: "/Volumes/Test/corrupt.bin", logicalOffset: 4096, physicalLbaOffset: 0x100000, contiguousBytes: 8192, errorCode: 5)
+            ]
+            let diagJson = DiagnosticExporter.shared.generateDiagnosticReport(snapshot: mockSnap)
+            guard let extList = diagJson["damagedExtents"] as? [[String: Any]], !extList.isEmpty else {
+                fatalError("damagedExtents list missing from diagnostic JSON")
+            }
+            assertTrue(extList.count == 1, "Expected 1 damaged extent in diagnostic JSON")
+            assertTrue(extList[0]["filePath"] as? String == "/Volumes/Test/corrupt.bin", "Extent file path mismatch")
+
+            let diagHtml = DiagnosticExporter.shared.exportDiagnosticReportHTML(snapshot: mockSnap)
+            assertTrue(diagHtml.contains("Pinpointed Bad Extents (Physical LBA Mapping)"), "HTML report must render Bad Extents card")
+            assertTrue(diagHtml.contains("corrupt.bin"), "HTML report must list corrupt.bin")
+            assertTrue(diagHtml.contains("0x100000"), "HTML report must list physical LBA 0x100000")
+
+            mockSnap.apfsContainer = ApfsContainerFleetMetrics(
+                containerBsd: "disk3",
+                totalCapacityBytes: 1_000_000_000,
+                freeSpaceBytes: 500_000_000,
+                volumes: [
+                    ApfsVolumeRoleMetrics(bsdName: "disk3s1", name: "Macintosh HD", role: "System", totalBytes: 1_000_000_000, usedBytes: 10_000_000, freeBytes: 500_000_000, isEncrypted: false)
+                ]
+            )
+            let diagJsonWithApfs = DiagnosticExporter.shared.generateDiagnosticReport(snapshot: mockSnap)
+            assertTrue(diagJsonWithApfs["apfsContainer"] != nil, "Diagnostic JSON must include apfsContainer")
+            let diagHtmlWithApfs = DiagnosticExporter.shared.exportDiagnosticReportHTML(snapshot: mockSnap)
+            assertTrue(diagHtmlWithApfs.contains("APFS Container Pool"), "HTML report must render APFS Container Pool")
+
+            let sleepRule = ActionRule(
+                name: "Sleep Shield Test",
+                scope: .allDrives,
+                triggerMetric: .systemWillSleep,
+                conditionOperator: .greaterThanOrEqual,
+                thresholdValue: 1.0,
+                actionType: .preSleepShield
+            )
+            let (awakeMatch, _) = ActionRuleEngine.evaluateRuleCondition(
+                rule: sleepRule,
+                snapshot: mockSnap,
+                isSleepNotificationEvent: false
+            )
+            assertTrue(awakeMatch == false, ".systemWillSleep condition must NOT match during normal awake evaluation")
+            let (sleepMatch, _) = ActionRuleEngine.evaluateRuleCondition(
+                rule: sleepRule,
+                snapshot: mockSnap,
+                isSleepNotificationEvent: true
+            )
+            assertTrue(sleepMatch == true, ".systemWillSleep condition MUST match during kernel sleep notification")
+
+            // 67d. TelemetryHistoryStore 90-Day Retention Compaction
+            let tmpHistoryFile = "\(ConfigManager.shared.configDir)/history/test_retention_drive.jsonl"
+            try? FileManager.default.createDirectory(atPath: "\(ConfigManager.shared.configDir)/history", withIntermediateDirectories: true)
+            let nowTs = Date().timeIntervalSince1970
+            let oldTs = nowTs - (120.0 * 86400.0) // 120 days ago
+            let recentTs = nowTs - (5.0 * 86400.0) // 5 days ago
+
+            let pOld = TelemetryHistoryPoint(timestamp: oldTs, overallSeverity: .healthy, healthScore: 100, temperatureCelsius: 25, freeBytes: 1000, usedPercent: 10, totalTerabytesWritten: 1, avgReadLatencyMs: 1, avgWriteLatencyMs: 1)
+            let pRecent = TelemetryHistoryPoint(timestamp: recentTs, overallSeverity: .healthy, healthScore: 100, temperatureCelsius: 25, freeBytes: 1000, usedPercent: 10, totalTerabytesWritten: 2, avgReadLatencyMs: 1, avgWriteLatencyMs: 1)
+            let enc = JSONEncoder()
+            if let dOld = try? enc.encode(pOld), let dRecent = try? enc.encode(pRecent),
+               let sOld = String(data: dOld, encoding: .utf8), let sRecent = String(data: dRecent, encoding: .utf8) {
+                // Populate file with padding to exceed compaction threshold
+                var fileContent = sOld + "\n" + sRecent + "\n"
+                while fileContent.utf8.count < 130 * 1024 {
+                    fileContent += sOld + "\n"
+                }
+                fileContent += sRecent + "\n"
+                try? fileContent.write(toFile: tmpHistoryFile, atomically: true, encoding: .utf8)
+                TelemetryHistoryStore.shared.pruneArchiveFileIfNeeded(filePath: tmpHistoryFile, nowTs: nowTs)
+
+                let compacted = (try? String(contentsOfFile: tmpHistoryFile, encoding: .utf8)) ?? ""
+                let compactedLines = compacted.split(separator: "\n")
+                // All kept lines should be >= cutoffTs
+                let cutoff = nowTs - (90.0 * 86400.0)
+                let allKeptRecent = compactedLines.allSatisfy { line in
+                    if let d = line.data(using: .utf8), let pt = try? JSONDecoder().decode(TelemetryHistoryPoint.self, from: d) {
+                        return pt.timestamp >= cutoff
+                    }
+                    return false
+                }
+                assertTrue(allKeptRecent, "Compacted archive must contain only points within 90 days")
+                try? FileManager.default.removeItem(atPath: tmpHistoryFile)
+            }
+
+            // 67e. SubprocessResult combinedOutput
+            let resSuccess = SubprocessResult(exitCode: 0, stdout: "diskutil unmount successful", stderr: "", timedOut: false)
+            assertTrue(resSuccess.combinedOutput == "diskutil unmount successful", "combinedOutput must return stdout when stderr is empty")
+            let resFailure = SubprocessResult(exitCode: 1, stdout: "", stderr: "Volume could not be unmounted", timedOut: false)
+            assertTrue(resFailure.combinedOutput == "Volume could not be unmounted", "combinedOutput must return stderr when stdout is empty")
+
+            // 67f. ParallelDriveProber Integration, SurfaceScannerService Isolation, Blocker Termination & NoteSystemWillSleep
+            let mockProv = MockTelemetryProvider()
+            mockProv.filesystemMetrics = FilesystemMountMetrics(
+                isMounted: true,
+                mountPoint: "/Volumes/MockVol",
+                filesystemType: "apfs",
+                isReadOnly: false,
+                totalBytes: 1_000_000_000,
+                freeBytes: 500_000_000,
+                purgeableBytes: 0,
+                usedBytes: 500_000_000,
+                usedPercent: 50.0
+            )
+            let pt1 = DriveProbeTarget(driveKey: "disk99", mountPath: "/Volumes/MockVol", isInternal: false, runCanary: true)
+            let probeRes = ParallelDriveProber.shared.probeAll(
+                targets: [pt1],
+                forceCanary: true,
+                isSystemSleeping: false,
+                nowTs: nowTs,
+                timeoutSeconds: 2.0,
+                telemetry: mockProv
+            )
+            assertTrue(probeRes["disk99"] != nil, "ParallelDriveProber must return result for disk99")
+            assertTrue(probeRes["disk99"]?.fsMetrics.isMounted == true, "Probe result must reflect mock filesystem mount")
+            assertTrue(probeRes["disk99"]?.canaryResult?.ok == true, "Probe result must reflect mock canary probe ok")
+            assertTrue(probeRes["disk99"]?.timedOut == false, "Probe must not time out for mock provider")
+
+            let sss = SurfaceScannerService.shared
+            let extentsA = sss.damagedExtents(forMount: "/Volumes/DriveA")
+            let extentsB = sss.damagedExtents(forMount: "/Volumes/DriveB_Healthy")
+            assertTrue(extentsA.isEmpty, "DriveA should have empty extents initially")
+            assertTrue(extentsB.isEmpty, "DriveB must have empty extents (no fallback to another drive)")
+
+            let safeBlocker = OpenFileBlocker(pid: 99999, processName: "unresponsive_app", filePath: "/Volumes/External/data.raw", fd: 4)
+            let systemBlocker = OpenFileBlocker(pid: 1, processName: "launchd", filePath: "/Volumes/External/data.raw", fd: 4)
+            let finderBlocker = OpenFileBlocker(pid: 500, processName: "Finder", filePath: "/Volumes/External/data.raw", fd: 4)
+            let rootMountBlocker = OpenFileBlocker(pid: 99999, processName: "unresponsive_app", filePath: "/etc/hosts", fd: 4)
+
+            assertTrue(OpenFileBlockerInspector.canSafelyTerminate(blocker: safeBlocker, mountPath: "/Volumes/External") == false, "Non-existent PID 99999 must fail kill(0) permission check")
+            assertTrue(OpenFileBlockerInspector.canSafelyTerminate(blocker: systemBlocker, mountPath: "/Volumes/External") == false, "PID 1 (launchd) must be rejected")
+            assertTrue(OpenFileBlockerInspector.canSafelyTerminate(blocker: finderBlocker, mountPath: "/Volumes/External") == false, "Finder must be protected")
+            assertTrue(OpenFileBlockerInspector.canSafelyTerminate(blocker: rootMountBlocker, mountPath: "/") == false, "Root mount '/' must be protected from termination")
+            let zeroStartBlocker = OpenFileBlocker(pid: ProcessInfo.processInfo.processIdentifier, processName: "test_core_logic", filePath: "/Volumes/External/data.raw", fd: 4, startTimeSec: 0, isTerminatable: true)
+            assertTrue(OpenFileBlockerInspector.canSafelyTerminate(blocker: zeroStartBlocker, mountPath: "/Volumes/External") == false, "Blocker missing startTimeSec (> 0) must fail closed against PID reuse")
+
+            DiskHealthMonitor.shared.noteSystemWillSleep()
+            DiskHealthMonitor.shared.noteSystemWillSleep()
+            DiskHealthMonitor.shared.noteSystemDidWake()
+
+            assertTrue(OpenMetricsServer.defaultPort == 9102, "OpenMetricsServer.defaultPort must be 9102")
+
+            print("  [OK] v3.2 Controller Quarantine, Bad Extents, OpenMetrics & 90d Retention verified")
+            print("  [OK] v3.2 ParallelDriveProber integration, Extent isolation, Blocker safety & Sleep deduplication verified")
+        }
+
+        // ====================================================================
+        // Test 68: v3.2 Architecture Hardening & Post-Refactor Regressions
+        // ====================================================================
+        print("=== Swift Unit Test 68: v3.2 Architecture Hardening & Post-Refactor Regressions ===")
+        do {
+            // 68a. Decoupled HID temperature visibility vs SMART validity + ThermalAndSpikeRule
+            func makeSampleSnapshot(
+                smartValid: Bool,
+                tempC: Int,
+                isInternal: Bool = true,
+                bsdName: String = "disk9",
+                serialNumber: String = "TEST_KEY",
+                timestamp: TimeInterval = 2000,
+                totalTerabytesWritten: Double = 2.0,
+                avgWriteLatencyMs: Double = 0.5
+            ) -> DiskHealthSnapshot {
+                return DiskHealthSnapshot(
+                    timestamp: timestamp,
+                    formattedTime: "2026-11-13 12:00:00",
+                    formattedShortTime: "12:00:00",
+                    overallSeverity: .healthy,
+                    healthScore: 100,
+                    issues: [],
+                    hardwareFound: true,
+                    vendorName: "Apple",
+                    productName: "Internal SSD",
+                    productRevision: "0",
+                    bsdName: bsdName,
+                    serialNumber: serialNumber,
+                    usbSerialNumber: "",
+                    interconnectType: "NVMe",
+                    protocolType: "NVMe",
+                    isInternal: isInternal,
+                    isRemovable: !isInternal,
+                    linkSpeedBps: 0,
+                    linkSpeedFormatted: "PCIe",
+                    isMounted: true,
+                    mountPoint: isInternal ? "/" : "/Volumes/Ext",
+                    filesystemType: "apfs",
+                    isReadOnly: false,
+                    totalBytes: 1_000_000_000,
+                    freeBytes: 500_000_000,
+                    usedBytes: 500_000_000,
+                    usedPercent: 50.0,
+                    subpathsStatus: [:],
+                    canaryOk: true,
+                    canaryLatencyMs: 1.0,
+                    canaryError: "",
+                    smartValid: smartValid,
+                    criticalWarning: 0,
+                    temperatureCelsius: tempC,
+                    peakTemperatureCelsius: tempC,
+                    availableSpare: 100,
+                    availableSpareThreshold: 10,
+                    percentageUsed: 0,
+                    lifeRemainingPercent: 100,
+                    totalTerabytesRead: 1.0,
+                    totalTerabytesWritten: totalTerabytesWritten,
+                    powerCycles: 1,
+                    powerOnHours: 100,
+                    unsafeShutdowns: 0,
+                    mediaErrors: 0,
+                    errorInfoLogEntries: 0,
+                    statsValid: true,
+                    sessionBytesRead: 0,
+                    sessionBytesWritten: 0,
+                    operationsRead: 0,
+                    operationsWritten: 0,
+                    errorsRead: 0,
+                    errorsWritten: 0,
+                    retriesRead: 0,
+                    retriesWritten: 0,
+                    avgReadLatencyMs: 0.5,
+                    avgWriteLatencyMs: avgWriteLatencyMs,
+                    readThroughputMBps: 0.0,
+                    writeThroughputMBps: 0.0,
+                    lastVerifyResult: "OK",
+                    lastVerifyOk: true
+                )
+            }
+
+            let hidOnlySnap = makeSampleSnapshot(smartValid: false, tempC: 36)
+            assertTrue(hidOnlySnap.hasTemperature == true, "HID die temperature must set hasTemperature even when smartValid == false")
+
+            var hidWarnHw = DiskHardwareMetrics()
+            hidWarnHw.smartValid = false
+            hidWarnHw.temperatureCelsius = 52
+            var hidCfg = DiskHealthConfig()
+            hidCfg.tempWarningCelsius = 48
+            hidCfg.tempCriticalCelsius = 60
+            let dummyFs = FilesystemMountMetrics(
+                isMounted: true,
+                mountPoint: "/",
+                filesystemType: "apfs",
+                isReadOnly: false,
+                totalBytes: 1_000_000_000,
+                freeBytes: 500_000_000,
+                purgeableBytes: 0,
+                usedBytes: 500_000_000,
+                usedPercent: 50.0
+            )
+            let hidCtx = HealthEvaluationContext(
+                nowTs: 2000,
+                config: hidCfg,
+                hardware: hidWarnHw,
+                linkSpeedFormatted: "PCIe",
+                interconnect: "NVMe",
+                mountToInspect: "/",
+                filesystem: dummyFs,
+                subpathsStatus: [:],
+                canaryOk: true,
+                canaryLatencyMs: 1.0,
+                canaryError: "",
+                avgReadLatMs: 0.0,
+                avgWriteLatMs: 0.0,
+                inWakeGrace: false,
+                hostThermalState: .nominal,
+                driveState: DriveBaselineState(),
+                recentTemperatureSamples: [],
+                apfsContainer: nil,
+                isControllerUnresponsive: false
+            )
+            let thermalOutcome = ThermalAndSpikeRule().evaluate(context: hidCtx)
+            assertTrue(thermalOutcome.issues.contains(where: { $0.code == "TEMP_WARNING" }), "ThermalAndSpikeRule must alert on unprivileged HID die temperature when above warning threshold")
+
+            // 68b. .systemWillSleep non-numeric trigger summary & simulation behavior
+            assertTrue(ActionTriggerMetric.systemWillSleep.usesNumericThreshold == false, ".systemWillSleep must not use numeric thresholds")
+            let sleepRuleDesc = ActionRule(
+                name: "Pre-Sleep Drain",
+                scope: .externalOnly,
+                triggerMetric: .systemWillSleep,
+                conditionOperator: .greaterThanOrEqual,
+                thresholdValue: 1.0,
+                actionType: .preSleepShield
+            )
+            assertTrue(!sleepRuleDesc.conditionSummary.contains(">="), "Non-numeric sleep trigger summary must omit numeric comparator")
+            let awakeOnlySnap = makeSampleSnapshot(smartValid: true, tempC: 30, isInternal: false)
+            let simSleepRec = DiskHealthMonitor.shared.simulateActionRule(
+                sleepRuleDesc,
+                on: awakeOnlySnap,
+                executeLive: false,
+                persistAuditRecord: false
+            )
+            assertTrue(simSleepRec.triggerReason.contains("System power pre-sleep event triggered"), "simulateActionRule for .systemWillSleep must synthesize sleep event trigger reason, got '\(simSleepRec.triggerReason)'")
+
+            // 68c. BusSignalIntegrityRule defers baseline capture when baselineBusErrors == nil
+            var unbaselinedHw = DiskHardwareMetrics()
+            unbaselinedHw.busErrorCount = 12
+            unbaselinedHw.busResetCount = 2
+            let busOutcomeNil = BusSignalIntegrityRule().evaluate(context: HealthEvaluationContext(
+                nowTs: 2100,
+                config: hidCfg,
+                hardware: unbaselinedHw,
+                linkSpeedFormatted: "10 Gbps",
+                interconnect: "USB",
+                mountToInspect: "/Volumes/Ext",
+                filesystem: dummyFs,
+                subpathsStatus: [:],
+                canaryOk: true,
+                canaryLatencyMs: 1.0,
+                canaryError: "",
+                avgReadLatMs: 0.0,
+                avgWriteLatMs: 0.0,
+                inWakeGrace: false,
+                hostThermalState: .nominal,
+                driveState: DriveBaselineState(),
+                recentTemperatureSamples: [],
+                apfsContainer: nil,
+                isControllerUnresponsive: false
+            ))
+            assertTrue(busOutcomeNil.issues.isEmpty, "BusSignalIntegrityRule must capture baseline cleanly when baselineBusErrors is nil")
+
+            // 68d. OpenFileBlocker startTimeSec / isTerminatable defaults
+            let defaultBlocker = OpenFileBlocker(pid: 4242, processName: "worker", filePath: "/Volumes/Ext/file", fd: 5)
+            assertTrue(defaultBlocker.startTimeSec == 0, "OpenFileBlocker startTimeSec must default to 0")
+            assertTrue(defaultBlocker.isTerminatable == false, "OpenFileBlocker isTerminatable must default fail-closed to false")
+
+            // 68e. ConfigManager env mapping for metrics server & pre-sleep shield
+            let envCfg = ConfigManager.applyEnvironmentVariables(
+                into: DiskHealthConfig(),
+                env: [
+                    "DISK_HEALTH_METRICS_SERVER": "true",
+                    "DISK_HEALTH_METRICS_PORT": "9205",
+                    "DISK_HEALTH_PRE_SLEEP_SHIELD": "true"
+                ]
+            )
+            assertTrue(envCfg.metricsServerEnabled == true, "DISK_HEALTH_METRICS_SERVER env must enable metricsServerEnabled")
+            assertTrue(envCfg.metricsServerPort == 9205, "DISK_HEALTH_METRICS_PORT env must set metricsServerPort")
+            assertTrue(envCfg.preSleepShieldEnabled == true, "DISK_HEALTH_PRE_SLEEP_SHIELD env must enable preSleepShieldEnabled")
+
+            // 68f. MockTelemetryProvider.isDarkWakeActive propagation through ParallelDriveProber
+            let darkMock = MockTelemetryProvider()
+            darkMock.darkWakeActive = true
+            darkMock.filesystemMetrics = FilesystemMountMetrics(
+                isMounted: true, mountPoint: "/Volumes/DarkExt", filesystemType: "apfs", isReadOnly: false,
+                totalBytes: 1_000_000_000, freeBytes: 500_000_000, purgeableBytes: 0, usedBytes: 500_000_000, usedPercent: 50.0
+            )
+            let darkRes = ParallelDriveProber.shared.probeAll(
+                targets: [DriveProbeTarget(driveKey: "darkDisk1", mountPath: "/Volumes/DarkExt", isInternal: false, runCanary: true)],
+                forceCanary: true,
+                isSystemSleeping: false,
+                nowTs: Date().timeIntervalSince1970,
+                timeoutSeconds: 2.0,
+                telemetry: darkMock
+            )
+            assertTrue(darkRes["darkDisk1"]?.canaryResult == nil && darkRes["darkDisk1"]?.timedOut == false, "ParallelDriveProber must defer external canary probes during Dark Wake (canaryResult == nil)")
+
+            // 68g. TelemetryHistoryStore isolated 90-day hourly JSONL forecast merge
+            let tmpDir68 = NSTemporaryDirectory()
+            let isoHistFile = (tmpDir68 as NSString).appendingPathComponent("dhm_test68_\(ProcessInfo.processInfo.processIdentifier)_history.json")
+            let isoArchDir = "\(isoHistFile).archive"
+            defer {
+                try? FileManager.default.removeItem(atPath: isoHistFile)
+                try? FileManager.default.removeItem(atPath: isoArchDir)
+            }
+            let isoStore = TelemetryHistoryStore(customFilePath: isoHistFile)
+            let nowEpoch = Date().timeIntervalSince1970
+            try FileManager.default.createDirectory(atPath: isoArchDir, withIntermediateDirectories: true)
+            let pArchive1 = TelemetryHistoryPoint(timestamp: nowEpoch - (20.0 * 86400.0), overallSeverity: .healthy, healthScore: 100, temperatureCelsius: 30, freeBytes: 100, usedPercent: 10, totalTerabytesWritten: 10.0, avgReadLatencyMs: 1, avgWriteLatencyMs: 1.0)
+            let pArchive2 = TelemetryHistoryPoint(timestamp: nowEpoch - (10.0 * 86400.0), overallSeverity: .healthy, healthScore: 100, temperatureCelsius: 34, freeBytes: 100, usedPercent: 10, totalTerabytesWritten: 20.0, avgReadLatencyMs: 1, avgWriteLatencyMs: 2.0)
+            let d1 = try JSONEncoder().encode(pArchive1)
+            let d2 = try JSONEncoder().encode(pArchive2)
+            let s1 = String(data: d1, encoding: .utf8)!
+            let s2 = String(data: d2, encoding: .utf8)!
+            let archFile68 = "\(isoArchDir)/SERIAL_TEST68.jsonl"
+            try (s1 + "\n" + s2 + "\n").write(toFile: archFile68, atomically: true, encoding: .utf8)
+            assertTrue(FileManager.default.fileExists(atPath: archFile68), "Archive seed file must exist at \(archFile68)")
+            let snap68 = makeSampleSnapshot(
+                smartValid: true,
+                tempC: 35,
+                bsdName: "disk68",
+                serialNumber: "SERIAL_TEST68",
+                timestamp: nowEpoch,
+                totalTerabytesWritten: 30.0,
+                avgWriteLatencyMs: 3.0
+            )
+            assertTrue(snap68.driveKey == "SERIAL_TEST68", "Expected driveKey SERIAL_TEST68, got \(snap68.driveKey)")
+            isoStore.recordSnapshot(snap68, force: true, persistToDisk: true)
+            let forecast68 = isoStore.computeRollingForecasts(for: snap68)
+            assertTrue(forecast68.rolling30dTBPerDay > 0.9 && forecast68.rolling30dTBPerDay < 1.1, "30-day rolling TBW/day regression should compute ~1.0 TB/day from 90d hourly archive, got \(forecast68.rolling30dTBPerDay)")
+
+            print("  [OK] v3.2 Architecture Hardening & Post-Refactor Regressions verified")
+        } catch {
+            assertTrue(false, "Test 68 threw unexpected error: \(error)")
         }
 
         print("✅ All Swift Core Logic Unit Tests Passed!")

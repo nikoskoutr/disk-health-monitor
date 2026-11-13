@@ -60,18 +60,18 @@ disk-health-monitor/
 ├── assets/                       # AppIcon.png (1024x1024), AppIcon.icns, and UI previews
 ├── scripts/                      # CoreGraphics vector icon generator
 ├── logs/                         # Runtime logs, latest JSON telemetry snapshot, and state persistence
-├── tests/                        # C11/IOKit unit tests (23) and Swift engine unit tests (65)
+├── tests/                        # C11/IOKit unit tests (26) and Swift engine unit tests (68)
 └── src/                          # Modular C11 + Swift source tree
     ├── main.swift                # CLI router, argument parser, and NSApplication bootstrap
-    ├── bridge/                   # Low-level C11 IOKit / NVMe SMART & libproc bridge
+    ├── bridge/                   # Low-level C11 IOKit / NVMe SMART, HID/power, and libproc bridges
     ├── models/                   # Domain models, automation rule schemas, and POSIX formatters
     ├── security/                 # SubprocessRunner, Keychain SecretStore and POSIX SingleInstanceLock
     ├── config/                   # ConfigManager, .env parser, and thread-safe logger
-    ├── notifications/            # Notification Center, Telegram, Webhook, and Script dispatchers
+    ├── notifications/            # AlertCoordinator, Notification Center, Telegram, Webhook, and Script dispatchers
     ├── network/                  # Native OpenMetrics / Prometheus HTTP loopback server
     ├── diagnostics/              # JSON/HTML report exporters, OpenFileBlockerInspector & ProcessIoInspector
-    ├── engine/                   # 13-rule health engine, ParallelDriveProber, ActionRuleEngine, ApfsSnapshotService, canary & scanner
-    └── ui/                       # Menu bar controller, dashboard card, and 7-tab Settings window
+    ├── engine/                   # 15-rule health engine, PersistentStateStore, ParallelDriveProber, ActionRuleEngine, ApfsSnapshotService, canary & scanner
+    └── ui/                       # Menu bar controller, dashboard card, shared components, and 7-tab Settings window
 ```
 
 ```mermaid
@@ -110,25 +110,25 @@ flowchart TD
 | Directory | Scope |
 | :--- | :--- |
 | [`src/`](src/README.md) | Source architecture, compilation pipeline, and module dependencies |
-| [`src/bridge/`](src/bridge/README.md) | C11 IOKit registry traversal, APFS physical store resolution, NVMe SMART interface |
-| [`src/models/`](src/models/README.md) | Domain models, SSD endurance & burn rate projections, synchronized formatters |
-| [`src/security/`](src/security/README.md) | macOS Keychain secret storage and POSIX single-instance lock |
-| [`src/config/`](src/config/README.md) | Multi-source configuration resolution, `.env` parser, and structured logging |
-| [`src/notifications/`](src/notifications/README.md) | Notification Center, Telegram Bot, Webhooks (Discord/Slack/HA), and script hooks |
+| [`src/bridge/`](src/bridge/README.md) | C11 IOKit registry traversal, APFS physical store resolution, NVMe SMART, HID thermal & libproc bridges |
+| [`src/models/`](src/models/README.md) | Domain models (`HealthModels.swift`), automation rule schemas (`AutomationModels.swift`), and synchronized formatters |
+| [`src/security/`](src/security/README.md) | Process-group `SubprocessRunner`, macOS Keychain `SecretStore`, and POSIX `SingleInstanceLock` |
+| [`src/config/`](src/config/README.md) | Multi-source configuration resolution (`applyKeyValueMap`), `.env` parser, and structured logging |
+| [`src/notifications/`](src/notifications/README.md) | `AlertCoordinator`, Notification Center, Telegram Bot, Webhooks (Discord/Slack/HA), and script hooks |
 | [`src/diagnostics/`](src/diagnostics/README.md) | Sanitized JSON diagnostic exporter, HTML RMA report generator, `OpenFileBlockerInspector`, and `ProcessIoInspector` |
 | [`src/network/`](src/network/OpenMetricsServer.swift) | Native loopback OpenMetrics / Prometheus HTTP server (`127.0.0.1:<port>`) |
-| [`src/engine/`](src/engine/README.md) | 13-rule evaluation engine, `ParallelDriveProber`, `ActionRuleEngine`, `ApfsSnapshotService`, `PowerManagementService`, canary I/O probe, surface scanner |
+| [`src/engine/`](src/engine/README.md) | 15-rule lock-split evaluation engine, `PersistentStateStore`, `ParallelDriveProber`, `ActionRuleEngine`, `ApfsSnapshotService`, `PowerManagementService`, canary I/O probe, surface scanner |
 | [`src/ui/`](src/ui/README.md) | Menu bar status controller, telemetry card, and 7-tab Settings window (`⌘,`, `⌘A`, `⌘I`, `⌘S`) |
-| [`tests/`](tests/run_tests.sh) | 20 C11/IOKit unit tests, 58 Swift engine unit tests, and CLI test stages |
+| [`tests/`](tests/README.md) | 26 C11/IOKit unit tests, 68 Swift engine unit tests, and CLI test stages |
 | [`scripts/`](scripts/generate_app_icon.swift) | CoreGraphics vector application icon generator |
 | [`assets/`](assets/README.md) | Application branding and icon assets |
 | [`logs/`](logs/README.md) | Runtime log files, telemetry snapshots, and state persistence |
 
 ---
 
-## 13-Point Health Evaluation Engine
+## 15-Point Health Evaluation Engine
 
-Each polling cycle evaluates a `DiskHealthSnapshot` against 13 deterministic rules:
+Each polling cycle evaluates a `DiskHealthSnapshot` against 15 deterministic rules (`StandardHealthRulePipeline`):
 
 | # | Rule Category | Telemetry Source | Trigger Condition | Severity |
 | :--- | :--- | :--- | :--- | :--- |
@@ -136,15 +136,17 @@ Each polling cycle evaluates a `DiskHealthSnapshot` against 13 deterministic rul
 | **2** | **Hardware S.M.A.R.T.** | `IONVMeSMARTUserClient` | SMART failure or Critical Warning bitmask `!= 0` | `CRITICAL` |
 | **3** | **Available Spare** | NVMe SMART Log `02h` | Available spare `< 25%` (`WARNING`) or `<= threshold` / `< 10%` (`CRITICAL`) | `WARNING` / `CRITICAL` |
 | **4** | **SSD Wear Level** | NVMe SMART Log `02h` | Wear percentage `>= 80%` (`WARNING`) or `>= 95%` (`CRITICAL`) | `WARNING` / `CRITICAL` |
-| **5** | **Drive Temperature** | NVMe SMART Log `02h` | Temperature `>= tempWarningCelsius` or `>= tempCriticalCelsius` | `WARNING` / `CRITICAL` |
+| **5** | **Drive Temperature** | NVMe SMART / HID Die Sensor | Temperature `>= tempWarningCelsius` or `>= tempCriticalCelsius`, or rapid thermal rise | `WARNING` / `CRITICAL` |
 | **6** | **Host Thermal State** | `ProcessInfo.processInfo` | macOS host thermal state enters `.critical` (internal only) | `WARNING` |
 | **7** | **Media & Kernel Errors** | NVMe Log `02h` & Driver Stats | Delta in media errors, error log entries, driver read/write errors or retries | `WARNING` / `CRITICAL` |
 | **8** | **I/O Latency Spikes** | `IOBlockStorageDriver` | Average read/write latency exceeds threshold (`> 50 ms` warn, `> 200 ms` crit) | `WARNING` / `CRITICAL` |
 | **9** | **Bus Link Speed** | `IOUSBHostDevice` | External link negotiates below expected speed (e.g., USB 3.0 on USB 2.0 port) | `WARNING` |
 | **10** | **Unsafe Shutdowns** | NVMe SMART Log `02h` | Unsafe shutdown counter incremented relative to persisted baseline | `WARNING` |
-| **11** | **Capacity & Free Space** | `statfs(2)` | Usage `%` above ceiling or free space below warning/critical floor | `WARNING` / `CRITICAL` |
+| **11** | **Capacity & Free Space** | `statfs(2)` | Usage `%` above ceiling or free space below warning/critical floor (skipped if quarantined) | `WARNING` / `CRITICAL` |
 | **12** | **Canary & Verification** | Active Canary & `diskutil` | Read-only mount, canary probe failure, or filesystem metadata corruption | `WARNING` / `CRITICAL` |
 | **13** | **Controller Quarantine** | `ParallelDriveProber` | Device prober circuit breaker tripped (hung controller, 3.0s timeout) | `CRITICAL` |
+| **14** | **Bus PHY Integrity** | IOKit Bus / PHY Counters | Physical layer CRC errors or link recovery resets increased over baseline | `WARNING` / `CRITICAL` |
+| **15** | **APFS Swap Pressure** | `AppleAPFSContainer` | VM swap volume `>= 16 GB` with `< 10%` container free space | `WARNING` |
 
 ### SSD Wear & Endurance Forecasting
 
@@ -155,7 +157,7 @@ $$\text{Remaining Lifespan (\%)} = \max(0, 100 - \text{Percentage Used})$$
 $$\text{Daily Burn Rate} = \frac{\text{Total TBW}}{\max(1, \text{POH} / 24)} \quad (\text{TB/day})$$
 
 - Lifetime forecasts project operational longevity based on active write velocity and accumulated Power-On Hours.
-- For external enclosures lacking NVMe pass-through (`smartValid = false`), health is tracked via rules 1, 6, 7, 8, 9, 11, 12, and 13.
+- For external enclosures lacking NVMe pass-through (`smartValid = false`), health is tracked via mount, driver stats, latency, link speed, capacity, canary/verification, quarantine, PHY signal integrity, and Apple Silicon HID die thermal rules (`hasTemperature`).
 
 ---
 
@@ -171,7 +173,7 @@ $$\text{Daily Burn Rate} = \frac{\text{Total TBW}}{\max(1, \text{POH} / 24)} \qu
 # Compile and create DiskHealthMonitor.app + ./disk-health CLI
 ./build_and_install.sh
 
-# Run the automated test suite (20 C tests + 58 Swift tests + CLI integration)
+# Run the automated test suite (26 C tests + 68 Swift tests + CLI integration)
 ./build_and_install.sh --test
 
 # Cross-compile release DMGs, ZIPs, and standalone CLI binaries in dist/

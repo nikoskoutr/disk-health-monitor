@@ -179,18 +179,32 @@ final class ProcessIoInspector: @unchecked Sendable {
     func throttleRunawayProcess(forMount mountPath: String) -> (throttled: Bool, culprit: ProcessIoCulprit?, message: String) {
         let trimmed = mountPath.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalized = (trimmed as NSString).standardizingPath
-        if trimmed.isEmpty || normalized == "/" || normalized.hasPrefix("/System") || normalized.hasPrefix("/private") {
+        let isDataFirmlinkRoot = (normalized == "/" || normalized == "/System/Volumes/Data")
+        if trimmed.isEmpty || (!isDataFirmlinkRoot && (normalized.hasPrefix("/System") || normalized.hasPrefix("/private"))) {
             return (false, nil, "Throttling runaway processes on system volume '\(mountPath)' is prohibited for safety")
         }
 
-        let blockers = OpenFileBlockerInspector.shared.inspectBlockers(mountPath: mountPath)
-        guard !blockers.isEmpty else {
-            return (false, nil, "No open file blockers detected on '\(mountPath)'")
+        // Sample active I/O processes first so we only query FDs for high-throughput culprits (PROC-03)
+        let culprits = sampleActiveCulpritsWindow(durationSec: 0.35, topN: 16).filter { $0.combinedDeltaBytes > 0 }
+        guard !culprits.isEmpty else {
+            return (false, nil, "No active disk I/O processes detected for '\(mountPath)'")
         }
 
-        let blockingPids = Set(blockers.map { $0.pid })
-        let culprits = sampleActiveCulpritsWindow(durationSec: 0.35, topN: 16)
-        guard let topCulprit = culprits.first(where: { blockingPids.contains($0.pid) }) else {
+        var matchedCulprit: ProcessIoCulprit? = nil
+        var matchedBlockers: [DiskFileBlocker] = []
+        for culprit in culprits {
+            var cList = [DiskFileBlocker](repeating: DiskFileBlocker(), count: 32)
+            let found = normalized.withCString { cPath in
+                DiskListProcessOpenFilesOnMount(culprit.pid, cPath, &cList, 32)
+            }
+            if found > 0 {
+                matchedCulprit = culprit
+                matchedBlockers = Array(cList.prefix(Int(found)))
+                break
+            }
+        }
+
+        guard let topCulprit = matchedCulprit else {
             return (false, nil, "No high-throughput process found among open file handles on '\(mountPath)'")
         }
 
@@ -204,6 +218,24 @@ final class ProcessIoInspector: @unchecked Sendable {
         ]
         if exemptNames.contains(topCulprit.processName) {
             return (false, topCulprit, "Process \(topCulprit.processName) is exempted from throttling")
+        }
+
+        // On root volume "/" or "/System/Volumes/Data", allow throttling user-space processes (PROC-03 / CHG-08)
+        if isDataFirmlinkRoot {
+            guard DiskIsSafeUserSpaceProcess(topCulprit.pid) else {
+                return (false, topCulprit, "Throttling '\(topCulprit.processName)' (PID \(topCulprit.pid)) on root volume is prohibited (system UID or system binary)")
+            }
+            let hasUserWritePath = matchedBlockers.contains { b in
+                let fPath = cStringToSwift(b.filePath)
+                return fPath.hasPrefix("/Users/") ||
+                    fPath.hasPrefix("/System/Volumes/Data/Users/") ||
+                    fPath.hasPrefix("/Volumes/") ||
+                    fPath.hasPrefix("/private/var/folders/") ||
+                    fPath.hasPrefix("/System/Volumes/Data/private/var/folders/")
+            }
+            guard hasUserWritePath else {
+                return (false, topCulprit, "Throttling '\(topCulprit.processName)' on '/' refused: no active user-space handles")
+            }
         }
 
         let res = DiskSetProcessBackgroundIoPriority(topCulprit.pid, true)

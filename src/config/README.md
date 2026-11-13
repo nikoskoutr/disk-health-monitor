@@ -9,17 +9,17 @@ This directory manages configuration resolution, user preferences, environment o
 ### [`ConfigManager.swift`](ConfigManager.swift)
 
 #### 1. `DiskHealthConfig`
-Codable schema managing 23 runtime parameters and alert thresholds:
+Codable schema managing runtime parameters, automation settings, and alert thresholds:
 - **Targeting & Probing**: `targetVolumePath`, `targetDeviceQuery`, `monitorAllDisks`, `monitoredTargets`, `requiredSubpaths`, `enableActiveCanary`, `pollIntervalSeconds`.
 - **Thresholds**: `tempWarningCelsius` (58°C), `tempCriticalCelsius` (68°C), `diskUsedWarningPercent` (85%), `diskUsedCriticalPercent` (93%), `minFreeSpaceWarningGB` (30 GB), `minFreeSpaceCriticalGB` (15 GB), `minExpectedUsbSpeedBps` (5 Gbps).
-- **Notifications & Security**: `enableNativeNotifications`, `enableCriticalSoundAlert`, `useKeychainStorage`, `telegramBotToken`, `telegramChatId`, `webhookUrl`, `alertScriptPath`, `alertCooldownSeconds` (3600s).
+- **Notifications, Automation & Services**: `enableNativeNotifications`, `enableCriticalSoundAlert`, `useKeychainStorage`, `telegramBotToken`, `telegramChatId`, `webhookUrl`, `alertScriptPath`, `alertCooldownSeconds` (3600s), `actionRules`, `preSleepShieldEnabled` (`DISK_HEALTH_PRE_SLEEP_SHIELD`), `metricsServerEnabled` (`DISK_HEALTH_METRICS_SERVER` / `DISK_HEALTH_METRICS_ENABLED`), `metricsServerPort` (`DISK_HEALTH_METRICS_PORT`, default `9102`).
 - **Diagnostics**: `scheduledVerifyIntervalHours` (0 = manual).
 
 #### 2. Configuration Precedence Hierarchy
-Configuration values resolve in strict priority order (highest to lowest):
-1. **CLI Flags** (`--volume`, `--device`, `--deep`)
-2. **Process Environment Variables** (all 20 variables supported)
-3. **Local `.env` File** (`$DISK_HEALTH_ENV_FILE`, `~/.config/disk-health-monitor/.env`, or `./.env`)
+Configuration values resolve via a unified `applyKeyValueMap(_:into:)` parser across environment and `.env` tiers (highest to lowest):
+1. **CLI Flags** (`--volume`, `--device`, `--deep`, `--metrics-server`, `--metrics-port`)
+2. **Process Environment Variables**
+3. **Local `.env` File** (`$DISK_HEALTH_ENV_FILE`, `~/.config/disk-health-monitor/.env`, or `./.env` when `DISK_HEALTH_DEV_DOTENV=1`)
 4. **JSON Configuration File** (`~/.config/disk-health-monitor/config.json`)
 5. **Compiled Defaults**
 

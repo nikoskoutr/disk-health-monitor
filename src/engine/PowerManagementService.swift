@@ -61,6 +61,27 @@ public final class PowerManagementService {
         }
     }
 
+    /// Deregisters from macOS kernel sleep/wake notifications (DA-02 / PWR-02).
+    public func stopPreSleepShield() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard rootPowerPort != 0 else { return }
+
+        if notifierRef != 0 {
+            IODeregisterForSystemPower(&notifierRef)
+            notifierRef = 0
+        }
+        if let thePort = notifyPortRef {
+            IONotificationPortDestroy(thePort)
+            notifyPortRef = nil
+        }
+        if rootPowerPort != 0 {
+            IOServiceClose(rootPowerPort)
+            rootPowerPort = 0
+        }
+        ConfigManager.shared.log("Pre-Sleep External Drive Shield deregistered from macOS IOPMrootDomain.")
+    }
+
     private let kIOMessageCanSystemSleepConst: natural_t = 0xe0000270
     private let kIOMessageSystemWillSleepConst: natural_t = 0xe0000280
     private let kIOMessageSystemHasPoweredOnConst: natural_t = 0xe0000300
@@ -68,20 +89,24 @@ public final class PowerManagementService {
     /// Handles system power state changes delivered from IOPMrootDomain.
     public func handlePowerMessage(messageType: natural_t, messageArgument: UnsafeMutableRawPointer?) {
         let msgId = Int(bitPattern: messageArgument)
+        lock.lock()
+        let port = rootPowerPort
+        lock.unlock()
 
         switch messageType {
         case kIOMessageSystemWillSleepConst:
             ConfigManager.shared.log("macOS power event: System will sleep (kIOMessageSystemWillSleep).")
+            DiskHealthMonitor.shared.noteSystemWillSleep()
             if ConfigManager.shared.currentConfig.preSleepShieldEnabled {
                 _ = shieldExternalDrivesBeforeSleep()
             }
-            if rootPowerPort != 0 {
-                _ = IOAllowPowerChange(rootPowerPort, msgId)
+            if port != 0 {
+                _ = IOAllowPowerChange(port, msgId)
             }
 
         case kIOMessageCanSystemSleepConst:
-            if rootPowerPort != 0 {
-                _ = IOAllowPowerChange(rootPowerPort, msgId)
+            if port != 0 {
+                _ = IOAllowPowerChange(port, msgId)
             }
 
         case kIOMessageSystemHasPoweredOnConst:
@@ -94,18 +119,48 @@ public final class PowerManagementService {
 
     @discardableResult
     public func shieldExternalDrivesBeforeSleep() -> Int {
-        let multi = DiskHealthMonitor.shared.currentMultiSnapshot
-        let externalDisks = multi?.disks.filter { !$0.isInternal && $0.isMounted && $0.mountPoint != "/" } ?? []
+        var mountCandidates: [String] = []
+        var seen = Set<String>()
+
+        func addCandidate(_ rawPath: String) {
+            let norm = (rawPath as NSString).standardizingPath
+            guard !norm.isEmpty, norm != "/", !norm.hasPrefix("/System"), !seen.contains(norm) else { return }
+            seen.insert(norm)
+            mountCandidates.append(norm)
+        }
+
+        if let multi = DiskHealthMonitor.shared.currentMultiSnapshot {
+            for d in multi.disks where !d.isInternal && d.isMounted {
+                addCandidate(d.mountPoint)
+            }
+        }
+        for dev in IOKitTelemetryProvider.shared.listAllDevices(maxCount: 32) where dev.found && !dev.isInternal {
+            let bsd = cStringToSwift(dev.bsdName)
+            if !bsd.isEmpty, let mnt = IOKitTelemetryProvider.shared.findMountPoint(forBsdName: bsd) {
+                addCandidate(mnt)
+            }
+        }
+
+        let totalDeadline = ProcessInfo.processInfo.systemUptime + 18.0
         var unmountedCount = 0
-        for disk in externalDisks {
-            if disk.mountPoint.hasPrefix("/System") { continue }
-            ConfigManager.shared.log("Pre-Sleep Shield: Safely unmounting external volume '\(disk.mountPoint)'...")
-            let res = OpenFileBlockerInspector.shared.unmountVolume(mountPath: disk.mountPoint, force: false)
+        for mount in mountCandidates {
+            if ParallelDriveProber.shared.isMountQuarantined(mount) {
+                ConfigManager.shared.log("Pre-Sleep Shield: Skipping quarantined mount '\(mount)'.")
+                continue
+            }
+            let remaining = totalDeadline - ProcessInfo.processInfo.systemUptime
+            if remaining <= 0.5 {
+                ConfigManager.shared.log("Pre-Sleep Shield: Reached 18.0s cumulative deadline; skipping remaining unmounts to protect IOAllowPowerChange budget.")
+                break
+            }
+            let perDriveTimeout = min(6.0, remaining)
+            ConfigManager.shared.log("Pre-Sleep Shield: Safely unmounting external volume '\(mount)'...")
+            let res = OpenFileBlockerInspector.shared.unmountVolume(mountPath: mount, force: false, timeoutSeconds: perDriveTimeout)
             if res.exitCode == 0 {
-                ConfigManager.shared.log("Pre-Sleep Shield: Safely unmounted '\(disk.mountPoint)'.")
+                ConfigManager.shared.log("Pre-Sleep Shield: Safely unmounted '\(mount)'.")
                 unmountedCount += 1
             } else {
-                ConfigManager.shared.log("Pre-Sleep Shield: Unmount failed for '\(disk.mountPoint)': \(res.stderr)")
+                ConfigManager.shared.log("Pre-Sleep Shield: Unmount failed for '\(mount)': \(res.stderr)")
             }
         }
         return unmountedCount
